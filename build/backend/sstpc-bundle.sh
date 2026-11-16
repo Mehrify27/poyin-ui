@@ -211,15 +211,20 @@ echo "$ver" | grep -q "sstp-client version" \
 # crypto says something else entirely, which is exactly what is being tested for.
 echo "== sstpc dial self-test (must reach the connect, not die in init) =="
 out="$("$DEST/sbin/sstpc" --nolaunchpppd --log-stderr 127.0.0.1:1 2>&1 || true)"
-echo "$out" | head -5
 case "$out" in
     *"legacy crypto provider"*)
         echo "FATAL: sstpc cannot load OpenSSL's legacy provider, so it could never compute the" >&2
         echo "       NT hash the SSTP crypto binding needs. Either the tree is not carrying" >&2
         echo "       lib/ossl-modules/legacy.so, or the launcher is not exporting OPENSSL_MODULES." >&2
+        echo "$out" | head -8 >&2
         exit 1 ;;
     *"Could not initialize"*)
         echo "FATAL: sstpc failed during client initialisation: $out" >&2
+        exit 1 ;;
+    *"HTTP handshake"*|*"socket error"*)
+        echo "== OK: sstpc crypto provider initialized and reached connect phase ==" ;;
+    *)
+        echo "FATAL: unexpected sstpc dial self-test output: $out" >&2
         exit 1 ;;
 esac
 

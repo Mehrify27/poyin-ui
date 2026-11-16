@@ -476,6 +476,7 @@ build_panel_static() {
         -e GOMODCACHE=/go/pkg/mod
         -e GOPATH=/tmp/gopath
         -e CGO_ENABLED=1
+        -e "CGO_CFLAGS=${CGO_CFLAGS:--g -O2 -Wno-discarded-qualifiers}"
         -e GOOS=linux
         -e "GOARCH=${ARCH}"
     )

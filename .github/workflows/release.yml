@@ -21,16 +21,16 @@ permissions:
 jobs:
   build-amd64:
     name: Build & Verify (linux/amd64)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository with submodules
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -38,6 +38,7 @@ jobs:
       - name: Go vet
         env:
           CGO_ENABLED: "1"
+          CGO_CFLAGS: "-g -O2 -Wno-discarded-qualifiers"
         run: go vet ./...
 
       - name: Build complete vpn-ui-amd64 binary
@@ -59,6 +60,7 @@ jobs:
 
           for img in ubuntu:24.04 debian:12 alpine:3.20; do
             echo "::group::Smoke test in $img"
+            docker pull -q "$img" >/dev/null
             docker run --rm \
               -v "$BIN:/usr/local/bin/vpn-ui:ro" \
               -e VPNUI_DB_FOLDER=/tmp/vpndb \
@@ -71,6 +73,9 @@ jobs:
                 test -n "$ver"
                 /usr/local/bin/vpn-ui install-menu /tmp/vpn-ui-menu
                 test -x /tmp/vpn-ui-menu
+                if command -v bash >/dev/null 2>&1; then
+                  bash -n /tmp/vpn-ui-menu
+                fi
                 /usr/local/bin/vpn-ui migrate
                 test -s /tmp/vpndb/vpn-ui.db
                 /usr/local/bin/vpn-ui migrate
@@ -81,6 +86,7 @@ jobs:
       - name: Run unit tests with race detector
         env:
           CGO_ENABLED: "1"
+          CGO_CFLAGS: "-g -O2 -Wno-discarded-qualifiers"
         run: go test -race -count=1 ./...
 
       - name: Generate SHA-256 checksum
@@ -88,7 +94,7 @@ jobs:
         run: sha256sum vpn-ui-amd64 > vpn-ui-amd64.sha256
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vpn-ui-amd64
           path: |
