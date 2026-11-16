@@ -105,16 +105,21 @@ func TestRequireSuperAdmin(t *testing.T) {
 	}
 }
 
-// A page navigation redirects; an XHR gets a JSON status. Denying a page with a raw
-// 403 would leave the browser on a blank screen.
+// A page navigation redirects (when the caller has another page to land on, or
+// 403 when they have none); an XHR gets a JSON status. Denying a page with a raw
+// 403 when they hold another page would leave the browser on a blank screen.
 func TestDenyShapeMatchesRequestKind(t *testing.T) {
-	limited := &model.User{Id: 2, Enable: true}
-	if got, _ := runGuarded(t, limited, requirePerm(model.PermAccessInbounds), false); got != http.StatusTemporaryRedirect {
+	redirectable := &model.User{Id: 2, Enable: true, Permissions: model.PermAccessOverview}
+	if got, _ := runGuarded(t, redirectable, requirePerm(model.PermAccessInbounds), false); got != http.StatusTemporaryRedirect {
 		t.Errorf("page navigation denial = %d; want 307 redirect", got)
+	}
+	noPages := &model.User{Id: 3, Enable: true}
+	if got, _ := runGuarded(t, noPages, requirePerm(model.PermAccessInbounds), false); got != http.StatusForbidden {
+		t.Errorf("page navigation denial with no reachable landing page = %d; want 403", got)
 	}
 	// XHR: 200 so axios resolves and the UI can render the reason. A real 403 makes
 	// axios reject, and the user sees "Request failed with status code 403".
-	got, body := runGuarded(t, limited, requirePerm(model.PermAccessInbounds), true)
+	got, body := runGuarded(t, redirectable, requirePerm(model.PermAccessInbounds), true)
 	if got != http.StatusOK {
 		t.Errorf("xhr denial = %d; want 200 so the message reaches the user", got)
 	}
@@ -123,7 +128,7 @@ func TestDenyShapeMatchesRequestKind(t *testing.T) {
 	}
 	// GET without Accept: text/html and without X-Requested-With is treated as data, not navigation.
 	r := gin.New()
-	r.GET("/guarded", withUser(limited), requirePerm(model.PermAccessInbounds), func(c *gin.Context) {
+	r.GET("/guarded", withUser(redirectable), requirePerm(model.PermAccessInbounds), func(c *gin.Context) {
 		c.String(http.StatusOK, "reached")
 	})
 	rec := httptest.NewRecorder()

@@ -352,6 +352,8 @@ func TestInboundServiceBotMultiInboundAndParkedHelpers(t *testing.T) {
 	parkSource := seedTaggedInbound(t, model.VLESS, 48303, []map[string]any{
 		{"id": "55555555-5555-5555-5555-555555555555", "email": "parked@example.com", "enable": false, "totalGB": float64(2 << 30), "subId": "park-sub"},
 	})
+	seedTrafficRow(t, xray.ClientTraffic{InboundId: ib1.Id, Enable: false, Email: "alice@example.com", Total: 5 << 30})
+	seedTrafficRow(t, xray.ClientTraffic{InboundId: parkSource.Id, Enable: false, Email: "parked@example.com", Total: 2 << 30})
 	acctSvc.MigrationAccounts()
 
 	// Spread alice across ib1 + ib2, then point client_traffics.inbound_id to a stale non-existent inbound ID.

@@ -123,7 +123,10 @@ func TestWgcXrayConfig(t *testing.T) {
 	if _, err := os.Stat(xrayBin); err != nil {
 		t.Skipf("xray binary not found at %s: %v", xrayBin, err)
 	}
-	out, err := exec.Command(xrayBin, "-test", "-c", cfgPath).CombinedOutput()
+	assetDir, _ := filepath.Abs("../../corebundle/core")
+	cmd := exec.Command(xrayBin, "-test", "-c", cfgPath)
+	cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+assetDir)
+	out, err := cmd.CombinedOutput()
 	t.Logf("xray -test output:\n%s", string(out))
 	if err != nil {
 		// dump the routing + dokodemo portion of the config for diagnosis

@@ -243,8 +243,8 @@ func TestRadiusAccountingIdempotentRedialKeepsRuleAcrossStop(t *testing.T) {
 			},
 		},
 		pending:     map[string]time.Time{},
-		stationIP:   map[string]string{},
-		stationSeen: map[string]time.Time{},
+		stationIP:   map[string]string{"pptp:2:0:203.0.113.9:5": "10.1.0.5"},
+		stationSeen: map[string]time.Time{"pptp:2:0:203.0.113.9:5": time.Now()},
 		nftService:  NftService{acctBackend: backend},
 		secret:      []byte("testsecret"),
 		foldTrafficFn: func(email, protocol string, inboundId int, up, down int64) {
