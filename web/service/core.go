@@ -241,6 +241,14 @@ func daemonVersion(name string) string {
 	return v
 }
 
+// invalidateDaemonVersionCache clears any cached version for a daemon binary so
+// core status cards immediately show newly updated or rolled-back versions.
+func invalidateDaemonVersionCache(name string) {
+	daemonVersionMu.Lock()
+	delete(daemonVersionCache, name)
+	daemonVersionMu.Unlock()
+}
+
 func procFileIsOne(path string) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {

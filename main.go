@@ -1483,13 +1483,15 @@ func runUpdateCore(args ...string) {
 
 	fs := flag.NewFlagSet("update-core", flag.ContinueOnError)
 	var (
-		version  string
-		url      string
-		filePath string
-		sha256   string
-		rollback bool
-		listOnly bool
-		asJSON   bool
+		version      string
+		url          string
+		filePath     string
+		sha256       string
+		rollback     bool
+		listOnly     bool
+		listUpstream bool
+		refresh      bool
+		asJSON       bool
 	)
 	fs.StringVar(&version, "version", "", "target release tag/version (e.g. v26.11.9 or v1.14.4)")
 	fs.StringVar(&url, "url", "", "download archive/binary directly from this URL")
@@ -1497,6 +1499,8 @@ func runUpdateCore(args ...string) {
 	fs.StringVar(&sha256, "sha256", "", "expected SHA-256 hex checksum of the artifact")
 	fs.BoolVar(&rollback, "rollback", false, "roll back target's custom override to .bak or bundled binary")
 	fs.BoolVar(&listOnly, "list", false, "list active, custom, and bundled sidecar binary versions")
+	fs.BoolVar(&listUpstream, "versions", false, "fetch available official upstream versions for target")
+	fs.BoolVar(&refresh, "refresh", false, "bypass upstream version cache when used with --versions")
 	fs.BoolVar(&asJSON, "json", false, "output JSON")
 	if err := fs.Parse(flagArgs); err != nil {
 		os.Exit(2)
@@ -1508,6 +1512,40 @@ func runUpdateCore(args ...string) {
 	}
 
 	var coreSvc service.CoreService
+	if listUpstream {
+		if target == "" {
+			fmt.Fprintf(os.Stderr, "usage: vpn-ui update-core <target> --versions [--refresh] [--json]\n")
+			fmt.Fprintf(os.Stderr, "targets: %s\n", strings.Join(service.SupportedCoreUpdateTargets(), ", "))
+			os.Exit(2)
+		}
+		spec, releases, err := coreSvc.ListUpstreamCoreVersions(target, refresh)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to list upstream versions for %s: %v\n", target, err)
+			os.Exit(1)
+		}
+		if asJSON {
+			out, _ := json.MarshalIndent(releases, "", "  ")
+			fmt.Println(string(out))
+			return
+		}
+		fmt.Printf("Upstream versions for %s (%s) [%s]:\n", spec.Target, spec.GithubRepo, spec.UpstreamURL)
+		for _, r := range releases {
+			flags := ""
+			if r.Latest {
+				flags += " [latest]"
+			}
+			if r.Prerelease {
+				flags += " [pre-release]"
+			}
+			if r.AssetName != "" {
+				flags += " -> " + r.AssetName
+			} else if r.SourceOnly {
+				flags += " (source)"
+			}
+			fmt.Printf("  %-22s %-12s%s\n", r.Tag, strings.Split(r.PublishedAt, "T")[0], flags)
+		}
+		return
+	}
 	if listOnly || (target == "" && !rollback && filePath == "" && url == "") {
 		inv := coreSvc.GetCoreBinaryInventory()
 		if asJSON {
@@ -1536,7 +1574,7 @@ func runUpdateCore(args ...string) {
 	}
 
 	if target == "" {
-		fmt.Fprintf(os.Stderr, "usage: vpn-ui update-core <target|all> [--version vX.Y.Z] [--url URL] [--file PATH] [--sha256 HEX] [--rollback] [--list] [--json]\n")
+		fmt.Fprintf(os.Stderr, "usage: vpn-ui update-core <target|all> [--version vX.Y.Z] [--versions] [--url URL] [--file PATH] [--sha256 HEX] [--rollback] [--list] [--json]\n")
 		fmt.Fprintf(os.Stderr, "targets: %s, all\n", strings.Join(service.SupportedCoreUpdateTargets(), ", "))
 		os.Exit(2)
 	}
@@ -1564,13 +1602,7 @@ func runUpdateCore(args ...string) {
 		return nil
 	}
 	verifyViaSocketOrExec := func(spec service.CoreUpdateSpec, destPath string) error {
-		if runtime.GOOS == "linux" && len(spec.VersionArgs) > 0 {
-			out, err := exec.Command(destPath, spec.VersionArgs...).CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("%s execution smoke test failed: %v (%s)", spec.Target, err, strings.TrimSpace(string(out)))
-			}
-		}
-		return nil
+		return service.RunBinaryVersionCheck(spec, destPath)
 	}
 
 	if rollback {
@@ -3327,7 +3359,7 @@ func main() {
 		fmt.Println("    ctl <cmd>      control the RUNNING panel over its socket:")
 		fmt.Println("                   " + strings.Join(service.ControlCommands, ", "))
 		fmt.Println("    update         install the latest release or --local <path> (backs up DB + .bak rollback)")
-		fmt.Println("    update-core    independently update/rollback sidecar binaries (xray, telemt, sing-box, amneziawg-go, ocserv, all)")
+		fmt.Println("    update-core    list versions / update / rollback core binaries (" + strings.Join(service.SupportedCoreUpdateTargets(), ", ") + ", all)")
 		fmt.Println("    install-menu   install the 'vpn-ui' management menu to " + service.MenuScriptPath)
 		fmt.Println("    --systemd      install+enable+start the panel as a systemd service")
 		fmt.Println("    --random       randomize panel port + username + password + web path")

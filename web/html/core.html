@@ -144,7 +144,7 @@
                     :style="{ marginTop: '10px' }"></a-alert>
 
                   <div class="core-actions">
-                    <a-space>
+                    <a-space :style="{ flexWrap: 'wrap' }">
                       <a-button size="small" type="primary" :disabled="!canRestart(core)"
                         @click="restart(core.name)">
                         <a-icon type="reload"></a-icon>{{ i18n "pages.core.restart" }}
@@ -174,6 +174,10 @@
                       </a-tooltip>
                       <a-button size="small" v-else @click="openConfig(core.name)">
                         <a-icon type="edit"></a-icon>{{ i18n "pages.core.editConfig" }}
+                      </a-button>
+                      <a-button size="small" v-if="coreBinaryTarget(core.name)"
+                        @click="openCoreUpdateByName(coreBinaryTarget(core.name))">
+                        <a-icon type="cloud-download"></a-icon>Versions / Update
                       </a-button>
                     </a-space>
                   </div>
@@ -263,18 +267,18 @@
             <a-card hoverable :loading="binaryLoading">
               <template #title>
                 <a-icon type="cloud-download"></a-icon>
-                <span :style="{ marginLeft: '8px' }">Sidecar &amp; Core Binaries</span>
+                <span :style="{ marginLeft: '8px' }">Sidecar &amp; Protocol Core Updates</span>
               </template>
               <template #extra>
                 <a-space>
                   <a-button size="small" @click="loadBinaries">
                     <a-icon type="reload"></a-icon>{{ i18n "pages.core.refresh" }}
                   </a-button>
-                  <a-popconfirm title="Update all upstream-tracked binaries sequentially?"
+                  <a-popconfirm title="Download &amp; install the latest official release for all auto-updatable cores?"
                     ok-text="{{ i18n "confirm" }}" cancel-text="{{ i18n "cancel" }}"
                     @confirm="updateAllCores">
                     <a-button size="small" type="primary" :loading="coreUpdateModal.submitting">
-                      <a-icon type="sync"></a-icon>Update All
+                      <a-icon type="sync"></a-icon>Update All to Latest
                     </a-button>
                   </a-popconfirm>
                 </a-space>
@@ -282,14 +286,24 @@
               <a-row :gutter="[12, 12]">
                 <a-col :xs="24" :md="12" :xl="8" v-for="bin in binaryInventory" :key="bin.core">
                   <div :style="{ border: '1px solid rgba(128,128,128,0.2)', borderRadius: '8px', padding: '12px' }">
-                    <div :style="{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }">
+                    <div :style="{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', gap: '6px', flexWrap: 'wrap' }">
                       <strong>[[ bin.core ]]</strong>
-                      <a-tag :color="binarySourceColor(bin.source)">[[ bin.source ]]</a-tag>
+                      <a-space :size="4">
+                        <a-tag :color="bin.autoUpdatable ? 'cyan' : 'orange'">
+                          [[ bin.autoUpdatable ? 'Auto-Update' : 'Versions / Custom' ]]
+                        </a-tag>
+                        <a-tag :color="binarySourceColor(bin.source)">[[ bin.source ]]</a-tag>
+                      </a-space>
+                    </div>
+                    <div class="core-kv" v-if="bin.protocols">
+                      <span class="core-kv-label">Protocols</span>
+                      <span class="core-kv-value" :style="{ maxWidth: '68%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }"
+                        :title="bin.protocols">[[ bin.protocols ]]</span>
                     </div>
                     <div class="core-kv">
                       <span class="core-kv-label">{{ i18n "pages.core.version" }}</span>
                       <span class="core-kv-value" :style="{ maxWidth: '65%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }"
-                        :title="bin.version || ''">[[ bin.version || '—' ]]</span>
+                        :title="bin.version || ''">[[ bin.installedVersion || bin.version || '—' ]]</span>
                     </div>
                     <div class="core-kv">
                       <span class="core-kv-label">Service</span>
@@ -301,8 +315,16 @@
                         :title="bin.activePath || bin.customPath">[[ bin.activePath || 'not found' ]]</span>
                     </div>
                     <div :style="{ marginTop: '10px', display: 'flex', gap: '8px', flexWrap: 'wrap' }">
-                      <a-button size="small" type="primary" @click="openCoreUpdateModal(bin)">
-                        <a-icon type="download"></a-icon>Update
+                      <a-popconfirm v-if="bin.autoUpdatable"
+                        :title="'Download & install latest official release of ' + bin.core + '?'"
+                        ok-text="{{ i18n "confirm" }}" cancel-text="{{ i18n "cancel" }}"
+                        @confirm="quickUpdateCoreLatest(bin.core)">
+                        <a-button size="small" type="primary" :loading="quickUpdatingCore === bin.core">
+                          <a-icon type="rocket"></a-icon>Latest
+                        </a-button>
+                      </a-popconfirm>
+                      <a-button size="small" :type="bin.autoUpdatable ? 'default' : 'primary'" @click="openCoreUpdateModal(bin)">
+                        <a-icon type="bars"></a-icon>Versions / Choose
                       </a-button>
                       <a-popconfirm v-if="bin.hasBackup || bin.source === 'custom-override'"
                         title="Roll back this binary to its previous snapshot / bundled fallback?"
@@ -641,22 +663,110 @@
     </a-spin>
   </a-modal>
 
-  <a-modal v-model="coreUpdateModal.visible" :title="'Update Binary: ' + coreUpdateModal.core"
-    :class="themeSwitcher.currentTheme" :width="isMobile ? '95%' : '520px'"
-    ok-text="Update" cancel-text='{{ i18n "cancel" }}'
+  <a-modal v-model="coreUpdateModal.visible" :title="'Core Versions & Update: ' + coreUpdateModal.core"
+    :class="themeSwitcher.currentTheme" :width="isMobile ? '96%' : '680px'"
+    :ok-text="coreUpdateOkText" cancel-text='{{ i18n "cancel" }}'
+    :ok-button-props="{ props: { disabled: !canSubmitCoreUpdate } }"
     :confirm-loading="coreUpdateModal.submitting" @ok="submitCoreUpdate">
-    <a-alert type="info" show-icon :style="{ marginBottom: '12px' }"
-      message="Installs to custom override directory without overwriting panel bundle; keeps .bak, restarts only the affected core, and rolls back automatically if unhealthy."></a-alert>
+    <a-alert type="info" show-icon :style="{ marginBottom: '12px' }">
+      <template #message>
+        <span>
+          Installed: <b>[[ coreUpdateModal.installedVersion || 'not installed' ]]</b>
+          <template v-if="coreUpdateModal.upstreamRepo">
+            &nbsp;|&nbsp; Official source:
+            <a v-if="coreUpdateModal.upstreamUrl" :href="coreUpdateModal.upstreamUrl" target="_blank" rel="noopener">
+              [[ coreUpdateModal.upstreamRepo ]]
+            </a>
+            <span v-else>[[ coreUpdateModal.upstreamRepo ]]</span>
+          </template>
+        </span>
+      </template>
+      <template #description>
+        Updates install safely to the custom override directory with a .bak snapshot, restart only the affected core, and auto-roll back if health checks fail.
+      </template>
+    </a-alert>
+
+    <a-alert v-if="!coreUpdateModal.autoUpdatable" type="warning" show-icon :style="{ marginBottom: '12px' }"
+      :message="coreUpdateModal.updateMode === 'source-go'
+        ? 'Upstream publishes source tags only (no Go toolchain detected on host for auto-build). Pick a version to inspect or pass a Custom binary URL below.'
+        : 'Upstream publishes C source archives only (no prebuilt generic Linux binary). Pick a version below to view upstream release notes, or paste a Custom ELF / .tar.gz / .zip URL.'">
+    </a-alert>
+
+    <div :style="{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: '10px' }">
+      <a-input-search v-model="coreUpdateModal.filter" allow-clear size="small"
+        placeholder="Search version tag..." :style="{ width: isMobile ? '100%' : '230px' }"></a-input-search>
+      <a-space :size="6">
+        <a-button v-if="latestUpstreamRelease" size="small" type="primary" ghost
+          @click="selectUpstreamVersion(latestUpstreamRelease.tag)">
+          Select Latest ([[ latestUpstreamRelease.tag ]])
+        </a-button>
+        <a-button size="small" :loading="coreUpdateModal.versionsLoading"
+          @click="loadUpstreamVersions(coreUpdateModal.core, true)">
+          <a-icon type="reload"></a-icon>Refresh List
+        </a-button>
+      </a-space>
+    </div>
+
+    <a-alert v-if="coreUpdateModal.versionsError" type="error" show-icon :style="{ marginBottom: '10px' }"
+      :message="coreUpdateModal.versionsError"></a-alert>
+
+    <a-spin :spinning="coreUpdateModal.versionsLoading">
+      <div v-if="filteredUpstreamReleases.length"
+        :style="{ maxHeight: '240px', overflowY: 'auto', border: '1px solid rgba(128,128,128,0.22)', borderRadius: '6px', marginBottom: '12px' }">
+        <div v-for="rel in filteredUpstreamReleases" :key="rel.tag"
+          @click="selectUpstreamVersion(rel.tag)"
+          :style="{
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px',
+            padding: '8px 12px', cursor: 'pointer',
+            borderBottom: '1px solid rgba(128,128,128,0.12)',
+            background: coreUpdateModal.version === rel.tag ? 'rgba(24, 144, 255, 0.14)' : 'transparent'
+          }">
+          <div :style="{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }">
+            <a-icon :type="coreUpdateModal.version === rel.tag ? 'check-circle' : 'tag'"
+              :style="{ color: coreUpdateModal.version === rel.tag ? '#1890ff' : '' }"></a-icon>
+            <strong>[[ rel.tag ]]</strong>
+            <a-tag v-if="rel.latest" color="green">Latest</a-tag>
+            <a-tag v-if="rel.prerelease" color="orange">Pre-release</a-tag>
+            <a-tag v-if="!rel.sourceOnly" color="blue">[[ rel.assetName || 'Prebuilt' ]]</a-tag>
+            <a-tag v-else>Source</a-tag>
+          </div>
+          <div :style="{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0, fontSize: '12px', opacity: 0.75 }">
+            <span v-if="rel.publishedAt">[[ rel.publishedAt.slice(0, 10) ]]</span>
+            <a v-if="rel.url" :href="rel.url" target="_blank" rel="noopener" @click.stop title="View official release">
+              <a-icon type="link"></a-icon>
+            </a>
+          </div>
+        </div>
+      </div>
+      <div v-else-if="!coreUpdateModal.versionsLoading && !coreUpdateModal.versionsError"
+        :style="{ padding: '12px', textAlign: 'center', opacity: 0.65, border: '1px dashed rgba(128,128,128,0.25)', borderRadius: '6px', marginBottom: '12px' }">
+        No matching versions found.
+      </div>
+    </a-spin>
+
     <a-form :label-col="{ span: 7 }" :wrapper-col="{ span: 17 }">
-      <a-form-item label="Release Tag">
-        <a-input v-model="coreUpdateModal.version" placeholder="Leave empty for latest release (e.g. v1.14.4)"></a-input>
+      <a-form-item label="Selected Version">
+        <a-select v-model="coreUpdateModal.version" show-search allow-clear
+          placeholder="Select version from list (empty = auto Latest)">
+          <a-select-option value="">Latest official release (auto)</a-select-option>
+          <a-select-option v-for="rel in coreUpdateModal.releases" :key="rel.tag" :value="rel.tag">
+            [[ rel.tag ]][[ rel.latest ? ' (Latest)' : '' ]][[ rel.prerelease ? ' [Pre-release]' : '' ]]
+          </a-select-option>
+        </a-select>
       </a-form-item>
-      <a-form-item label="Custom URL">
-        <a-input v-model="coreUpdateModal.url" placeholder="Optional direct ELF / .tar.gz / .zip URL"></a-input>
-      </a-form-item>
-      <a-form-item label="SHA-256">
-        <a-input v-model="coreUpdateModal.sha256" placeholder="Optional 64-char hex checksum"></a-input>
-      </a-form-item>
+      <div :style="{ marginBottom: '8px', textAlign: 'right' }">
+        <a @click="coreUpdateModal.showAdvanced = !coreUpdateModal.showAdvanced">
+          [[ coreUpdateModal.showAdvanced ? 'Hide Custom URL / Checksum' : 'Custom URL / SHA-256 Override' ]]
+        </a>
+      </div>
+      <template v-if="coreUpdateModal.showAdvanced || !coreUpdateModal.autoUpdatable">
+        <a-form-item label="Custom URL">
+          <a-input v-model="coreUpdateModal.url" placeholder="Optional direct ELF / .tar.gz / .zip URL"></a-input>
+        </a-form-item>
+        <a-form-item label="SHA-256">
+          <a-input v-model="coreUpdateModal.sha256" placeholder="Optional 64-char hex checksum"></a-input>
+        </a-form-item>
+      </template>
     </a-form>
   </a-modal>
 {{template "page/shell_end" . }}
@@ -741,10 +851,21 @@
       cfgCm: null,
       binaryInventory: [],
       binaryLoading: false,
+      quickUpdatingCore: '',
       coreUpdateModal: {
         visible: false,
         submitting: false,
+        versionsLoading: false,
+        versionsError: '',
         core: '',
+        installedVersion: '',
+        upstreamRepo: '',
+        upstreamUrl: '',
+        updateMode: 'prebuilt',
+        autoUpdatable: true,
+        showAdvanced: false,
+        filter: '',
+        releases: [],
         version: '',
         url: '',
         sha256: '',
@@ -1341,22 +1462,91 @@
       binarySourceColor(src) {
         return ({ 'custom-override': 'blue', bundled: 'green', 'host-path': 'cyan', missing: 'default' })[src] || 'default';
       },
-      openCoreUpdateModal(bin) {
+      coreBinaryTarget(coreName) {
+        return ({
+          xray: 'xray',
+          mtproto: 'telemt',
+          hysteria2: 'sing-box',
+          awg: 'amneziawg-go',
+          openconnect: 'ocserv',
+          openvpn: 'openvpn',
+          l2tp: 'xl2tpd',
+        })[coreName] || '';
+      },
+      openCoreUpdateByName(target) {
+        const bin = (this.binaryInventory || []).find((b) => b.core === target);
+        if (bin) {
+          this.openCoreUpdateModal(bin);
+          return;
+        }
+        this.openCoreUpdateModal({
+          core: target,
+          installedVersion: '',
+          upstreamRepo: '',
+          upstreamUrl: '',
+          updateMode: 'prebuilt',
+          autoUpdatable: true,
+        });
+      },
+      async openCoreUpdateModal(bin) {
         this.coreUpdateModal = {
           visible: true,
           submitting: false,
+          versionsLoading: false,
+          versionsError: '',
           core: bin.core,
+          installedVersion: bin.installedVersion || bin.version || '',
+          upstreamRepo: bin.upstreamRepo || '',
+          upstreamUrl: bin.upstreamUrl || '',
+          updateMode: bin.updateMode || 'prebuilt',
+          autoUpdatable: bin.autoUpdatable !== false,
+          showAdvanced: false,
+          filter: '',
+          releases: [],
           version: '',
           url: '',
           sha256: '',
         };
+        await this.loadUpstreamVersions(bin.core, false);
+      },
+      async loadUpstreamVersions(core, refresh) {
+        if (!core) return;
+        this.coreUpdateModal.versionsLoading = true;
+        this.coreUpdateModal.versionsError = '';
+        const q = refresh ? '?refresh=1' : '';
+        const msg = await HttpUtil.get('/panel/core/upstream/' + encodeURIComponent(core) + q);
+        this.coreUpdateModal.versionsLoading = false;
+        if (msg && msg.success && msg.obj) {
+          this.coreUpdateModal.releases = msg.obj.releases || [];
+          if (msg.obj.upstreamRepo) this.coreUpdateModal.upstreamRepo = msg.obj.upstreamRepo;
+          if (msg.obj.upstreamUrl) this.coreUpdateModal.upstreamUrl = msg.obj.upstreamUrl;
+          if (msg.obj.updateMode) this.coreUpdateModal.updateMode = msg.obj.updateMode;
+          if (!this.coreUpdateModal.version) {
+            const latest = this.coreUpdateModal.releases.find((r) => r.latest) || this.coreUpdateModal.releases[0];
+            if (latest && latest.tag && this.coreUpdateModal.autoUpdatable) {
+              this.coreUpdateModal.version = latest.tag;
+            }
+          }
+        } else {
+          this.coreUpdateModal.versionsError = (msg && msg.msg) ? msg.msg : 'Failed to fetch upstream releases.';
+        }
+      },
+      selectUpstreamVersion(tag) {
+        this.coreUpdateModal.version = tag || '';
+      },
+      async quickUpdateCoreLatest(core) {
+        this.quickUpdatingCore = core;
+        const msg = await HttpUtil.post('/panel/core/update/' + encodeURIComponent(core), {});
+        this.quickUpdatingCore = '';
+        if (msg && msg.obj && msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
+        await this.loadStatus(false);
       },
       async submitCoreUpdate() {
         this.coreUpdateModal.submitting = true;
-        const msg = await HttpUtil.post('/panel/core/update/' + this.coreUpdateModal.core, {
-          version: this.coreUpdateModal.version.trim(),
-          url: this.coreUpdateModal.url.trim(),
-          sha256: this.coreUpdateModal.sha256.trim(),
+        const msg = await HttpUtil.post('/panel/core/update/' + encodeURIComponent(this.coreUpdateModal.core), {
+          version: (this.coreUpdateModal.version || '').trim(),
+          url: (this.coreUpdateModal.url || '').trim(),
+          sha256: (this.coreUpdateModal.sha256 || '').trim(),
         });
         this.coreUpdateModal.submitting = false;
         if (msg && msg.obj && msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
@@ -1374,13 +1564,37 @@
       },
       async rollbackCoreBinary(core) {
         this.binaryLoading = true;
-        const msg = await HttpUtil.post('/panel/core/rollback/' + core, {});
+        const msg = await HttpUtil.post('/panel/core/rollback/' + encodeURIComponent(core), {});
         this.binaryLoading = false;
         if (msg && msg.obj && msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
         await this.loadStatus(false);
       },
     },
     computed: {
+      latestUpstreamRelease() {
+        const list = this.coreUpdateModal.releases || [];
+        return list.find((r) => r.latest) || list[0] || null;
+      },
+      filteredUpstreamReleases() {
+        const q = (this.coreUpdateModal.filter || '').trim().toLowerCase();
+        const list = this.coreUpdateModal.releases || [];
+        if (!q) return list;
+        return list.filter((r) =>
+          (r.tag || '').toLowerCase().includes(q) ||
+          (r.name || '').toLowerCase().includes(q) ||
+          (r.assetName || '').toLowerCase().includes(q)
+        );
+      },
+      canSubmitCoreUpdate() {
+        if (this.coreUpdateModal.submitting) return false;
+        if ((this.coreUpdateModal.url || '').trim()) return true;
+        return !!this.coreUpdateModal.autoUpdatable;
+      },
+      coreUpdateOkText() {
+        if ((this.coreUpdateModal.url || '').trim()) return 'Download & Install URL';
+        if ((this.coreUpdateModal.version || '').trim()) return 'Download & Install (' + this.coreUpdateModal.version.trim() + ')';
+        return 'Download & Install Latest';
+      },
       // The core's log, coloured by severity through the shared LogFormatter.
       // Carries the core's own name as the per-line badge for the same reason
       // the aggregated view does: a downloaded or copied line stays attributable.

@@ -21,7 +21,7 @@ var name string
 const (
 	// DefaultVersion is the fallback semantic version when embedded/linker metadata
 	// is missing or below MinSupportedVersion.
-	DefaultVersion = "2.0.0"
+	DefaultVersion = "2.0.1"
 	// MinSupportedVersion ensures builds of this fork always report strictly above 1.9.4.
 	MinSupportedVersion = "2.0.0"
 	// DefaultRepo is the default GitHub owner/repository for releases and self-updates.

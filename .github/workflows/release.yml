@@ -75,7 +75,10 @@ jobs:
                 test -x /tmp/vpn-ui-menu
                 if command -v bash >/dev/null 2>&1; then
                   bash -n /tmp/vpn-ui-menu
+                  /tmp/vpn-ui-menu --help | grep -q "bbr"
+                  /tmp/vpn-ui-menu bbr status
                 fi
+                /usr/local/bin/vpn-ui update-core --list
                 /usr/local/bin/vpn-ui migrate
                 test -s /tmp/vpndb/vpn-ui.db
                 /usr/local/bin/vpn-ui migrate

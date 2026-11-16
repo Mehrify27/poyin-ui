@@ -49,6 +49,7 @@ func (a *CoreController) initRouter(g *gin.RouterGroup) {
 	// through the logs endpoint.
 	g.POST("/config/:core", requireSuperAdmin(), a.saveCoreConfig)
 	g.GET("/versions", a.versions)
+	g.GET("/upstream/:core", a.upstreamVersions)
 	g.POST("/update/:core", requireSuperAdmin(), a.updateCore)
 	g.POST("/rollback/:core", requireSuperAdmin(), a.rollbackCore)
 }
@@ -270,6 +271,27 @@ type coreBinaryUpdateForm struct {
 func (a *CoreController) versions(c *gin.Context) {
 	jsonObj(c, gin.H{
 		"binaries": a.coreService.GetCoreBinaryInventory(),
+	}, nil)
+}
+
+// upstreamVersions returns the official available release/tag list for a core binary
+// so operators can pick the latest release or any specific version directly from UI.
+func (a *CoreController) upstreamVersions(c *gin.Context) {
+	forceRefresh := c.Query("refresh") == "1" || c.Query("refresh") == "true"
+	spec, releases, err := a.coreService.ListUpstreamCoreVersions(c.Param("core"), forceRefresh)
+	if err != nil {
+		jsonMsg(c, "Failed to fetch upstream versions", err)
+		return
+	}
+	jsonObj(c, gin.H{
+		"core":          spec.Target,
+		"serviceCore":   spec.ServiceCore,
+		"protocols":     spec.Protocols,
+		"upstreamRepo":  spec.GithubRepo,
+		"upstreamUrl":   spec.UpstreamURL,
+		"updateMode":    spec.UpdateMode,
+		"autoUpdatable": service.CanAutoUpdateTarget(spec.Target),
+		"releases":      releases,
 	}, nil)
 }
 

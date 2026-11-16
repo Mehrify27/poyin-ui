@@ -374,3 +374,241 @@ func TestUpdateCoreAutoRollbackOnHealthFailureAndManualRollback(t *testing.T) {
 		t.Fatalf("expected custom override to be removed, stat err = %v", statErr)
 	}
 }
+
+func TestScoreReleaseAssetPrefersMuslAndAvoidsV3(t *testing.T) {
+	telemtAssets := []githubReleaseAsset{
+		{Name: "telemt", BrowserDownloadURL: "https://example.com/telemt"},
+		{Name: "telemt-x86_64-linux-gnu.tar.gz", BrowserDownloadURL: "https://example.com/gnu"},
+		{Name: "telemt-x86_64-v3-linux-musl.tar.gz", BrowserDownloadURL: "https://example.com/v3-musl"},
+		{Name: "telemt-x86_64-linux-musl.tar.gz", BrowserDownloadURL: "https://example.com/musl"},
+	}
+	name, _, _, _ := pickReleaseAsset("telemt", telemtAssets, "amd64")
+	if name != "telemt-x86_64-linux-musl.tar.gz" {
+		t.Fatalf("telemt amd64 picked %q, want telemt-x86_64-linux-musl.tar.gz", name)
+	}
+
+	singboxAssets := []githubReleaseAsset{
+		{Name: "sing-box-1.14.4-linux-amd64-glibc.tar.gz", BrowserDownloadURL: "https://example.com/glibc"},
+		{Name: "sing-box-1.14.4-linux-amd64.tar.gz", BrowserDownloadURL: "https://example.com/plain"},
+		{Name: "sing-box-1.14.4-linux-amd64-musl.tar.gz", BrowserDownloadURL: "https://example.com/musl"},
+	}
+	name, _, _, _ = pickReleaseAsset("sing-box", singboxAssets, "amd64")
+	if name != "sing-box-1.14.4-linux-amd64-musl.tar.gz" {
+		t.Fatalf("sing-box amd64 picked %q, want sing-box-1.14.4-linux-amd64-musl.tar.gz", name)
+	}
+
+	singboxNoMusl := []githubReleaseAsset{
+		{Name: "sing-box-1.14.4-linux-amd64-glibc.tar.gz", BrowserDownloadURL: "https://example.com/glibc"},
+		{Name: "sing-box-1.14.4-linux-amd64.tar.gz", BrowserDownloadURL: "https://example.com/plain"},
+	}
+	name, _, _, _ = pickReleaseAsset("sing-box", singboxNoMusl, "amd64")
+	if name != "sing-box-1.14.4-linux-amd64.tar.gz" {
+		t.Fatalf("sing-box amd64 fallback picked %q, want static plain tar.gz over glibc", name)
+	}
+
+	armAssets := []githubReleaseAsset{
+		{Name: "sing-box-1.14.4-linux-arm64.tar.gz", BrowserDownloadURL: "https://example.com/arm64"},
+		{Name: "sing-box-1.14.4-linux-armv7.tar.gz", BrowserDownloadURL: "https://example.com/armv7"},
+	}
+	name, _, _, _ = pickReleaseAsset("sing-box", armAssets, "arm")
+	if name != "sing-box-1.14.4-linux-armv7.tar.gz" {
+		t.Fatalf("sing-box arm picked %q, want armv7 (must not match arm64)", name)
+	}
+}
+
+func TestListUpstreamCoreVersionsAndInstallSelectedTag(t *testing.T) {
+	customDir := t.TempDir()
+	t.Setenv(binutil.CustomBinDirEnv, customDir)
+
+	archTok := archTokenForTest(runtime.GOARCH)
+	oldELF := makeUpdaterTestELF(t, runtime.GOARCH, 0x33)
+	oldZip := makeTestZipArchive(t, "xray", oldELF)
+	oldSum := sha256HexBytes(oldZip)
+
+	var srv *httptest.Server
+	var xrayListCalls int
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/XTLS/Xray-core/releases":
+			xrayListCalls++
+			assetOld := fmt.Sprintf("Xray-linux-%s.zip", archTok)
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"tag_name":     "v26.12.0-rc.1",
+					"prerelease":   true,
+					"published_at": "2026-11-16T00:00:00Z",
+					"assets": []map[string]any{
+						{"name": assetOld, "browser_download_url": srv.URL + "/dl/rc/" + assetOld},
+					},
+				},
+				{
+					"tag_name":     "v26.11.9",
+					"prerelease":   false,
+					"published_at": "2026-11-09T00:00:00Z",
+					"assets": []map[string]any{
+						{"name": assetOld, "browser_download_url": srv.URL + "/dl/latest/" + assetOld},
+					},
+				},
+				{
+					"tag_name":     "v26.10.1",
+					"prerelease":   false,
+					"published_at": "2026-10-01T00:00:00Z",
+					"assets": []map[string]any{
+						{"name": assetOld, "browser_download_url": srv.URL + "/dl/old/" + assetOld},
+						{"name": assetOld + ".dgst", "browser_download_url": srv.URL + "/dl/old/" + assetOld + ".dgst"},
+					},
+				},
+			})
+		case "/repos/XTLS/Xray-core/releases/tags/v26.10.1":
+			assetOld := fmt.Sprintf("Xray-linux-%s.zip", archTok)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tag_name": "v26.10.1",
+				"assets": []map[string]any{
+					{"name": assetOld, "browser_download_url": srv.URL + "/dl/old/" + assetOld},
+					{"name": assetOld + ".dgst", "browser_download_url": srv.URL + "/dl/old/" + assetOld + ".dgst"},
+				},
+			})
+		case "/dl/old/Xray-linux-" + archTok + ".zip":
+			_, _ = w.Write(oldZip)
+		case "/dl/old/Xray-linux-" + archTok + ".zip.dgst":
+			_, _ = fmt.Fprintf(w, "SHA2-256= %s\n", oldSum)
+		case "/repos/amnezia-vpn/amneziawg-go/releases":
+			_, _ = w.Write([]byte("[]"))
+		case "/repos/amnezia-vpn/amneziawg-go/tags":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"name": "v3.1.20261116", "tarball_url": srv.URL + "/awg.tgz"},
+				{"name": "v3.0.3", "tarball_url": srv.URL + "/awg303.tgz"},
+			})
+		case "/api/v4/projects/openconnect%2Focserv/releases":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"tag_name": "1.3.0", "name": "ocserv 1.3.0", "released_at": "2024-06-01T00:00:00Z"},
+				{"tag_name": "1.2.4", "name": "ocserv 1.2.4", "released_at": "2024-02-01T00:00:00Z"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	prevGH, prevGL := githubReleaseAPIBase, gitlabReleaseAPIBase
+	githubReleaseAPIBase, gitlabReleaseAPIBase = srv.URL, srv.URL
+	defer func() {
+		githubReleaseAPIBase, gitlabReleaseAPIBase = prevGH, prevGL
+	}()
+
+	svc := &CoreService{}
+	spec, list, err := svc.ListUpstreamCoreVersions("xray", true)
+	if err != nil {
+		t.Fatalf("ListUpstreamCoreVersions(xray): %v", err)
+	}
+	if spec.Target != "xray" || len(list) != 3 {
+		t.Fatalf("unexpected xray upstream list: %+v", list)
+	}
+	if list[0].Latest || !list[0].Prerelease || !list[1].Latest || list[1].Tag != "v26.11.9" {
+		t.Fatalf("expected first non-prerelease v26.11.9 marked Latest, got %+v", list)
+	}
+	if _, _, err := svc.ListUpstreamCoreVersions("xray", false); err != nil {
+		t.Fatalf("cached ListUpstreamCoreVersions(xray): %v", err)
+	}
+	if xrayListCalls != 1 {
+		t.Fatalf("expected second cached lookup not to hit HTTP, calls=%d", xrayListCalls)
+	}
+
+	// Install the explicitly picked older tag v26.10.1.
+	results, err := svc.UpdateCore(CoreUpdateOptions{
+		Target:           "xray",
+		Version:          "v26.10.1",
+		RestartFunc:      func(string) error { return nil },
+		VerifyHealthFunc: func(CoreUpdateSpec, string) error { return nil },
+	})
+	if err != nil || len(results) != 1 || results[0].Status != "updated" {
+		t.Fatalf("install selected version v26.10.1 failed: results=%+v err=%v", results, err)
+	}
+	gotBytes, err := os.ReadFile(results[0].DestPath)
+	if err != nil || !bytes.Equal(gotBytes, oldELF) {
+		t.Fatalf("selected v26.10.1 binary mismatch")
+	}
+
+	// Verify GitHub tag fallback for amneziawg-go and GitLab releases for ocserv.
+	_, awgList, err := svc.ListUpstreamCoreVersions("awg", true)
+	if err != nil || len(awgList) != 2 || awgList[0].Tag != "v3.1.20261116" || !awgList[0].Latest {
+		t.Fatalf("unexpected amneziawg-go tags list: %+v err=%v", awgList, err)
+	}
+	_, ocList, err := svc.ListUpstreamCoreVersions("openconnect", true)
+	if err != nil || len(ocList) != 2 || ocList[0].Tag != "1.3.0" || !ocList[0].Latest || !ocList[0].SourceOnly {
+		t.Fatalf("unexpected ocserv GitLab releases list: %+v err=%v", ocList, err)
+	}
+}
+
+func TestUpdateCoreAllSkipsNonPrebuiltCleanly(t *testing.T) {
+	customDir := t.TempDir()
+	t.Setenv(binutil.CustomBinDirEnv, customDir)
+	// Simulate a server without a Go compiler in PATH so source-go targets skip cleanly.
+	t.Setenv("PATH", t.TempDir())
+
+	archTok := archTokenForTest(runtime.GOARCH)
+	xrayZip := makeTestZipArchive(t, "xray", makeUpdaterTestELF(t, runtime.GOARCH, 0x41))
+	telemtTgz := makeTestTarGzArchive(t, "telemt", makeUpdaterTestELF(t, runtime.GOARCH, 0x42))
+	sbTgz := makeTestTarGzArchive(t, "sing-box-1.14.4/sing-box", makeUpdaterTestELF(t, runtime.GOARCH, 0x43))
+
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/XTLS/Xray-core/releases/latest":
+			name := fmt.Sprintf("Xray-linux-%s.zip", archTok)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tag_name": "v26.11.9",
+				"assets":   []map[string]any{{"name": name, "browser_download_url": srv.URL + "/xray.zip"}},
+			})
+		case "/repos/telemt/telemt/releases/latest":
+			name := fmt.Sprintf("telemt-%s-linux-musl.tar.gz", archTok)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tag_name": "3.5.17",
+				"assets":   []map[string]any{{"name": name, "browser_download_url": srv.URL + "/telemt.tgz"}},
+			})
+		case "/repos/SagerNet/sing-box/releases/latest":
+			name := fmt.Sprintf("sing-box-1.14.4-linux-%s-musl.tar.gz", archTok)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tag_name": "v1.14.4",
+				"assets":   []map[string]any{{"name": name, "browser_download_url": srv.URL + "/sb.tgz"}},
+			})
+		case "/xray.zip":
+			_, _ = w.Write(xrayZip)
+		case "/telemt.tgz":
+			_, _ = w.Write(telemtTgz)
+		case "/sb.tgz":
+			_, _ = w.Write(sbTgz)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	prevBase := githubReleaseAPIBase
+	githubReleaseAPIBase = srv.URL
+	defer func() { githubReleaseAPIBase = prevBase }()
+
+	svc := &CoreService{}
+	results, err := svc.UpdateCore(CoreUpdateOptions{
+		Target:           "all",
+		RestartFunc:      func(string) error { return nil },
+		VerifyHealthFunc: func(CoreUpdateSpec, string) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("UpdateCore(all) should skip source-only targets cleanly without error, got %v", err)
+	}
+	byTarget := map[string]string{}
+	for _, r := range results {
+		byTarget[r.Target] = r.Status
+	}
+	for _, wantUpd := range []string{"xray", "telemt", "sing-box"} {
+		if byTarget[wantUpd] != "updated" {
+			t.Fatalf("target %s status = %q, want updated (all=%v)", wantUpd, byTarget[wantUpd], byTarget)
+		}
+	}
+	for _, wantSkip := range []string{"amneziawg-go", "ocserv", "openvpn", "xl2tpd"} {
+		if byTarget[wantSkip] != "skipped" {
+			t.Fatalf("target %s status = %q, want skipped (all=%v)", wantSkip, byTarget[wantSkip], byTarget)
+		}
+	}
+}
