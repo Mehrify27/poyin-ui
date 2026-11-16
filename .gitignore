@@ -13,7 +13,7 @@ tmp/
 
 # Ignore build and distribution directories
 backup/
-bin/
+/bin/
 dist/
 release/
 node_modules/
@@ -54,6 +54,7 @@ corebundle/core/*
 !corebundle/core/.gitkeep
 
 # Static VPN daemon bundle (built by build/backend/build.sh via Docker)
+!backend/bin/
 backend/bin/*
 !backend/bin/.gitkeep
 
