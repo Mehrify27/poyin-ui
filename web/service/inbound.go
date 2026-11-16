@@ -4420,6 +4420,29 @@ func (s *InboundService) DelClientIPs(tx *gorm.DB, email string) error {
 	return tx.Where("client_email = ?", email).Delete(model.InboundClientIps{}).Error
 }
 
+func (s *InboundService) resolveServingInbound(db *gorm.DB, inboundId int, email string) (*model.Inbound, error) {
+	var (
+		inbound *model.Inbound
+		err     error
+	)
+	if inboundId > 0 {
+		inbound, err = s.GetInbound(inboundId)
+		if err == nil && inbound != nil && s.inboundHasEmail(inbound, email) {
+			return inbound, nil
+		}
+	}
+	serving, sErr := s.inboundsServingEmails(db, []string{email})
+	if sErr == nil {
+		for _, item := range serving {
+			cand, cErr := s.GetInbound(item.Id)
+			if cErr == nil && cand != nil && s.inboundHasEmail(cand, email) {
+				return cand, nil
+			}
+		}
+	}
+	return inbound, err
+}
+
 func (s *InboundService) GetClientInboundByTrafficID(trafficId int) (traffic *xray.ClientTraffic, inbound *model.Inbound, err error) {
 	db := database.GetDB()
 	var traffics []*xray.ClientTraffic
@@ -4429,7 +4452,7 @@ func (s *InboundService) GetClientInboundByTrafficID(trafficId int) (traffic *xr
 		return nil, nil, err
 	}
 	if len(traffics) > 0 {
-		inbound, err = s.GetInbound(traffics[0].InboundId)
+		inbound, err = s.resolveServingInbound(db, traffics[0].InboundId, traffics[0].Email)
 		return traffics[0], inbound, err
 	}
 	return nil, nil, nil
@@ -4483,22 +4506,12 @@ func (s *InboundService) GetClientInboundByEmail(email string) (traffic *xray.Cl
 		logger.Warningf("Error retrieving ClientTraffic with email %s: %v", email, err)
 		return nil, nil, err
 	}
+	hintInboundId := 0
 	if len(traffics) > 0 {
 		traffic = traffics[0]
-		inbound, err = s.GetInbound(traffic.InboundId)
-		if err == nil && inbound != nil && s.inboundHasEmail(inbound, email) {
-			return traffic, inbound, nil
-		}
+		hintInboundId = traffic.InboundId
 	}
-	serving, sErr := s.inboundsServingEmails(db, []string{email})
-	if sErr == nil {
-		for _, item := range serving {
-			cand, cErr := s.GetInbound(item.Id)
-			if cErr == nil && cand != nil && s.inboundHasEmail(cand, email) {
-				return traffic, cand, nil
-			}
-		}
-	}
+	inbound, err = s.resolveServingInbound(db, hintInboundId, email)
 	return traffic, inbound, err
 }
 

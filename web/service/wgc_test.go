@@ -137,7 +137,7 @@ func TestWgcXrayConfig(t *testing.T) {
 		}
 		t.Fatalf("xray -test FAILED: %v", err)
 	}
-	if strings.Contains(strings.ToLower(string(out)), "error") {
+	if !strings.Contains(string(out), "Configuration OK.") || strings.Contains(string(out), "[Error]") {
 		t.Fatalf("xray -test reported error")
 	}
 }
