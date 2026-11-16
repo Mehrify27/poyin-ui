@@ -618,7 +618,13 @@ else
 fi
 
 chmod +x "$tmp"
-probed_ver="$("$tmp" -v 2>/dev/null | tr -d '[:space:]' || true)"
+probed_raw=""
+probed_rc=0
+probed_raw="$("$tmp" -v 2>&1)" || probed_rc=$?
+if (( probed_rc )); then
+    die "staged binary failed pre-flight execution (${OS_NAME:-linux}/${ARCH}, exit ${probed_rc}): ${probed_raw:-no output}"
+fi
+probed_ver="$(printf '%s' "$probed_raw" | tr -d '[:space:]')"
 probed_ver="${probed_ver#v}"
 NEW_VER="${probed_ver:-${ver#v}}"
 
@@ -735,7 +741,8 @@ rollback_upgrade() {
 # Install/refresh the management menu on BOTH paths.
 msg "Installing the ${MENU} management menu"
 export VPNUI_BIN="$DEST"
-if "$DEST" install-menu >/dev/null 2>&1 && [[ -r "$MENU" ]]; then
+menu_out=""
+if menu_out="$("$DEST" install-menu 2>&1)" && [[ -r "$MENU" ]]; then
     ok "management menu -> ${MENU}  (run: ${TEAL}vpn-ui${R})"
     # shellcheck source=vpn-ui.sh
     source "$MENU"
@@ -745,6 +752,7 @@ elif [[ -n "$BUNDLED_MENU" && -r "$BUNDLED_MENU" ]]; then
     # shellcheck source=vpn-ui.sh
     source "$MENU"
 else
+    [[ -n "$menu_out" ]] && printf '%s\n' "$menu_out" >&2
     warn "could not install ${MENU}, so the 'vpn-ui' menu is unavailable on this host."
     obtain_letsencrypt_cert() { warn "real SSL needs ${MENU}, which failed to install. Skipping."; return 1; }
 fi
@@ -832,7 +840,9 @@ if [[ "$MODE" == "install" ]]; then
     fi
 else
     msg "Running non-destructive schema migration"
-    if ! "$DEST" migrate >/dev/null 2>&1; then
+    migrate_out=""
+    if ! migrate_out="$("$DEST" migrate 2>&1)"; then
+        [[ -n "$migrate_out" ]] && printf '%s\n' "$migrate_out" >&2
         rollback_upgrade "database schema migration failed"
     fi
     if [[ "${PANEL_TLS:-}" =~ ^(letsencrypt|le|acme|real)$ || -n "$DOMAIN" || -n "${DEPLOY_CF_TOKEN:-}" ]]; then

@@ -52,7 +52,10 @@ What lands in the binary:
                           a routing rule names it
       --geo-only          refresh the geo files but don't rebuild the core
   -a, --arch GOARCH       target architecture (default: this host's 'go env GOARCH').
-                          Cross-building needs a cgo cross compiler in CC
+                          Static builds cross-compile via Docker; --dynamic cross-
+                          builds need a cgo cross compiler in CC
+      --static            build a statically linked musl ELF via Docker (default)
+      --dynamic           compile with the host toolchain/glibc instead of static musl
       --repo OWNER/NAME   override default GitHub release repo embedded in binary
       --mirror URL        GitHub mirror/proxy prefix for core/geo downloads and builds
       --skip-deps         skip automatic host build-dependency preflight
@@ -65,11 +68,13 @@ Other:
 Environment (all still honored; the matching switch wins):
   SKIP_SUBMODULES  SKIP_CORE  SUBMODULES_LATEST  SUBMODULES_UPDATE
   CORE_FORCE  GEO_FORCE  GEO_LEAN  GEO_ONLY  REPO  GH_PROXY
-  DOCKER_NET       extra 'docker run' flags for the daemon bundle (e.g.
-                   --network=host when the default bridge is firewalled)
+  STATIC           1 = static musl ELF via Docker (default), 0 = host dynamic build
+  GO_ALPINE_IMAGE  override golang:*-alpine base image used by static builds
+  DOCKER_NET       extra 'docker run' flags for the daemon/static Docker builds
+                   (e.g. --network=host when the default bridge is firewalled)
   XRAY_SRC         build the core from another local checkout
   XRAY_REPO/REF    fork URL / git ref for the fallback clone
-  CC               cgo cross compiler, required by -a/--arch off this host's arch
+  CC               cgo cross compiler, required by --dynamic -a/--arch off host arch
 
 Examples:
   ./build.sh                       full build (what a release ships)
@@ -95,6 +100,8 @@ SKIP_BUNDLE=0
 FORCE_BUNDLE=0
 DRY_RUN=0
 SKIP_DEPS="${SKIP_DEPS:-0}"
+STATIC="${STATIC:-1}"
+GO_ALPINE_IMAGE="${GO_ALPINE_IMAGE:-}"
 ARCH_FLAG=""
 REPO_SLUG="${VPNUI_REPO:-${REPO:-Mehrify27/poyin-ui}}"
 MIRROR_URL="${VPNUI_GH_PROXY:-${GH_PROXY:-}}"
@@ -107,6 +114,8 @@ while (( $# )); do
         --skip-core)         SKIP_CORE=1 ;;
         --skip-bundle)       SKIP_BUNDLE=1 ;;
         --skip-deps)         SKIP_DEPS=1 ;;
+        --static)            STATIC=1 ;;
+        --dynamic)           STATIC=0 ;;
         --latest)            SUBMODULES_LATEST=1 ;;
         --update-submodules) SUBMODULES_UPDATE=1 ;;
         # The force knobs are read by build/core/build.sh, a separate process, so they
@@ -209,11 +218,31 @@ ensure_host_deps() {
 command -v go >/dev/null 2>&1 || die "no 'go' in PATH. The panel, the Xray core and the arch default all need the Go toolchain."
 HOST_ARCH="$(go env GOARCH)"
 ARCH="${ARCH_FLAG:-$HOST_ARCH}"
-# sqlite needs cgo, so a build for another GOARCH invokes a C compiler for THAT arch.
-# Without CC set, go reaches for the host gcc and dies pages deep in linker errors
-# that say nothing about the real cause. Say it here instead.
-if [[ "$ARCH" != "$HOST_ARCH" && -z "${CC:-}" ]]; then
-    die "cross-building for '$ARCH' on '$HOST_ARCH' needs a cgo cross compiler, e.g.: CC=aarch64-linux-gnu-gcc ./build.sh --arch $ARCH"
+
+docker_platform_for_arch() {
+    case "$1" in
+        amd64)     printf 'linux/amd64' ;;
+        arm64)     printf 'linux/arm64' ;;
+        386)       printf 'linux/386' ;;
+        arm|armv7) printf 'linux/arm/v7' ;;
+        *)         return 1 ;;
+    esac
+}
+
+DOCKER_PLATFORM=""
+if (( STATIC )); then
+    DOCKER_PLATFORM="$(docker_platform_for_arch "$ARCH")" || die "static Docker build does not support --arch '$ARCH' (pass --dynamic with CC=... instead)"
+    if ! (( DRY_RUN )); then
+        command -v docker >/dev/null 2>&1 || die "static build requires 'docker' in PATH (or pass --dynamic for a host glibc build)."
+        docker info >/dev/null 2>&1 || die "static build requires a running Docker daemon (or pass --dynamic for a host glibc build)."
+    fi
+else
+    # sqlite needs cgo, so a dynamic build for another GOARCH invokes a C compiler
+    # for THAT arch. Without CC set, go reaches for the host gcc and fails deep in
+    # linker errors that say nothing about the real cause. Say it here instead.
+    if [[ "$ARCH" != "$HOST_ARCH" && -z "${CC:-}" ]]; then
+        die "cross-building for '$ARCH' on '$HOST_ARCH' needs a cgo cross compiler, e.g.: CC=aarch64-linux-gnu-gcc ./build.sh --dynamic --arch $ARCH"
+    fi
 fi
 
 # Colored logging (step/ok/info/warn/err). Falls back to plain echo if the shared
@@ -373,9 +402,119 @@ if [[ -n "$MIRROR_URL" ]]; then
     LDFLAGS+=" -X github.com/mhsanaei/3x-ui/v2/config.ldGHProxy=${MIRROR_URL}"
 fi
 
-step "compiling vpn-ui v${BUILD_VERSION}"
+STATIC_BUILD_TAGS="osusergo,netgo,sqlite_omit_load_extension"
+STATIC_LDFLAGS="${LDFLAGS} -linkmode external -extldflags '-static'"
+STATIC_BUILDER_IMG=""
+
+prepare_static_builder() {
+    local arch="$1" platform="$2"
+    local host_ver mod_ver mm base_img safe_tag builder_img build_ctx
+    local -a candidates=()
+
+    host_ver="$(go env GOVERSION 2>/dev/null || go version | awk '{print $3}')"
+    host_ver="${host_ver#go}"
+    mod_ver="$(awk '/^go[ \t]+/{print $2; exit}' "$REPO_ROOT/go.mod" 2>/dev/null || true)"
+    mm="$(printf '%s' "${host_ver:-$mod_ver}" | grep -oE '^[0-9]+\.[0-9]+' || echo "1.27")"
+
+    if [[ -n "$GO_ALPINE_IMAGE" ]]; then
+        candidates=("$GO_ALPINE_IMAGE")
+    else
+        [[ "$host_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && candidates+=("golang:${host_ver}-alpine")
+        candidates+=("golang:${mm}-alpine")
+    fi
+
+    build_ctx="$(mktemp -d)"
+    for base_img in "${candidates[@]}"; do
+        safe_tag="${base_img//[:\/]/_}"
+        builder_img="vpn-ui-go-builder:${safe_tag}-${arch}"
+        if docker image inspect "$builder_img" >/dev/null 2>&1; then
+            rm -rf "$build_ctx"
+            STATIC_BUILDER_IMG="$builder_img"
+            return 0
+        fi
+        info "preparing static Go builder: $builder_img (base: $base_img, $platform)"
+        if docker build ${DOCKER_NET:-} --platform "$platform" -t "$builder_img" -f - "$build_ctx" <<EOF
+FROM ${base_img}
+RUN apk add --no-cache gcc musl-dev file
+EOF
+        then
+            rm -rf "$build_ctx"
+            STATIC_BUILDER_IMG="$builder_img"
+            return 0
+        fi
+        warn "failed to prepare builder from $base_img, trying next fallback if any"
+    done
+    rm -rf "$build_ctx"
+    err "could not prepare Alpine Go builder image for $platform"
+    exit 1
+}
+
+build_panel_static() {
+    local host_modcache goproxy gosumdb goprivate gonosumdb
+    local -a docker_user_args=()
+    prepare_static_builder "$ARCH" "$DOCKER_PLATFORM"
+
+    host_modcache="$(go env GOMODCACHE)"
+    mkdir -p "$host_modcache"
+    info "ensuring Go module cache on host: $host_modcache"
+    go mod download
+
+    # Map UID/GID for standard rootful Docker so output files stay owned by the
+    # calling user; under rootless Docker UID 0 in-container already maps to host UID.
+    if ! docker info -f '{{json .SecurityOptions}}' 2>/dev/null | grep -q 'name=rootless'; then
+        docker_user_args=(--user "$(id -u):$(id -g)")
+    fi
+
+    goproxy="$(go env GOPROXY 2>/dev/null || true)"
+    gosumdb="$(go env GOSUMDB 2>/dev/null || true)"
+    goprivate="$(go env GOPRIVATE 2>/dev/null || true)"
+    gonosumdb="$(go env GONOSUMDB 2>/dev/null || true)"
+
+    local -a docker_env_args=(
+        -e HOME=/tmp
+        -e GOCACHE=/tmp/gocache
+        -e GOMODCACHE=/go/pkg/mod
+        -e GOPATH=/tmp/gopath
+        -e CGO_ENABLED=1
+        -e GOOS=linux
+        -e "GOARCH=${ARCH}"
+    )
+    [[ -n "$goproxy" ]]   && docker_env_args+=(-e "GOPROXY=${goproxy}")
+    [[ -n "$gosumdb" ]]   && docker_env_args+=(-e "GOSUMDB=${gosumdb}")
+    [[ -n "$goprivate" ]] && docker_env_args+=(-e "GOPRIVATE=${goprivate}")
+    [[ -n "$gonosumdb" ]] && docker_env_args+=(-e "GONOSUMDB=${gonosumdb}")
+
+    docker run --rm ${DOCKER_NET:-} \
+        --platform "$DOCKER_PLATFORM" \
+        ${docker_user_args[@]+"${docker_user_args[@]}"} \
+        "${docker_env_args[@]}" \
+        -v "$host_modcache:/go/pkg/mod" \
+        -v "$REPO_ROOT:/src" \
+        -w /src \
+        "$STATIC_BUILDER_IMG" \
+        go build -trimpath -buildvcs=false -tags "$STATIC_BUILD_TAGS" -ldflags "$STATIC_LDFLAGS" -o "build/out/vpn-ui-${ARCH}" main.go
+
+    local file_desc=""
+    if command -v file >/dev/null 2>&1; then
+        file_desc="$(file -b "$OUT_BIN" 2>/dev/null || true)"
+    fi
+    if [[ -z "$file_desc" ]]; then
+        file_desc="$(docker run --rm --platform "$DOCKER_PLATFORM" ${docker_user_args[@]+"${docker_user_args[@]}"} -v "$OUT_DIR:/out:ro" "$STATIC_BUILDER_IMG" file -b "/out/vpn-ui-${ARCH}" 2>/dev/null || true)"
+    fi
+    if ! printf '%s' "$file_desc" | grep -qiE 'statically linked|static-pie linked'; then
+        err "expected a statically linked ELF binary for $OUT_BIN, got: ${file_desc:-unknown}"
+        exit 1
+    fi
+    ok "verified static ELF: ${file_desc}"
+}
+
+step "compiling vpn-ui v${BUILD_VERSION}$( (( STATIC )) && printf ' [static/musl]' || printf ' [dynamic/host]' )"
 if (( DRY_RUN )); then
-    info "would run: CGO_ENABLED=1 GOARCH=$ARCH go build -ldflags \"$LDFLAGS\" -o build/out/vpn-ui-$ARCH main.go"
+    if (( STATIC )); then
+        info "would run (Docker $DOCKER_PLATFORM musl): go build -trimpath -buildvcs=false -tags \"$STATIC_BUILD_TAGS\" -ldflags \"$STATIC_LDFLAGS\" -o build/out/vpn-ui-$ARCH main.go"
+    else
+        info "would run: CGO_ENABLED=1 GOARCH=$ARCH go build -ldflags \"$LDFLAGS\" -o build/out/vpn-ui-$ARCH main.go"
+    fi
     info "would package offline bundle: $OUT_TGZ (+ SHA256SUMS + deploy.sh + vpn-ui.sh + VERSION)"
     hr
     ok "dry run: nothing was built"
@@ -383,7 +522,11 @@ if (( DRY_RUN )); then
     exit 0
 fi
 mkdir -p "$OUT_DIR"
-CGO_ENABLED=1 GOARCH="$ARCH" go build -ldflags "$LDFLAGS" -o "$OUT_BIN" main.go
+if (( STATIC )); then
+    build_panel_static
+else
+    CGO_ENABLED=1 GOARCH="$ARCH" go build -ldflags "$LDFLAGS" -o "$OUT_BIN" main.go
+fi
 
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then

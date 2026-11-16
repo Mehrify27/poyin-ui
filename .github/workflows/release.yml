@@ -43,6 +43,41 @@ jobs:
       - name: Build complete vpn-ui-amd64 binary
         run: ./build.sh --arch amd64
 
+      - name: Smoke-test static binary across Linux distros
+        run: |
+          set -euo pipefail
+          BIN="$PWD/build/out/vpn-ui-amd64"
+          test -s "$BIN"
+          file_desc="$(file -b "$BIN")"
+          echo "Binary: $file_desc"
+          echo "$file_desc" | grep -qiE 'statically linked|static-pie linked'
+          if ldd "$BIN" 2>&1 | grep -qiE 'libc\.so|libpthread|ld-linux'; then
+            echo "Unexpected dynamic libc dependency:" >&2
+            ldd "$BIN" >&2 || true
+            exit 1
+          fi
+
+          for img in ubuntu:24.04 debian:12 alpine:3.20; do
+            echo "::group::Smoke test in $img"
+            docker run --rm \
+              -v "$BIN:/usr/local/bin/vpn-ui:ro" \
+              -e VPNUI_DB_FOLDER=/tmp/vpndb \
+              -e VPNUI_LOG_FOLDER=/tmp/vpndb \
+              -e VPNUI_BIN_FOLDER=/tmp/vpndb/bin \
+              "$img" sh -eu -c '
+                mkdir -p /tmp/vpndb /tmp/vpndb/bin
+                ver="$(/usr/local/bin/vpn-ui -v)"
+                echo "$0 version: $ver"
+                test -n "$ver"
+                /usr/local/bin/vpn-ui install-menu /tmp/vpn-ui-menu
+                test -x /tmp/vpn-ui-menu
+                /usr/local/bin/vpn-ui migrate
+                test -s /tmp/vpndb/vpn-ui.db
+                /usr/local/bin/vpn-ui migrate
+              ' "$img"
+            echo "::endgroup::"
+          done
+
       - name: Run unit tests with race detector
         env:
           CGO_ENABLED: "1"
