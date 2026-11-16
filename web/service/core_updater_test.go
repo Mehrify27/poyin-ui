@@ -131,7 +131,7 @@ func TestUpdateCoreZipAndTargetedRestart(t *testing.T) {
 
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
+		switch r.URL.EscapedPath() {
 		case "/repos/XTLS/Xray-core/releases/latest":
 			assetName := fmt.Sprintf("Xray-linux-%s.zip", archTokenForTest(runtime.GOARCH))
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -428,7 +428,7 @@ func TestListUpstreamCoreVersionsAndInstallSelectedTag(t *testing.T) {
 	var srv *httptest.Server
 	var xrayListCalls int
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
+		switch r.URL.EscapedPath() {
 		case "/repos/XTLS/Xray-core/releases":
 			xrayListCalls++
 			assetOld := fmt.Sprintf("Xray-linux-%s.zip", archTok)
@@ -553,7 +553,7 @@ func TestUpdateCoreAllSkipsNonPrebuiltCleanly(t *testing.T) {
 
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
+		switch r.URL.EscapedPath() {
 		case "/repos/XTLS/Xray-core/releases/latest":
 			name := fmt.Sprintf("Xray-linux-%s.zip", archTok)
 			_ = json.NewEncoder(w).Encode(map[string]any{
