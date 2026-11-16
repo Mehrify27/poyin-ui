@@ -59,6 +59,28 @@ apk add --no-cache \
     libxml2-dev libxml2-static xz-dev xz-static \
     zlib-dev zlib-static >/dev/null
 
+# Portable download helper with connect/read timeout and fallback mirrors.
+fetch_file() {
+    dest="$1"
+    shift
+    for url in "$@"; do
+        rm -f "$dest"
+        ok=0
+        if wget --version >/dev/null 2>&1; then
+            wget -q --timeout=15 --tries=2 "$url" -O "$dest" && ok=1 || ok=0
+        else
+            wget -q -T 15 "$url" -O "$dest" && ok=1 || ok=0
+        fi
+        if [ "$ok" -eq 1 ] && [ -s "$dest" ]; then
+            return 0
+        fi
+        echo "warn: fetch failed ($url), trying next mirror..." >&2
+    done
+    rm -f "$dest"
+    echo "FATAL: all download URLs failed for $dest" >&2
+    return 1
+}
+
 # --- GnuTLS (static, self-contained) -------------------------------------------
 # --with-included-{libtasn1,unistring} pulls those into libgnutls.a so we don't
 # need their (missing) -static apk packages. --without-p11-kit drops the only
@@ -67,7 +89,9 @@ if [ -f /usr/local/lib/pkgconfig/gnutls.pc ]; then
   echo "== gnutls static already present (cached /usr/local) — skipping build =="
 else
 cd /tmp
-wget -q "https://www.gnupg.org/ftp/gcrypt/gnutls/v${GNUTLS_VER%.*}/gnutls-${GNUTLS_VER}.tar.xz"
+fetch_file "gnutls-${GNUTLS_VER}.tar.xz" \
+    "https://www.gnupg.org/ftp/gcrypt/gnutls/v${GNUTLS_VER%.*}/gnutls-${GNUTLS_VER}.tar.xz" \
+    "https://mirrors.kernel.org/gnupg/gnutls/v${GNUTLS_VER%.*}/gnutls-${GNUTLS_VER}.tar.xz"
 tar xf "gnutls-${GNUTLS_VER}.tar.xz"
 cd "gnutls-${GNUTLS_VER}"
 ./configure --prefix=/usr/local \
@@ -89,8 +113,10 @@ fi
 # apk archives. Point pkg-config at our static GnuTLS in /usr/local and force
 # --static so gnutls.pc emits its whole transitive static graph (nettle/gmp/…).
 cd /tmp
-wget -q "https://www.infradead.org/ocserv/download/ocserv-${OCSERV_VER}.tar.xz" \
-  || wget -q "https://ftp.infradead.org/pub/ocserv/ocserv-${OCSERV_VER}.tar.xz"
+fetch_file "ocserv-${OCSERV_VER}.tar.xz" \
+    "https://www.infradead.org/ocserv/download/ocserv-${OCSERV_VER}.tar.xz" \
+    "https://deb.debian.org/debian/pool/main/o/ocserv/ocserv_${OCSERV_VER}.orig.tar.xz" \
+    "https://ftp.infradead.org/pub/ocserv/ocserv-${OCSERV_VER}.tar.xz"
 tar xf "ocserv-${OCSERV_VER}.tar.xz"
 cd "ocserv-${OCSERV_VER}"
 
@@ -153,7 +179,10 @@ ls -lh /out/ocserv
 # while musl's resolver is self-contained, so looking up the remote gateway keeps
 # working on a host whose libc we know nothing about.
 cd /tmp
-wget -q "https://www.infradead.org/openconnect/download/openconnect-${OPENCONNECT_VER}.tar.gz"
+fetch_file "openconnect-${OPENCONNECT_VER}.tar.gz" \
+    "https://www.infradead.org/openconnect/download/openconnect-${OPENCONNECT_VER}.tar.gz" \
+    "https://deb.debian.org/debian/pool/main/o/openconnect/openconnect_${OPENCONNECT_VER}.orig.tar.gz" \
+    "https://ftp.infradead.org/pub/openconnect/openconnect-${OPENCONNECT_VER}.tar.gz"
 tar xf "openconnect-${OPENCONNECT_VER}.tar.gz"
 cd "openconnect-${OPENCONNECT_VER}"
 
