@@ -3,6 +3,7 @@ package sub
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/goccy/go-json"
 	yaml "github.com/goccy/go-yaml"
@@ -110,35 +111,40 @@ func (s *SubClashService) GetClash(subId string, host string) (string, string, e
 }
 
 func (s *SubClashService) getProxies(inbound *model.Inbound, client model.Client, host string) []map[string]any {
-	// wg-c/awg carry key material and emit one proxy per device x endpoint, not the
-	// stream/externalProxy shape the rest of the protocols use.
+	// wg-c/awg/wireguard carry key material and emit one proxy per device x endpoint,
+	// not the stream/externalProxy shape the rest of the protocols use.
 	switch inbound.Protocol {
 	case model.WGC:
 		return s.buildWireguardProxies(inbound, client, host, false)
 	case model.AWG:
 		return s.buildWireguardProxies(inbound, client, host, true)
+	case model.WireGuard:
+		return s.buildWireguardProxies(inbound, client, host, false)
 	}
 	stream := s.streamData(inbound.StreamSettings)
-	externalProxies, ok := stream["externalProxy"].([]any)
-	if !ok || len(externalProxies) == 0 {
-		externalProxies = []any{map[string]any{
-			"forceTls": "same",
-			"dest":     host,
-			"port":     float64(inbound.Port),
-			"remark":   "",
+	var settingsMap map[string]any
+	if inbound.Protocol == model.Hysteria2 {
+		_ = json.Unmarshal([]byte(inbound.Settings), &settingsMap)
+	}
+	specs := extractExternalProxies(stream, settingsMap, host, inbound.Port)
+	if len(specs) == 0 {
+		specs = []externalProxySpec{{
+			ForceTls: "same",
+			Dest:     host,
+			Port:     inbound.Port,
+			Remark:   "",
 		}}
 	}
 	delete(stream, "externalProxy")
 
-	proxies := make([]map[string]any, 0, len(externalProxies))
-	for _, ep := range externalProxies {
-		extPrxy := ep.(map[string]any)
+	proxies := make([]map[string]any, 0, len(specs))
+	for _, spec := range specs {
 		workingInbound := *inbound
-		workingInbound.Listen = extPrxy["dest"].(string)
-		workingInbound.Port = int(extPrxy["port"].(float64))
+		workingInbound.Listen = spec.Dest
+		workingInbound.Port = spec.Port
 		workingStream := cloneMap(stream)
 
-		switch extPrxy["forceTls"].(string) {
+		switch spec.ForceTls {
 		case "tls":
 			if workingStream["security"] != "tls" {
 				workingStream["security"] = "tls"
@@ -152,7 +158,7 @@ func (s *SubClashService) getProxies(inbound *model.Inbound, client model.Client
 			}
 		}
 
-		proxy := s.buildProxy(&workingInbound, client, workingStream, extPrxy["remark"].(string))
+		proxy := s.buildProxy(&workingInbound, client, workingStream, spec.Remark)
 		if len(proxy) > 0 {
 			proxies = append(proxies, proxy)
 		}
@@ -203,20 +209,46 @@ func (s *SubClashService) buildWireguardProxies(inbound *model.Inbound, client m
 		proxies := make([]map[string]any, 0, len(params))
 		for _, p := range params {
 			proxy := base(p.WgcClientParams)
-			proxy["amnezia-wg-option"] = map[string]any{
+			opts := map[string]any{
 				"jc": p.Jc, "jmin": p.Jmin, "jmax": p.Jmax,
 				"s1": p.S1, "s2": p.S2,
 				"h1": p.H1, "h2": p.H2, "h3": p.H3, "h4": p.H4,
 			}
+			if p.S3 > 0 {
+				opts["s3"] = p.S3
+			}
+			if p.S4 > 0 {
+				opts["s4"] = p.S4
+			}
+			for _, kv := range []struct {
+				k, v string
+			}{{"i1", p.I1}, {"i2", p.I2}, {"i3", p.I3}, {"i4", p.I4}, {"i5", p.I5}} {
+				if kv.v != "" {
+					opts[kv.k] = kv.v
+				}
+			}
+			proxy["amnezia-wg-option"] = opts
 			proxies = append(proxies, proxy)
 		}
 		return proxies
 	}
 
-	params, err := s.wgcService.RenderClientParams(inbound, client.Email, host)
-	if err != nil {
-		logger.Error("SubClashService - wgc RenderClientParams:", err)
-		return nil
+	var (
+		params []service.WgcClientParams
+		err    error
+	)
+	if inbound.Protocol == model.WireGuard {
+		params, err = service.RenderWireguardXrayParams(inbound, client.Email, host)
+		if err != nil {
+			logger.Error("SubClashService - wireguard RenderWireguardXrayParams:", err)
+			return nil
+		}
+	} else {
+		params, err = s.wgcService.RenderClientParams(inbound, client.Email, host)
+		if err != nil {
+			logger.Error("SubClashService - wgc RenderClientParams:", err)
+			return nil
+		}
 	}
 	proxies := make([]map[string]any, 0, len(params))
 	for _, p := range params {
@@ -269,11 +301,18 @@ func (s *SubClashService) buildProxy(inbound *model.Inbound, client model.Client
 	case model.VLESS:
 		proxy["type"] = "vless"
 		proxy["uuid"] = client.ID
-		if client.Flow != "" && network == "tcp" {
-			proxy["flow"] = client.Flow
-		}
 		var inboundSettings map[string]any
 		json.Unmarshal([]byte(inbound.Settings), &inboundSettings)
+		flow := client.Flow
+		security, _ := stream["security"].(string)
+		if flow == "" && (security == "tls" || security == "reality") {
+			if inboundFlow, ok := inboundSettings["flow"].(string); ok {
+				flow = inboundFlow
+			}
+		}
+		if flow != "" && network == "tcp" {
+			proxy["flow"] = flow
+		}
 		if encryption, ok := inboundSettings["encryption"].(string); ok && encryption != "" {
 			proxy["packet-encoding"] = encryption
 		}
@@ -316,6 +355,76 @@ func (s *SubClashService) buildHysteriaProxy(inbound *model.Inbound, client mode
 	var inboundSettings map[string]any
 	_ = json.Unmarshal([]byte(inbound.Settings), &inboundSettings)
 
+	auth := client.Auth
+	if auth == "" {
+		auth = client.Password
+	}
+
+	if inbound.Protocol == model.Hysteria2 {
+		proxy := map[string]any{
+			"name":     s.SubService.genRemark(inbound, client.Email, extraRemark),
+			"type":     "hysteria2",
+			"server":   inbound.Listen,
+			"port":     inbound.Port,
+			"udp":      true,
+			"password": auth,
+		}
+		if sni, _ := inboundSettings["serverName"].(string); strings.TrimSpace(sni) != "" {
+			proxy["sni"] = strings.TrimSpace(sni)
+		}
+		if alpns, ok := inboundSettings["alpn"].([]any); ok && len(alpns) > 0 {
+			out := make([]string, 0, len(alpns))
+			for _, a := range alpns {
+				if str, ok := a.(string); ok && strings.TrimSpace(str) != "" {
+					out = append(out, strings.TrimSpace(str))
+				}
+			}
+			if len(out) > 0 {
+				proxy["alpn"] = out
+			}
+		}
+		allowInsecure, _ := inboundSettings["allowInsecure"].(bool)
+		if allowInsecure {
+			proxy["skip-cert-verify"] = true
+		}
+		if fp, _ := inboundSettings["fingerprint"].(string); strings.TrimSpace(fp) != "" {
+			proxy["client-fingerprint"] = strings.TrimSpace(fp)
+		}
+		if pin, _ := inboundSettings["pinSHA256"].(string); strings.TrimSpace(pin) != "" {
+			proxy["fingerprint"] = strings.TrimSpace(pin)
+		} else if !allowInsecure {
+			certFile, _ := inboundSettings["certificateFile"].(string)
+			certFileAlt, _ := inboundSettings["certFile"].(string)
+			certInline, _ := inboundSettings["certificate"].(string)
+			if strings.TrimSpace(certFile) == "" && strings.TrimSpace(certFileAlt) == "" && strings.TrimSpace(certInline) == "" {
+				if autoPin := s.SubService.hysteria2Service.ResolveCertPinSHA256(inbound); autoPin != "" {
+					proxy["fingerprint"] = autoPin
+				}
+			}
+		}
+		obfsType, _ := inboundSettings["obfsType"].(string)
+		obfsPass, _ := inboundSettings["obfsPassword"].(string)
+		if strings.EqualFold(strings.TrimSpace(obfsType), "salamander") && obfsPass != "" {
+			proxy["obfs"] = "salamander"
+			proxy["obfs-password"] = obfsPass
+		}
+		if hop, _ := inboundSettings["hopPorts"].(string); strings.TrimSpace(hop) != "" {
+			proxy["ports"] = strings.TrimSpace(hop)
+		}
+		if hopInt, _ := inboundSettings["hopInterval"].(string); strings.TrimSpace(hopInt) != "" {
+			if d, err := time.ParseDuration(strings.TrimSpace(hopInt)); err == nil && d >= time.Second {
+				proxy["hop-interval"] = int(d.Seconds())
+			}
+		}
+		if up, ok := inboundSettings["upMbps"].(float64); ok && int(up) > 0 {
+			proxy["up"] = fmt.Sprintf("%d Mbps", int(up))
+		}
+		if down, ok := inboundSettings["downMbps"].(float64); ok && int(down) > 0 {
+			proxy["down"] = fmt.Sprintf("%d Mbps", int(down))
+		}
+		return proxy
+	}
+
 	proxyType := "hysteria2"
 	authKey := "password"
 	if v, ok := inboundSettings["version"].(float64); ok && int(v) == 1 {
@@ -329,7 +438,7 @@ func (s *SubClashService) buildHysteriaProxy(inbound *model.Inbound, client mode
 		"server": inbound.Listen,
 		"port":   inbound.Port,
 		"udp":    true,
-		authKey:  client.Auth,
+		authKey:  auth,
 	}
 
 	var rawStream map[string]any

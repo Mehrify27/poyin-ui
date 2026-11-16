@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"sort"
 	"strings"
 	"time"
 
@@ -1595,14 +1596,13 @@ func (s *AccountService) RenameAccount(oldEmail, newEmail string) ([]int, error)
 	var touched []int
 	err := database.GetDB().Transaction(func(tx *gorm.DB) error {
 		var account model.Account
+		accountFound := true
 		err := tx.Where("LOWER(TRIM(email)) = ?", oldKey).First(&account).Error
 		if err != nil {
-			if err == gorm.ErrRecordNotFound {
-				// Nothing mirrored under the old key. The ordinary caller's
-				// SyncInboundAccounts will create the account under the new one.
-				return nil
+			if err != gorm.ErrRecordNotFound {
+				return err
 			}
-			return err
+			accountFound = false
 		}
 
 		// An account already holding the new key is NOT merged into and NOT deleted.
@@ -1610,10 +1610,12 @@ func (s *AccountService) RenameAccount(oldEmail, newEmail string) ([]int, error)
 		// memberships, and picking one silently moves the other's traffic. The
 		// duplicate-email check is what is supposed to stop this reaching here, so
 		// arriving is a bug worth a log line rather than a data-destroying repair.
+		clashQuery := tx.Model(&model.Account{}).Where("LOWER(TRIM(email)) = ?", newKey)
+		if accountFound {
+			clashQuery = clashQuery.Where("id != ?", account.Id)
+		}
 		var clash int64
-		if err := tx.Model(&model.Account{}).
-			Where("LOWER(TRIM(email)) = ? AND id != ?", newKey, account.Id).
-			Count(&clash).Error; err != nil {
+		if err := clashQuery.Count(&clash).Error; err != nil {
 			return err
 		}
 		if clash > 0 {
@@ -1626,6 +1628,28 @@ func (s *AccountService) RenameAccount(oldEmail, newEmail string) ([]int, error)
 			return err
 		}
 		touched = changed
+
+		if err := tx.Model(&xray.ClientTraffic{}).
+			Where("LOWER(TRIM(email)) = ?", oldKey).
+			Update("email", newEmail).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.InboundClientIps{}).
+			Where("LOWER(TRIM(client_email)) = ?", oldKey).
+			Update("client_email", newEmail).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.ResellerClient{}).
+			Where("LOWER(TRIM(email)) = ?", oldKey).
+			Update("email", newEmail).Error; err != nil {
+			return err
+		}
+
+		if !accountFound {
+			// Nothing mirrored under the old key; SyncInboundAccounts will create
+			// the account under the new one while auxiliary tables stay in sync.
+			return nil
+		}
 
 		return tx.Model(&model.Account{}).Where("id = ?", account.Id).
 			Update("email", newEmail).Error
@@ -1738,4 +1762,73 @@ func (s *AccountService) DropMembership(tx *gorm.DB, inboundId int, email string
 		return nil
 	}
 	return tx.Where("id = ?", account.Id).Delete(&model.Account{}).Error
+}
+
+// PurgeAccountIfOrphanedTx verifies whether any live inbound still serves email in
+// its settings. If at least one inbound serves email, it removes stale memberships
+// pointing elsewhere and repoints client_traffics/reseller_clients home inbound IDs
+// to a surviving inbound; if NO inbound serves email, it deletes all remaining
+// account, membership, traffic, IP binding, and reseller ledger rows for email.
+func PurgeAccountIfOrphanedTx(tx *gorm.DB, email string) (bool, error) {
+	key := accountKey(email)
+	if tx == nil || key == "" {
+		return false, nil
+	}
+
+	var inboundSvc InboundService
+	liveIds, err := inboundSvc.inboundIdsServingEmails(tx, []string{email})
+	if err != nil {
+		return false, err
+	}
+
+	if len(liveIds) > 0 {
+		sort.Ints(liveIds)
+		// Still served on at least one live inbound: prune any stale membership rows
+		// not in liveIds and ensure home inbound pointers target a surviving inbound.
+		var account model.Account
+		if err := tx.Where("LOWER(TRIM(email)) = ?", key).First(&account).Error; err == nil {
+			if err := tx.Where("account_id = ? AND inbound_id NOT IN ?", account.Id, liveIds).
+				Delete(&model.AccountInbound{}).Error; err != nil {
+				return false, err
+			}
+		} else if err != gorm.ErrRecordNotFound {
+			return false, err
+		}
+		survivingId := liveIds[0]
+		if err := tx.Model(&xray.ClientTraffic{}).
+			Where("LOWER(TRIM(email)) = ? AND inbound_id NOT IN ?", key, liveIds).
+			Update("inbound_id", survivingId).Error; err != nil {
+			return false, err
+		}
+		if err := tx.Model(&model.ResellerClient{}).
+			Where("LOWER(TRIM(email)) = ? AND inbound_id NOT IN ?", key, liveIds).
+			Update("inbound_id", survivingId).Error; err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	var accountIds []int
+	if err := tx.Model(&model.Account{}).Where("LOWER(TRIM(email)) = ?", key).
+		Pluck("id", &accountIds).Error; err != nil {
+		return false, err
+	}
+	if len(accountIds) > 0 {
+		if err := tx.Where("account_id IN ?", accountIds).Delete(&model.AccountInbound{}).Error; err != nil {
+			return false, err
+		}
+		if err := tx.Where("id IN ?", accountIds).Delete(&model.Account{}).Error; err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Where("LOWER(TRIM(email)) = ?", key).Delete(&xray.ClientTraffic{}).Error; err != nil {
+		return false, err
+	}
+	if err := tx.Where("LOWER(TRIM(client_email)) = ?", key).Delete(&model.InboundClientIps{}).Error; err != nil {
+		return false, err
+	}
+	if err := tx.Where("LOWER(TRIM(email)) = ?", key).Delete(&model.ResellerClient{}).Error; err != nil {
+		return false, err
+	}
+	return true, nil
 }

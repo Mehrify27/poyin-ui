@@ -52,10 +52,11 @@ type XrayService struct {
 	ikev2Service   Ikev2Service
 	wgcService     WgcService
 	awgService     AwgService
-	greService     GreService
-	mtprotoService MtprotoService
-	sshService     SshService
-	xrayAPI        xray.XrayAPI
+	greService       GreService
+	mtprotoService   MtprotoService
+	hysteria2Service Hysteria2Service
+	sshService       SshService
+	xrayAPI          xray.XrayAPI
 }
 
 // IsXrayRunning checks if the Xray process is currently running.
@@ -126,10 +127,38 @@ func (s *XrayService) applySshOutbounds(config *xray.Config) {
 	}
 }
 
+type loopbackSocksSpec struct {
+	Tag       string
+	SocksPort int
+}
+
 // applySshOutboundsWith is the pure half of applySshOutbounds, taking the tunnel
 // list as an argument so it can be tested without a database.
 func applySshOutboundsWith(config *xray.Config, tunnels []SshOutboundConfig) error {
-	if len(tunnels) == 0 {
+	specs := make([]loopbackSocksSpec, 0, len(tunnels))
+	for _, t := range tunnels {
+		specs = append(specs, loopbackSocksSpec{Tag: t.Tag, SocksPort: t.SocksPort})
+	}
+	return applyLoopbackSocksOutboundsWith(config, specs)
+}
+
+func (s *XrayService) applyHysteria2Outbounds(config *xray.Config) {
+	var svc Hysteria2OutboundService
+	if err := applyHysteria2OutboundsWith(config, svc.List()); err != nil {
+		logger.Warning("could not synthesize the Hysteria 2 outbounds:", err)
+	}
+}
+
+func applyHysteria2OutboundsWith(config *xray.Config, tunnels []Hysteria2OutboundConfig) error {
+	specs := make([]loopbackSocksSpec, 0, len(tunnels))
+	for _, t := range tunnels {
+		specs = append(specs, loopbackSocksSpec{Tag: t.Tag, SocksPort: t.SocksPort})
+	}
+	return applyLoopbackSocksOutboundsWith(config, specs)
+}
+
+func applyLoopbackSocksOutboundsWith(config *xray.Config, specs []loopbackSocksSpec) error {
+	if len(specs) == 0 {
 		return nil
 	}
 
@@ -140,7 +169,7 @@ func applySshOutboundsWith(config *xray.Config, tunnels []SshOutboundConfig) err
 		}
 	}
 
-	for _, t := range tunnels {
+	for _, t := range specs {
 		if t.Tag == "" || t.SocksPort <= 0 {
 			continue
 		}
@@ -197,6 +226,7 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 	// Deriving it from the stored tunnel list on every config build removes the
 	// second writer, and with it the whole class.
 	s.applySshOutbounds(xrayConfig)
+	s.applyHysteria2Outbounds(xrayConfig)
 
 	// The client-side VPN tunnels get the same treatment, for the same reason: the
 	// interface a dialled tunnel lands on is decided by the client each time it comes
@@ -242,7 +272,7 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		// Omitting a protocol here is not a no-op: its raw settings would be handed to
 		// Xray as a native inbound, Xray would reject the unknown protocol, and the
 		// WHOLE core would fail to start, taking every other inbound down with it.
-		if inbound.Protocol == "l2tp" || inbound.Protocol == "pptp" || inbound.Protocol == "openvpn" || inbound.Protocol == "openconnect" || inbound.Protocol == "sstp" || inbound.Protocol == "ikev2" || inbound.Protocol == "wg-c" || inbound.Protocol == "awg" || inbound.Protocol == "gre" || inbound.Protocol == "mtproto" || inbound.Protocol == "ssh" {
+		if inbound.Protocol == "l2tp" || inbound.Protocol == "pptp" || inbound.Protocol == "openvpn" || inbound.Protocol == "openconnect" || inbound.Protocol == "sstp" || inbound.Protocol == "ikev2" || inbound.Protocol == "wg-c" || inbound.Protocol == "awg" || inbound.Protocol == "gre" || inbound.Protocol == "mtproto" || inbound.Protocol == "ssh" || inbound.Protocol == "hysteria2" {
 			continue
 		}
 		// get settings clients
@@ -495,6 +525,18 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		}
 	}
 
+	// Inject the loopback socks inbound for each sing-box Hysteria 2 inbound configured
+	// with routeThroughXray enabled, so client connections inherit Xray routing & outbounds.
+	hy2Inbounds, _ := s.hysteria2Service.GetHysteria2Inbounds()
+	for _, hy2Inbound := range hy2Inbounds {
+		if !hy2Inbound.Enable {
+			continue
+		}
+		if socksConfig := s.hysteria2Service.GetSocksConfig(hy2Inbound); socksConfig != nil {
+			xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *socksConfig)
+		}
+	}
+
 	// Translate email-based routing rules for L2TP/PPTP clients to source-IP rules.
 	// Dokodemo-door doesn't support per-user identification, so we use deterministic
 	// IP assignment and match on source IP instead.
@@ -520,7 +562,7 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 	// lists the raise path uses, so the config and the routing rules cannot disagree
 	// about which tag has a device.
 	carriers, problems := vpnOutCarrierPlan((&VpnOutboundService{}).List(),
-		(&SshOutboundService{}).List(), vpnOutTemplateOutbounds())
+		loadedProxyTunnels(), vpnOutTemplateOutbounds())
 	for _, p := range problems {
 		logger.Warning("vpn carrier:", p)
 	}

@@ -130,10 +130,11 @@ type CoreService struct {
 	ikev2Service   Ikev2Service
 	wgcService     WgcService
 	awgService     AwgService
-	greService     GreService
-	mtprotoService MtprotoService
-	sshService     SshService
-	xrayService    XrayService
+	greService       GreService
+	mtprotoService   MtprotoService
+	hysteria2Service Hysteria2Service
+	sshService       SshService
+	xrayService      XrayService
 }
 
 // --------------------------------------------------------------------------- //
@@ -354,6 +355,7 @@ func (s *CoreService) GetCoresStatus() []CoreStatus {
 		s.awgStatus(),
 		s.greStatus(),
 		s.mtprotoStatus(),
+		s.hysteria2Status(),
 		s.sshStatus(),
 		s.radiusStatus(),
 	}
@@ -721,7 +723,7 @@ func (s *CoreService) greStatus() CoreStatus {
 }
 
 // awgStatus reports the AmneziaWG core. Like wg-c it has no daemon: the data plane is the
-// out-of-tree amneziawg kernel module (DKMS-built) + the panel's wgctrl-managed interfaces.
+// out-of-tree amneziawg kernel module (DKMS-built) + userspace amneziawg-go AWG 2.0 hybrid engine.
 func (s *CoreService) awgStatus() CoreStatus {
 	cs := CoreStatus{Name: "awg"}
 	inbounds, _ := s.awgService.GetAwgInbounds()
@@ -729,13 +731,10 @@ func (s *CoreService) awgStatus() CoreStatus {
 	enabled := countEnabledInbounds(inbounds)
 	if !s.awgService.AmneziawgAvailable() {
 		cs.State = CoreNotInstalled
-		// Distinguish "setup has not run yet" from "this host cannot build it at all".
-		// Telling an operator on Fedora/Arch/RHEL to re-run setup would send them round a
-		// loop that can never succeed, so say what is actually wrong.
 		if ok, why := awgKernelModuleSupported(); !ok {
-			cs.Detail = why
+			cs.Detail = why + " (userspace TUN device /dev/net/tun is also unavailable)"
 		} else {
-			cs.Detail = "amneziawg kernel module not built (run Core Settings setup)"
+			cs.Detail = "amneziawg kernel module and userspace TUN (/dev/net/tun) are both unavailable"
 		}
 		return cs
 	}
@@ -748,6 +747,9 @@ func (s *CoreService) awgStatus() CoreStatus {
 		}
 	case s.awgService.AnyInterfaceUp():
 		cs.State = CoreRunning
+		if !awgKernelModuleLoaded() {
+			cs.Detail = "running via userspace amneziawg-go (AWG 2.0)"
+		}
 	default:
 		cs.State = CoreStopped
 		cs.Detail = "amneziawg interface(s) down — check server key or click Restart"
@@ -773,6 +775,27 @@ func (s *CoreService) mtprotoStatus() CoreStatus {
 	case cs.Inbounds == 0:
 		cs.State = CoreIdle
 	case procMgr.AnyRunningWithPrefix("mtproto-server-"):
+		cs.State = CoreRunning
+	default:
+		cs.State = CoreStopped
+	}
+	return cs
+}
+
+func (s *CoreService) hysteria2Status() CoreStatus {
+	cs := CoreStatus{Name: "hysteria2"}
+	inbounds, _ := s.hysteria2Service.GetHysteria2Inbounds()
+	cs.Inbounds = len(inbounds)
+	if !s.hysteria2Service.Available() {
+		cs.State = CoreNotInstalled
+		cs.Detail = "sing-box binary not bundled for this architecture"
+		return cs
+	}
+	cs.Version = daemonVersion("sing-box")
+	switch {
+	case cs.Inbounds == 0:
+		cs.State = CoreIdle
+	case procMgr.AnyRunningWithPrefix(hy2ProcPrefix):
 		cs.State = CoreRunning
 	default:
 		cs.State = CoreStopped
@@ -990,6 +1013,13 @@ func (s *CoreService) RestartCore(name string) error {
 		return s.greService.RestartServices()
 	case "mtproto":
 		return s.mtprotoService.RestartServices()
+	case "hysteria2":
+		err := s.hysteria2Service.RestartServices()
+		outErr := (&Hysteria2OutboundService{}).RestartAll()
+		if err != nil {
+			return err
+		}
+		return outErr
 	case "ssh":
 		return s.sshService.RestartServices()
 	case "radius":
@@ -1006,7 +1036,7 @@ func (s *CoreService) RestartCore(name string) error {
 // one failing core doesn't abort the rest.
 func (s *CoreService) RestartAll() error {
 	var errs []string
-	for _, name := range []string{"xray", "l2tp", "pptp", "openvpn", "openconnect", "sstp", "ikev2", "wgc", "awg", "gre", "mtproto", "ssh", "radius"} {
+	for _, name := range []string{"xray", "l2tp", "pptp", "openvpn", "openconnect", "sstp", "ikev2", "wgc", "awg", "gre", "mtproto", "hysteria2", "ssh", "radius"} {
 		if err := s.RestartCore(name); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
 		}
@@ -1047,6 +1077,10 @@ func (s *CoreService) StopCore(name string) error {
 		return s.greService.StopServices()
 	case "mtproto":
 		return s.mtprotoService.StopServices()
+	case "hysteria2":
+		err := s.hysteria2Service.StopServices()
+		(&Hysteria2OutboundService{}).StopAll()
+		return err
 	case "ssh":
 		return s.sshService.StopServices()
 	case "radius":
@@ -1086,13 +1120,18 @@ func (s *CoreService) CoreLogs(name string) string {
 		return fmt.Sprintf("WireGuard (C) runs in-kernel via wgctrl (no daemon log).\nModule version: %s\nInterface(s) up: %s", wireguardModuleVersion(), up)
 	case "awg":
 		if !s.awgService.AmneziawgAvailable() {
-			return "AmneziaWG: kernel module 'amneziawg' not built on this host (run Core Settings setup)."
+			return "AmneziaWG: neither kernel module 'amneziawg' nor userspace /dev/net/tun is available on this host."
 		}
 		up := "no"
 		if s.awgService.AnyInterfaceUp() {
 			up = "yes"
 		}
-		return fmt.Sprintf("AmneziaWG runs in-kernel via the wgctrl fork (no daemon log).\nModule version: %s\nInterface(s) up: %s", amneziawgModuleVersion(), up)
+		out := fmt.Sprintf("AmneziaWG hybrid runtime (kernel DKMS + userspace amneziawg-go AWG 2.0).\nBackend: %s\nVersion: %s\nInterface(s) up: %s",
+			awgRuntimeBackendSummary(), amneziawgModuleVersion(), up)
+		if ulogs := awgUserspaceLogs(); ulogs != "" {
+			out += "\n\n" + ulogs
+		}
+		return out
 	case "gre":
 		if !s.greService.GreAvailable() {
 			return "GRE: kernel GRE (ip_gre) not available on this host."
@@ -1108,6 +1147,8 @@ func (s *CoreService) CoreLogs(name string) string {
 		return fmt.Sprintf("GRE runs in-kernel via netlink (no daemon log).\nTunnel(s) up: %s\nFOU (UDP encap) available: %s", up, fou)
 	case "mtproto":
 		return procMgr.LogsByPrefix("mtproto-server-")
+	case "hysteria2":
+		return procMgr.LogsByPrefix(hy2ProcPrefix)
 	case "ssh":
 		running := "no"
 		if s.sshService.AnyRunning() {
@@ -1557,6 +1598,7 @@ func (s *CoreService) StartProvision(cores []string) bool {
 			cs.awgService.InitAwg()
 			cs.greService.InitGre()
 			cs.mtprotoService.InitMtproto()
+			cs.hysteria2Service.InitHysteria2()
 			cs.sshService.InitSsh()
 			if err := cs.xrayService.RestartXray(true); err != nil {
 				logger.Warning("provision: failed to restart xray after setup:", err)

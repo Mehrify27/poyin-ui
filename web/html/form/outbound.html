@@ -563,6 +563,77 @@
         </a-form-item>
       </template>
 
+      <template v-if="outbound.protocol === Protocols.Hysteria2">
+        <a-form-item label='{{ i18n "pages.xray.outbound.sshOutAddress" }}'>
+          <a-input v-model.trim="outbound.settings.address" placeholder="example.com"></a-input>
+        </a-form-item>
+        <a-form-item label='{{ i18n "pages.xray.outbound.sshOutPort" }}'>
+          <a-input-number v-model.number="outbound.settings.port" :min="1" :max="65535"></a-input-number>
+        </a-form-item>
+        <a-form-item label="Port Hopping">
+          <a-input v-model.trim="outbound.settings.hopPorts" placeholder="e.g. 20000-20100 or 443,20000-20100"></a-input>
+        </a-form-item>
+        <a-form-item v-if="outbound.settings.hopPorts" label="Hop Interval">
+          <a-input v-model.trim="outbound.settings.hopInterval" placeholder="30s"></a-input>
+        </a-form-item>
+        <a-form-item label='{{ i18n "pages.xray.outbound.vpnOutPassword" }}'>
+          <a-input-password v-model="outbound.settings.password"
+            :placeholder="outModal.isEdit ? '(leave blank to keep existing)' : ''"></a-input-password>
+        </a-form-item>
+        <a-form-item label="Obfs Type">
+          <a-select v-model="outbound.settings.obfsType" :dropdown-class-name="themeSwitcher.currentTheme">
+            <a-select-option value="">None</a-select-option>
+            <a-select-option value="salamander">Salamander</a-select-option>
+          </a-select>
+        </a-form-item>
+        <a-form-item v-if="outbound.settings.obfsType" label="Obfs Password">
+          <a-input-password v-model="outbound.settings.obfsPassword"
+            :placeholder="outModal.isEdit ? '(leave blank to keep existing)' : ''"></a-input-password>
+        </a-form-item>
+        <a-form-item label="Up / Down (Mbps)">
+          <a-input-group compact>
+            <a-input-number v-model.number="outbound.settings.upMbps" :min="0" placeholder="Up Mbps"
+              :style="{ width: '50%' }"></a-input-number>
+            <a-input-number v-model.number="outbound.settings.downMbps" :min="0" placeholder="Down Mbps"
+              :style="{ width: '50%' }"></a-input-number>
+          </a-input-group>
+        </a-form-item>
+        <a-form-item label="SNI">
+          <a-input v-model.trim="outbound.settings.serverName" placeholder="example.com"></a-input>
+        </a-form-item>
+        <a-form-item label="ALPN">
+          <a-select v-model="outbound.settings.alpn" mode="tags" :dropdown-class-name="themeSwitcher.currentTheme"
+            placeholder="h3">
+            <a-select-option value="h3">h3</a-select-option>
+          </a-select>
+        </a-form-item>
+        <a-form-item label="Allow Insecure">
+          <a-switch v-model="outbound.settings.allowInsecure"></a-switch>
+        </a-form-item>
+        <a-form-item label="Pin SHA-256">
+          <a-input v-model.trim="outbound.settings.pinSHA256" placeholder="sha256 hex or colon-hex fingerprint"></a-input>
+        </a-form-item>
+        <a-form-item label="CA / Leaf Cert (PEM)">
+          <a-textarea v-model="outbound.settings.certificatePEM" :rows="3"
+            placeholder="-----BEGIN CERTIFICATE-----"></a-textarea>
+        </a-form-item>
+        <a-form-item v-if="outModal.isEdit" label='{{ i18n "pages.xray.outbound.sshOutStatus" }}'>
+          <a-space>
+            <a-button size="small" icon="reload" :loading="outModal.hy2StatusLoading"
+              @click="outModal.refreshHy2Status()"></a-button>
+            <a-tag v-if="outModal.hy2StatusText" :color="outModal.hy2StatusUp ? 'green' : 'orange'"
+              :style="{ margin: '0' }">[[ outModal.hy2StatusText ]]</a-tag>
+          </a-space>
+          <div v-if="outModal.hy2StatusLog" class="term" :style="{ marginTop: '10px' }">
+            <div class="term-body" :style="{ maxHeight: '160px' }">
+              <div class="term-line" v-for="(l, i) in outModal.hy2StatusLog.split('\n')" :key="i">
+                <span class="term-name">[[ l || ' ' ]]</span>
+              </div>
+            </div>
+          </div>
+        </a-form-item>
+      </template>
+
       <!-- vpn tunnel settings. The panel dials out as a CLIENT of a remote VPN
            server, the driver brings up a netdev, and what Xray gets is a freedom
            outbound pinned to that device with SO_BINDTODEVICE; the tag above names

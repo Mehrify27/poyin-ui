@@ -191,6 +191,7 @@ func (s *OutboundService) TestOutbound(outboundJSON string, testURL string, allO
 	// createTestConfig cannot disagree about a tunnel that changed in between.
 	tunnels := (&VpnOutboundService{}).List()
 	sshTunnels := (&SshOutboundService{}).List()
+	hy2Tunnels := (&Hysteria2OutboundService{}).List()
 
 	// A tunnel with no live device is refused here rather than tested. The synthesis
 	// turns that tag into a BLACKHOLE (applyVpnOutboundsWith fails closed), so the test
@@ -213,7 +214,7 @@ func (s *OutboundService) TestOutbound(outboundJSON string, testURL string, allO
 	}
 
 	// Copy all outbounds, synthesize the tunnels over them, add test inbound and route rule
-	testConfig := s.createTestConfig(outboundTag, allOutbounds, testPort, tunnels, sshTunnels)
+	testConfig := s.createTestConfigFull(outboundTag, allOutbounds, testPort, tunnels, sshTunnels, hy2Tunnels)
 
 	// Use a temporary config file so the main config.json is never overwritten
 	testConfigPath, err := createTestConfigPath()
@@ -349,6 +350,11 @@ func (s *OutboundService) probeExit(proxyPort int) ExitInfo {
 // what it is given and the tests can pin its behaviour without a database.
 func (s *OutboundService) createTestConfig(outboundTag string, allOutbounds []any, testPort int,
 	tunnels []VpnOutboundConfig, sshTunnels []SshOutboundConfig) *xray.Config {
+	return s.createTestConfigFull(outboundTag, allOutbounds, testPort, tunnels, sshTunnels, nil)
+}
+
+func (s *OutboundService) createTestConfigFull(outboundTag string, allOutbounds []any, testPort int,
+	tunnels []VpnOutboundConfig, sshTunnels []SshOutboundConfig, hy2Tunnels []Hysteria2OutboundConfig) *xray.Config {
 	// Test inbound (SOCKS proxy) - only addition to inbounds
 	testInbound := xray.InboundConfig{
 		Tag:      "test-inbound",
@@ -429,6 +435,9 @@ func (s *OutboundService) createTestConfig(outboundTag string, allOutbounds []an
 	// a successful test of somebody else's proxy.
 	if err := applySshOutboundsWith(cfg, sshTunnels); err != nil {
 		logger.Warning("outbound test: could not synthesize the SSH outbounds:", err)
+	}
+	if err := applyHysteria2OutboundsWith(cfg, hy2Tunnels); err != nil {
+		logger.Warning("outbound test: could not synthesize the Hysteria 2 outbounds:", err)
 	}
 	if err := applyVpnOutboundsWith(cfg, tunnels); err != nil {
 		logger.Warning("outbound test: could not synthesize the VPN client outbounds:", err)

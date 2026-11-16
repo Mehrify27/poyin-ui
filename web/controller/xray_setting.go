@@ -22,6 +22,7 @@ type XraySettingController struct {
 	WarpService        service.WarpService
 	NordService        service.NordService
 	SshOutboundService service.SshOutboundService
+	Hy2OutboundService service.Hysteria2OutboundService
 	VpnOutboundService service.VpnOutboundService
 }
 
@@ -44,6 +45,7 @@ func (a *XraySettingController) initRouter(g *gin.RouterGroup) {
 	g.POST("/warp/:action", a.warp)
 	g.POST("/warpsocks/:action", a.warpsocks)
 	g.POST("/sshoutbound/:action", a.sshoutbound)
+	g.POST("/hy2outbound/:action", a.hy2outbound)
 	g.POST("/vpnoutbound/:action", a.vpnoutbound)
 	g.POST("/nord/:action", a.nord)
 	g.POST("/update", a.updateSetting)
@@ -75,6 +77,7 @@ func (a *XraySettingController) getXraySetting(c *gin.Context) {
 			xraySetting = unwrapped
 		}
 	}
+	xraySetting = service.ReconcileXrayTemplateOutbounds(xraySetting)
 	inboundTags, err := a.InboundService.GetInboundTags()
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.getSettings"), err)
@@ -203,6 +206,40 @@ func (a *XraySettingController) sshoutbound(c *gin.Context) {
 		jsonObj(c, gin.H{"running": up, "log": log}, nil)
 	default:
 		jsonObj(c, a.SshOutboundService.List(), nil)
+	}
+}
+
+// hy2outbound drives operator-configured Hysteria 2 client egress tunnels (list/save/delete/status).
+func (a *XraySettingController) hy2outbound(c *gin.Context) {
+	switch c.Param("action") {
+	case "list":
+		jsonObj(c, a.Hy2OutboundService.List(), nil)
+	case "save":
+		var cfg service.Hysteria2OutboundConfig
+		if err := c.ShouldBind(&cfg); err != nil {
+			jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+			return
+		}
+		if rawAlpn := strings.TrimSpace(c.PostForm("alpnStr")); rawAlpn != "" && len(cfg.Alpn) == 0 {
+			for _, part := range strings.Split(rawAlpn, ",") {
+				if trimmed := strings.TrimSpace(part); trimmed != "" {
+					cfg.Alpn = append(cfg.Alpn, trimmed)
+				}
+			}
+		}
+		saved, err := a.Hy2OutboundService.Save(cfg)
+		if err != nil {
+			jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
+			return
+		}
+		jsonObj(c, gin.H{"socksPort": saved.SocksPort}, nil)
+	case "delete":
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.Hy2OutboundService.Delete(c.PostForm("tag")))
+	case "status":
+		up, log := a.Hy2OutboundService.Status(c.PostForm("tag"))
+		jsonObj(c, gin.H{"running": up, "log": log}, nil)
+	default:
+		jsonObj(c, a.Hy2OutboundService.List(), nil)
 	}
 }
 

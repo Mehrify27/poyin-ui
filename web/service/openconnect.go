@@ -65,6 +65,7 @@ type ocservSettings struct {
 	UserLimit         *int           `json:"userLimit"`         // nil=absent(legacy=>1); 0=no limit; else 1..64. Parse-only — enforce via effectiveUserLimit.
 	UserLimitStrategy string         `json:"userLimitStrategy"` // "accept" (evict oldest) or "reject"
 	IpRanges          []string       `json:"ipRanges"`          // panel-managed 10.4.x /24 ranges
+	CustomConfig      string         `json:"customConfig,omitempty"`
 	Clients           []ocservClient `json:"clients"`
 }
 
@@ -231,9 +232,15 @@ func (s *OcservService) generateServerConfig(inbound *model.Inbound) error {
 	ownPrepareDir("/var/run/ocserv", "openconnect")
 	os.MkdirAll("/var/run/ocserv", 0755)
 
-	conf := applyCoreConfigOverride("openconnect", inbound.Id, "ocserv.conf",
-		s.buildServerConfig(inbound, settings))
-	return s.writeFile(fmt.Sprintf("%s/ocserv.conf", dir), conf)
+	confPath := fmt.Sprintf("%s/ocserv.conf", dir)
+	existingBytes, _ := os.ReadFile(confPath)
+	rendered := s.buildServerConfig(inbound, settings)
+	merged, recoveredOnDisk := mergeOcservCustomConfig(rendered, settings.CustomConfig, string(existingBytes))
+	if strings.TrimSpace(settings.CustomConfig) == "" && strings.TrimSpace(recoveredOnDisk) != "" {
+		syncInboundCustomConfig(inbound.Id, recoveredOnDisk, false)
+	}
+	conf := applyCoreConfigOverride("openconnect", inbound.Id, "ocserv.conf", merged)
+	return s.writeFile(confPath, conf)
 }
 
 // ocservProcName returns the process-manager key for an OpenConnect inbound.
@@ -388,6 +395,188 @@ func (s *OcservService) buildServerConfig(inbound *model.Inbound, settings *ocse
 	b.WriteString("log-level = 3\n")
 
 	return b.String()
+}
+
+func ocservDirectiveKey(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+		return ""
+	}
+	if idx := strings.IndexByte(trimmed, '='); idx >= 0 {
+		return strings.ToLower(strings.TrimSpace(trimmed[:idx]))
+	}
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToLower(fields[0])
+}
+
+var (
+	ocservMandatoryKeys = map[string]bool{
+		"auth":              true,
+		"acct":              true,
+		"use-occtl":         true,
+		"occtl-socket-file": true,
+		"socket-file":       true,
+		"pid-file":          true,
+		"run-as-user":       true,
+		"run-as-group":      true,
+		"device":            true,
+		"tcp-port":          true,
+		"udp-port":          true,
+		"ipv4-network":      true,
+		"ipv4-netmask":      true,
+		"server-cert":       true,
+		"server-key":        true,
+		"ca-cert":           true,
+	}
+	ocservUiControlledKeys = map[string]bool{
+		"auth":              true,
+		"acct":              true,
+		"use-occtl":         true,
+		"occtl-socket-file": true,
+		"socket-file":       true,
+		"pid-file":          true,
+		"run-as-user":       true,
+		"run-as-group":      true,
+		"device":            true,
+		"tcp-port":          true,
+		"udp-port":          true,
+		"ipv4-network":      true,
+		"ipv4-netmask":      true,
+		"server-cert":       true,
+		"server-key":        true,
+		"ca-cert":           true,
+		"dns":               true,
+		"mtu":               true,
+	}
+	ocservOverridableSingleKeys = map[string]bool{
+		"max-clients":           true,
+		"max-same-clients":      true,
+		"dpd":                   true,
+		"mobile-dpd":            true,
+		"mtu":                   true,
+		"try-mtu-discovery":     true,
+		"output-buffer":         true,
+		"tls-priorities":        true,
+		"banner":                true,
+		"rekey-time":            true,
+		"rekey-method":          true,
+		"keepalive":             true,
+		"compression":           true,
+		"no-compress-limit":     true,
+		"switch-to-tcp-timeout": true,
+		"log-level":             true,
+		"isolate-workers":       true,
+		"cisco-client-compat":   true,
+		"dtls-legacy":           true,
+		"tunnel-all-dns":        true,
+		"predictable-ips":       true,
+		"cert-user-oid":         true,
+		"cookie-timeout":        true,
+		"idle-timeout":          true,
+		"session-timeout":       true,
+	}
+)
+
+// mergeOcservCustomConfig merges settingsCustom and any manual operator directives
+// or # BEGIN_USER_CUSTOM ... # END_USER_CUSTOM block from existing on-disk
+// ocserv.conf into rendered output, suppressing overridden single-value defaults
+// while protecting mandatory panel lifecycle keys.
+func mergeOcservCustomConfig(rendered, settingsCustom, onDiskContent string) (merged string, recoveredOnDisk string) {
+	settingsLines := extractCustomLinesPlain(settingsCustom)
+
+	onDiskClean := stripCoreConfigBanner(onDiskContent)
+	renderedLinesSet := make(map[string]bool)
+	for _, l := range strings.Split(strings.ReplaceAll(rendered, "\r\n", "\n"), "\n") {
+		if t := strings.TrimSpace(l); t != "" {
+			renderedLinesSet[t] = true
+		}
+	}
+
+	explicitDiskLines := extractDelimitedCustomBlock(onDiskClean, userCustomBeginMarker, userCustomEndMarker)
+	var looseDiskLines []string
+	inBlock := false
+	for _, raw := range strings.Split(strings.ReplaceAll(onDiskClean, "\r\n", "\n"), "\n") {
+		t := strings.TrimSpace(raw)
+		if t == userCustomBeginMarker {
+			inBlock = true
+			continue
+		}
+		if t == userCustomEndMarker {
+			inBlock = false
+			continue
+		}
+		if inBlock || t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, ";") {
+			continue
+		}
+		if renderedLinesSet[t] {
+			continue
+		}
+		key := ocservDirectiveKey(t)
+		if key == "" || ocservUiControlledKeys[key] {
+			continue
+		}
+		looseDiskLines = append(looseDiskLines, t)
+	}
+
+	onDiskAll := dedupeCustomLines(explicitDiskLines, looseDiskLines)
+	filterSafe := func(lines []string) []string {
+		var safe []string
+		for _, line := range lines {
+			key := ocservDirectiveKey(line)
+			if key != "" && ocservMandatoryKeys[key] {
+				continue
+			}
+			safe = append(safe, line)
+		}
+		return safe
+	}
+	onDiskSafe := filterSafe(onDiskAll)
+	recoveredOnDisk = strings.Join(onDiskSafe, "\n")
+
+	combined := filterSafe(dedupeCustomLines(settingsLines, onDiskSafe))
+	if len(combined) == 0 {
+		return rendered, ""
+	}
+
+	overridden := make(map[string]bool)
+	for _, line := range combined {
+		key := ocservDirectiveKey(line)
+		if key != "" && ocservOverridableSingleKeys[key] {
+			overridden[key] = true
+		}
+	}
+
+	var out strings.Builder
+	for _, line := range strings.Split(strings.TrimRight(strings.ReplaceAll(rendered, "\r\n", "\n"), "\n"), "\n") {
+		key := ocservDirectiveKey(line)
+		if key != "" && overridden[key] {
+			continue
+		}
+		out.WriteString(line)
+		out.WriteByte('\n')
+	}
+	out.WriteString("\n" + userCustomBeginMarker + "\n")
+	for _, line := range combined {
+		out.WriteString(line)
+		out.WriteByte('\n')
+	}
+	out.WriteString(userCustomEndMarker + "\n")
+	return out.String(), recoveredOnDisk
+}
+
+func extractCustomLinesPlain(custom string) []string {
+	var out []string
+	for _, raw := range strings.Split(strings.ReplaceAll(custom, "\r\n", "\n"), "\n") {
+		t := strings.TrimSpace(raw)
+		if t == "" || t == userCustomBeginMarker || t == userCustomEndMarker {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 // writeCertFiles writes the content-mode server cert/key (and optional CA) to the

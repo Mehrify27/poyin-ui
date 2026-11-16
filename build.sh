@@ -53,6 +53,9 @@ What lands in the binary:
       --geo-only          refresh the geo files but don't rebuild the core
   -a, --arch GOARCH       target architecture (default: this host's 'go env GOARCH').
                           Cross-building needs a cgo cross compiler in CC
+      --repo OWNER/NAME   override default GitHub release repo embedded in binary
+      --mirror URL        GitHub mirror/proxy prefix for core/geo downloads and builds
+      --skip-deps         skip automatic host build-dependency preflight
 
 Other:
   -n, --dry-run           print what each step would do, then stop
@@ -61,7 +64,7 @@ Other:
 
 Environment (all still honored; the matching switch wins):
   SKIP_SUBMODULES  SKIP_CORE  SUBMODULES_LATEST  SUBMODULES_UPDATE
-  CORE_FORCE  GEO_FORCE  GEO_LEAN  GEO_ONLY
+  CORE_FORCE  GEO_FORCE  GEO_LEAN  GEO_ONLY  REPO  GH_PROXY
   DOCKER_NET       extra 'docker run' flags for the daemon bundle (e.g.
                    --network=host when the default bridge is firewalled)
   XRAY_SRC         build the core from another local checkout
@@ -91,7 +94,10 @@ SUBMODULES_UPDATE="${SUBMODULES_UPDATE:-0}"
 SKIP_BUNDLE=0
 FORCE_BUNDLE=0
 DRY_RUN=0
+SKIP_DEPS="${SKIP_DEPS:-0}"
 ARCH_FLAG=""
+REPO_SLUG="${VPNUI_REPO:-${REPO:-Mehrify27/poyin-ui}}"
+MIRROR_URL="${VPNUI_GH_PROXY:-${GH_PROXY:-}}"
 
 while (( $# )); do
     case "$1" in
@@ -100,6 +106,7 @@ while (( $# )); do
         --skip-submodules)   SKIP_SUBMODULES=1 ;;
         --skip-core)         SKIP_CORE=1 ;;
         --skip-bundle)       SKIP_BUNDLE=1 ;;
+        --skip-deps)         SKIP_DEPS=1 ;;
         --latest)            SUBMODULES_LATEST=1 ;;
         --update-submodules) SUBMODULES_UPDATE=1 ;;
         # The force knobs are read by build/core/build.sh, a separate process, so they
@@ -113,6 +120,10 @@ while (( $# )); do
         # Both spellings, matching test_unit/run.sh's flags.
         -a|--arch)           [[ $# -ge 2 ]] || die "-a/--arch needs a GOARCH (amd64, arm64, ...)"; ARCH_FLAG="$2"; shift ;;
         --arch=*)            ARCH_FLAG="${1#*=}"; [[ -n "$ARCH_FLAG" ]] || die "--arch= needs a GOARCH (amd64, arm64, ...)" ;;
+        --repo)              [[ $# -ge 2 ]] || die "--repo needs owner/name"; REPO_SLUG="$2"; shift ;;
+        --repo=*)            REPO_SLUG="${1#*=}"; [[ -n "$REPO_SLUG" ]] || die "--repo= needs owner/name" ;;
+        --mirror)            [[ $# -ge 2 ]] || die "--mirror needs a URL prefix"; MIRROR_URL="$2"; shift ;;
+        --mirror=*)          MIRROR_URL="${1#*=}"; [[ -n "$MIRROR_URL" ]] || die "--mirror= needs a URL prefix" ;;
         -n|--dry-run)        DRY_RUN=1 ;;
         --no-color)          export NO_COLOR=1 ;;
         -*)                  die "unknown option '$1'. Run './build.sh --help' for the list." ;;
@@ -120,6 +131,80 @@ while (( $# )); do
     esac
     shift
 done
+
+if [[ -n "$MIRROR_URL" ]]; then
+    export GH_PROXY="$MIRROR_URL"
+    export VPNUI_GH_PROXY="$MIRROR_URL"
+fi
+export REPO="$REPO_SLUG"
+
+read_build_version() {
+    local raw=""
+    if [[ -s "$REPO_ROOT/VERSION" ]]; then
+        raw="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
+    elif [[ -s "$REPO_ROOT/config/version" ]]; then
+        raw="$(tr -d '[:space:]' < "$REPO_ROOT/config/version")"
+    fi
+    raw="${raw#v}"
+    raw="${raw#V}"
+    [[ -n "$raw" ]] || raw="2.0.0"
+    printf '%s' "$raw"
+}
+
+BUILD_VERSION="$(read_build_version)"
+if [[ "${DRY_RUN}" != "1" ]] && [[ -f "$REPO_ROOT/config/version" ]]; then
+    if [[ "$(tr -d '[:space:]' < "$REPO_ROOT/config/version")" != "$BUILD_VERSION" ]]; then
+        printf '%s\n' "$BUILD_VERSION" > "$REPO_ROOT/config/version"
+    fi
+fi
+
+ensure_host_deps() {
+    [[ "$SKIP_DEPS" == "1" ]] && return 0
+    local missing=()
+    local cc_bin="${CC:-gcc}"
+    command -v git  >/dev/null 2>&1 || missing+=(git)
+    command -v curl >/dev/null 2>&1 || missing+=(curl)
+    command -v tar  >/dev/null 2>&1 || missing+=(tar)
+    if [[ "$ARCH" == "$HOST_ARCH" ]] && ! command -v "$cc_bin" >/dev/null 2>&1; then
+        missing+=(gcc)
+    fi
+    (( ${#missing[@]} == 0 )) && return 0
+    if (( DRY_RUN )); then
+        info "would install missing host build tool(s): ${missing[*]}"
+        return 0
+    fi
+    if [[ $EUID -ne 0 ]] && ! command -v sudo >/dev/null 2>&1; then
+        warn "missing host build tools (${missing[*]}) and cannot elevate to install them cleanly"
+        return 0
+    fi
+    local sudo_cmd=()
+    [[ $EUID -eq 0 ]] || sudo_cmd=(sudo)
+    local id="" like=""
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        id="${ID,,}"
+        like="${ID_LIKE,,}"
+    fi
+    if command -v apt-get >/dev/null 2>&1; then
+        info "installing build prerequisites on ${PRETTY_NAME:-Debian/Ubuntu}: build-essential curl git tar ca-certificates"
+        DEBIAN_FRONTEND=noninteractive "${sudo_cmd[@]}" apt-get update -qq || true
+        DEBIAN_FRONTEND=noninteractive "${sudo_cmd[@]}" apt-get install -y -qq build-essential curl git tar ca-certificates || true
+    elif command -v dnf5 >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
+        local dnf_bin="dnf"
+        command -v dnf >/dev/null 2>&1 || dnf_bin="dnf5"
+        info "installing build prerequisites on ${PRETTY_NAME:-Fedora/EL}: gcc make curl git tar ca-certificates"
+        "${sudo_cmd[@]}" "$dnf_bin" install -y gcc make curl git tar ca-certificates || true
+    elif command -v yum >/dev/null 2>&1; then
+        "${sudo_cmd[@]}" yum install -y gcc make curl git tar ca-certificates || true
+    elif command -v pacman >/dev/null 2>&1; then
+        "${sudo_cmd[@]}" pacman -Sy --needed --noconfirm base-devel curl git tar ca-certificates || true
+    elif command -v zypper >/dev/null 2>&1; then
+        "${sudo_cmd[@]}" zypper --non-interactive install gcc make curl git tar ca-certificates || true
+    elif command -v apk >/dev/null 2>&1; then
+        "${sudo_cmd[@]}" apk add --no-cache build-base curl git tar ca-certificates || true
+    fi
+}
 
 command -v go >/dev/null 2>&1 || die "no 'go' in PATH. The panel, the Xray core and the arch default all need the Go toolchain."
 HOST_ARCH="$(go env GOARCH)"
@@ -161,9 +246,10 @@ do_run() {
 }
 
 hr
-step "vpn-ui build ${_CD:-}(${ARCH})${_CR:-}"
+step "vpn-ui build ${_CD:-}(v${BUILD_VERSION}, ${ARCH}, repo=${REPO_SLUG})${_CR:-}"
 hr
 if (( DRY_RUN )); then info "dry run: nothing is fetched, built or written"; fi
+ensure_host_deps
 
 # 0. Pinned upstream (third_party/Xray-core). Clone it
 #    ONCE, then reuse. `git submodule status` prefixes a line with '-' when a
@@ -230,6 +316,7 @@ BUNDLE_ARTIFACTS=(
     accel-ppp-bundle.tgz     # SSTP server
     strongswan-bundle.tgz    # IKEv2
     telemt                   # MTProto Proxy
+    sing-box                 # Hysteria 2 server/client
     pptp                     # PPTP client
     openconnect              # OpenConnect client
     vpnc-script              # its routing/DNS hook
@@ -279,18 +366,64 @@ fi
 # 3. Panel binary (cgo required for sqlite). Output goes to build/out/.
 OUT_DIR="$REPO_ROOT/build/out"
 OUT_BIN="$OUT_DIR/vpn-ui-$ARCH"
-step "compiling vpn-ui"
+OUT_TGZ="$OUT_DIR/vpn-ui-${BUILD_VERSION}-linux-${ARCH}.tar.gz"
+OUT_TGZ_LATEST="$OUT_DIR/vpn-ui-linux-${ARCH}.tar.gz"
+LDFLAGS="-s -w -X github.com/mhsanaei/3x-ui/v2/config.ldVersion=${BUILD_VERSION} -X github.com/mhsanaei/3x-ui/v2/config.ldRepo=${REPO_SLUG}"
+if [[ -n "$MIRROR_URL" ]]; then
+    LDFLAGS+=" -X github.com/mhsanaei/3x-ui/v2/config.ldGHProxy=${MIRROR_URL}"
+fi
+
+step "compiling vpn-ui v${BUILD_VERSION}"
 if (( DRY_RUN )); then
-    info "would run: CGO_ENABLED=1 GOARCH=$ARCH go build -o build/out/vpn-ui-$ARCH main.go"
+    info "would run: CGO_ENABLED=1 GOARCH=$ARCH go build -ldflags \"$LDFLAGS\" -o build/out/vpn-ui-$ARCH main.go"
+    info "would package offline bundle: $OUT_TGZ (+ SHA256SUMS + deploy.sh + vpn-ui.sh + VERSION)"
     hr
     ok "dry run: nothing was built"
     hr
     exit 0
 fi
 mkdir -p "$OUT_DIR"
-CGO_ENABLED=1 GOARCH="$ARCH" go build -o "$OUT_BIN" main.go
+CGO_ENABLED=1 GOARCH="$ARCH" go build -ldflags "$LDFLAGS" -o "$OUT_BIN" main.go
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        openssl dgst -sha256 -r "$1" | awk '{print $1}'
+    fi
+}
+
+step "packaging offline release bundle & checksums"
+bin_sum="$(sha256_of "$OUT_BIN")"
+printf '%s  %s\n' "$bin_sum" "vpn-ui-${ARCH}" > "$OUT_BIN.sha256"
+
+bundle_stage="$(mktemp -d)"
+trap 'rm -rf "$bundle_stage"' EXIT
+cp "$OUT_BIN" "$bundle_stage/vpn-ui-${ARCH}"
+chmod 0755 "$bundle_stage/vpn-ui-${ARCH}"
+cp "$REPO_ROOT/deploy.sh" "$bundle_stage/deploy.sh"
+chmod 0755 "$bundle_stage/deploy.sh"
+cp "$REPO_ROOT/vpn-ui.sh" "$bundle_stage/vpn-ui.sh"
+chmod 0755 "$bundle_stage/vpn-ui.sh"
+printf '%s\n' "$BUILD_VERSION" > "$bundle_stage/VERSION"
+(
+    cd "$bundle_stage"
+    for f in "vpn-ui-${ARCH}" "deploy.sh" "vpn-ui.sh" "VERSION"; do
+        printf '%s  %s\n' "$(sha256_of "$f")" "$f"
+    done > SHA256SUMS
+    tar -czf "$OUT_TGZ" "vpn-ui-${ARCH}" "deploy.sh" "vpn-ui.sh" "VERSION" "SHA256SUMS"
+)
+rm -rf "$bundle_stage"
+trap - EXIT
+
+cp -f "$OUT_TGZ" "$OUT_TGZ_LATEST"
+printf '%s  %s\n' "$(sha256_of "$OUT_TGZ")" "$(basename "$OUT_TGZ")" > "${OUT_TGZ}.sha256"
+printf '%s  %s\n' "$(sha256_of "$OUT_TGZ_LATEST")" "$(basename "$OUT_TGZ_LATEST")" > "${OUT_TGZ_LATEST}.sha256"
 
 hr
 ok "done: ${_CB:-}$(ls -lh "$OUT_BIN" | awk '{print $5}')${_CR:-} -> ${_CB:-}build/out/vpn-ui-${ARCH}${_CR:-}"
+ok "bundle: ${_CB:-}build/out/$(basename "$OUT_TGZ")${_CR:-} (offline/air-gapped ready)"
 info "run it:  ./build/out/vpn-ui-${ARCH}"
 hr

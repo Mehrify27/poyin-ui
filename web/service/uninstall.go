@@ -442,7 +442,7 @@ func stopVpnDaemons(r *UninstallReport, exePath string, keepCores bool) {
 		// procmgr.go has known about them for as long as they have existed. Same
 		// omission, same consequence: a daemon still holding :443 (or the MTProto
 		// port) after the panel that supervised it is gone.
-		for _, d := range []string{"openvpn", "xl2tpd", "pptpd", "accel-pppd", "telemt"} {
+		for _, d := range []string{"openvpn", "xl2tpd", "pptpd", "accel-pppd", "telemt", "sing-box"} {
 			bin := daemonBin(d)
 			if bin == d {
 				continue // unresolved bare name — avoid a too-broad match

@@ -47,6 +47,7 @@ type SubService struct {
 	awgService     service.AwgService
 	greService     service.GreService
 	openvpnService service.OpenVpnService
+	hysteria2Service service.Hysteria2Service
 }
 
 // NewSubService creates a new subscription service with the given configuration.
@@ -275,7 +276,7 @@ func (s *SubService) getLink(inbound *model.Inbound, email string) string {
 		// Same split: ssh:// here is the Shadowrocket/base64 form (service.sshShareLink),
 		// which subscription importers do not read either.
 		return joinLinks(s.genSshLink(inbound, email), s.genConnectionCard(inbound, email))
-	case "wg-c", "awg":
+	case "wg-c", "awg", "wireguard":
 		// A real, importable link rather than a card: Xray/sing-box clients speak
 		// WireGuard, so these accounts get a working entry. The full-fidelity .conf
 		// still comes from the Clash sub and the per-client modal.
@@ -550,12 +551,36 @@ func (s *SubService) genWireguardLink(inbound *model.Inbound, email string) stri
 		for _, p := range awgParams {
 			params = append(params, p.WgcClientParams)
 		}
+	case model.WireGuard:
+		params, err = service.RenderWireguardXrayParams(inbound, email, s.resolveInboundAddress(inbound))
 	default:
 		return ""
 	}
 	if err != nil {
 		logger.Error("SubService - wireguard RenderClientParams:", err)
 		return ""
+	}
+
+	if inbound.Protocol != model.WireGuard {
+		stream := unmarshalStreamSettings(inbound.StreamSettings)
+		if epSpecs := extractExternalProxies(stream, nil, s.resolveInboundAddress(inbound), inbound.Port); len(epSpecs) > 0 {
+			expanded := make([]service.WgcClientParams, 0, len(params)*len(epSpecs))
+			for _, p := range params {
+				for _, ep := range epSpecs {
+					cp := p
+					cp.Host = ep.Dest
+					cp.Port = ep.Port
+					switch {
+					case cp.Name != "" && ep.Remark != "":
+						cp.Name = cp.Name + " - " + ep.Remark
+					case ep.Remark != "":
+						cp.Name = ep.Remark
+					}
+					expanded = append(expanded, cp)
+				}
+			}
+			params = expanded
+		}
 	}
 
 	links := make([]string, 0, len(params))
@@ -639,10 +664,15 @@ func (s *SubService) genVmessLink(inbound *model.Inbound, email string) string {
 
 	clients, _ := s.inboundService.GetClients(inbound)
 	clientIndex := findClientIndex(clients, email)
+	if clientIndex < 0 {
+		return ""
+	}
 	obj["id"] = clients[clientIndex].ID
 	obj["scy"] = clients[clientIndex].Security
 
-	externalProxies, _ := stream["externalProxy"].([]any)
+	var settings map[string]any
+	_ = json.Unmarshal([]byte(inbound.Settings), &settings)
+	externalProxies := extractExternalProxies(stream, settings, address, inbound.Port)
 
 	if len(externalProxies) > 0 {
 		return s.buildVmessExternalProxyLinks(externalProxies, obj, inbound, email)
@@ -660,15 +690,18 @@ func (s *SubService) genVlessLink(inbound *model.Inbound, email string) string {
 	stream := unmarshalStreamSettings(inbound.StreamSettings)
 	clients, _ := s.inboundService.GetClients(inbound)
 	clientIndex := findClientIndex(clients, email)
+	if clientIndex < 0 {
+		return ""
+	}
 	uuid := clients[clientIndex].ID
 	port := inbound.Port
-	streamNetwork := stream["network"].(string)
+	streamNetwork, _ := stream["network"].(string)
 	params := make(map[string]string)
 	params["type"] = streamNetwork
 
 	// Add encryption parameter for VLESS from inbound settings
 	var settings map[string]any
-	json.Unmarshal([]byte(inbound.Settings), &settings)
+	_ = json.Unmarshal([]byte(inbound.Settings), &settings)
 	if encryption, ok := settings["encryption"].(string); ok {
 		params["encryption"] = encryption
 	}
@@ -677,23 +710,29 @@ func (s *SubService) genVlessLink(inbound *model.Inbound, email string) string {
 	if finalmask, ok := stream["finalmask"].(map[string]any); ok {
 		applyFinalMaskParams(finalmask, params)
 	}
+	flow := clients[clientIndex].Flow
+	if flow == "" {
+		if inboundFlow, ok := settings["flow"].(string); ok {
+			flow = inboundFlow
+		}
+	}
 	security, _ := stream["security"].(string)
 	switch security {
 	case "tls":
 		applyShareTLSParams(stream, params)
-		if streamNetwork == "tcp" && len(clients[clientIndex].Flow) > 0 {
-			params["flow"] = clients[clientIndex].Flow
+		if streamNetwork == "tcp" && len(flow) > 0 {
+			params["flow"] = flow
 		}
 	case "reality":
 		applyShareRealityParams(stream, params)
-		if streamNetwork == "tcp" && len(clients[clientIndex].Flow) > 0 {
-			params["flow"] = clients[clientIndex].Flow
+		if streamNetwork == "tcp" && len(flow) > 0 {
+			params["flow"] = flow
 		}
 	default:
 		params["security"] = "none"
 	}
 
-	externalProxies, _ := stream["externalProxy"].([]any)
+	externalProxies := extractExternalProxies(stream, settings, address, port)
 
 	if len(externalProxies) > 0 {
 		return s.buildExternalProxyURLLinks(
@@ -701,15 +740,15 @@ func (s *SubService) genVlessLink(inbound *model.Inbound, email string) string {
 			params,
 			security,
 			func(dest string, port int) string {
-				return fmt.Sprintf("vless://%s@%s:%d", uuid, dest, port)
+				return fmt.Sprintf("vless://%s@%s", uuid, net.JoinHostPort(dest, strconv.Itoa(port)))
 			},
-			func(ep map[string]any) string {
-				return s.genRemark(inbound, email, ep["remark"].(string))
+			func(ep externalProxySpec) string {
+				return s.genRemark(inbound, email, ep.Remark)
 			},
 		)
 	}
 
-	link := fmt.Sprintf("vless://%s@%s:%d", uuid, address, port)
+	link := fmt.Sprintf("vless://%s@%s", uuid, net.JoinHostPort(address, strconv.Itoa(port)))
 	return buildLinkWithParams(link, params, s.genRemark(inbound, email, ""))
 }
 
@@ -721,9 +760,12 @@ func (s *SubService) genTrojanLink(inbound *model.Inbound, email string) string 
 	stream := unmarshalStreamSettings(inbound.StreamSettings)
 	clients, _ := s.inboundService.GetClients(inbound)
 	clientIndex := findClientIndex(clients, email)
+	if clientIndex < 0 {
+		return ""
+	}
 	password := clients[clientIndex].Password
 	port := inbound.Port
-	streamNetwork := stream["network"].(string)
+	streamNetwork, _ := stream["network"].(string)
 	params := make(map[string]string)
 	params["type"] = streamNetwork
 
@@ -744,7 +786,9 @@ func (s *SubService) genTrojanLink(inbound *model.Inbound, email string) string 
 		params["security"] = "none"
 	}
 
-	externalProxies, _ := stream["externalProxy"].([]any)
+	var settings map[string]any
+	_ = json.Unmarshal([]byte(inbound.Settings), &settings)
+	externalProxies := extractExternalProxies(stream, settings, address, port)
 
 	if len(externalProxies) > 0 {
 		return s.buildExternalProxyURLLinks(
@@ -752,15 +796,15 @@ func (s *SubService) genTrojanLink(inbound *model.Inbound, email string) string 
 			params,
 			security,
 			func(dest string, port int) string {
-				return fmt.Sprintf("trojan://%s@%s:%d", password, dest, port)
+				return fmt.Sprintf("trojan://%s@%s", password, net.JoinHostPort(dest, strconv.Itoa(port)))
 			},
-			func(ep map[string]any) string {
-				return s.genRemark(inbound, email, ep["remark"].(string))
+			func(ep externalProxySpec) string {
+				return s.genRemark(inbound, email, ep.Remark)
 			},
 		)
 	}
 
-	link := fmt.Sprintf("trojan://%s@%s:%d", password, address, port)
+	link := fmt.Sprintf("trojan://%s@%s", password, net.JoinHostPort(address, strconv.Itoa(port)))
 	return buildLinkWithParams(link, params, s.genRemark(inbound, email, ""))
 }
 
@@ -773,11 +817,14 @@ func (s *SubService) genShadowsocksLink(inbound *model.Inbound, email string) st
 	clients, _ := s.inboundService.GetClients(inbound)
 
 	var settings map[string]any
-	json.Unmarshal([]byte(inbound.Settings), &settings)
-	inboundPassword := settings["password"].(string)
-	method := settings["method"].(string)
+	_ = json.Unmarshal([]byte(inbound.Settings), &settings)
+	inboundPassword, _ := settings["password"].(string)
+	method, _ := settings["method"].(string)
 	clientIndex := findClientIndex(clients, email)
-	streamNetwork := stream["network"].(string)
+	if clientIndex < 0 {
+		return ""
+	}
+	streamNetwork, _ := stream["network"].(string)
 	params := make(map[string]string)
 	params["type"] = streamNetwork
 
@@ -792,11 +839,11 @@ func (s *SubService) genShadowsocksLink(inbound *model.Inbound, email string) st
 	}
 
 	encPart := fmt.Sprintf("%s:%s", method, clients[clientIndex].Password)
-	if method[0] == '2' {
+	if strings.HasPrefix(method, "2") {
 		encPart = fmt.Sprintf("%s:%s:%s", method, inboundPassword, clients[clientIndex].Password)
 	}
 
-	externalProxies, _ := stream["externalProxy"].([]any)
+	externalProxies := extractExternalProxies(stream, settings, address, inbound.Port)
 
 	if len(externalProxies) > 0 {
 		proxyParams := cloneStringMap(params)
@@ -806,15 +853,15 @@ func (s *SubService) genShadowsocksLink(inbound *model.Inbound, email string) st
 			proxyParams,
 			security,
 			func(dest string, port int) string {
-				return fmt.Sprintf("ss://%s@%s:%d", base64.StdEncoding.EncodeToString([]byte(encPart)), dest, port)
+				return fmt.Sprintf("ss://%s@%s", base64.StdEncoding.EncodeToString([]byte(encPart)), net.JoinHostPort(dest, strconv.Itoa(port)))
 			},
-			func(ep map[string]any) string {
-				return s.genRemark(inbound, email, ep["remark"].(string))
+			func(ep externalProxySpec) string {
+				return s.genRemark(inbound, email, ep.Remark)
 			},
 		)
 	}
 
-	link := fmt.Sprintf("ss://%s@%s:%d", base64.StdEncoding.EncodeToString([]byte(encPart)), address, inbound.Port)
+	link := fmt.Sprintf("ss://%s@%s", base64.StdEncoding.EncodeToString([]byte(encPart)), net.JoinHostPort(address, strconv.Itoa(inbound.Port)))
 	return buildLinkWithParams(link, params, s.genRemark(inbound, email, ""))
 }
 
@@ -823,116 +870,153 @@ func (s *SubService) genHysteriaLink(inbound *model.Inbound, email string) strin
 		return ""
 	}
 	var stream map[string]any
-	json.Unmarshal([]byte(inbound.StreamSettings), &stream)
+	_ = json.Unmarshal([]byte(inbound.StreamSettings), &stream)
 	clients, _ := s.inboundService.GetClients(inbound)
-	clientIndex := -1
-	for i, client := range clients {
-		if client.Email == email {
-			clientIndex = i
-			break
-		}
+	clientIndex := findClientIndex(clients, email)
+	if clientIndex < 0 {
+		return ""
 	}
 	auth := clients[clientIndex].Auth
-	params := make(map[string]string)
-
-	params["security"] = "tls"
-	tlsSetting, _ := stream["tlsSettings"].(map[string]any)
-	alpns, _ := tlsSetting["alpn"].([]any)
-	var alpn []string
-	for _, a := range alpns {
-		alpn = append(alpn, a.(string))
+	if auth == "" {
+		auth = clients[clientIndex].Password
 	}
-	if len(alpn) > 0 {
-		params["alpn"] = strings.Join(alpn, ",")
-	}
-	if sniValue, ok := searchKey(tlsSetting, "serverName"); ok {
-		params["sni"], _ = sniValue.(string)
-	}
-
-	tlsSettings, _ := searchKey(tlsSetting, "settings")
-	if tlsSetting != nil {
-		if fpValue, ok := searchKey(tlsSettings, "fingerprint"); ok {
-			params["fp"], _ = fpValue.(string)
-		}
-		if insecure, ok := searchKey(tlsSettings, "allowInsecure"); ok {
-			if insecure.(bool) {
-				params["insecure"] = "1"
-			}
-		}
-	}
-
-	// salamander obfs (Hysteria2). The panel-side link generator already
-	// emits these; keep the subscription output in sync so a client has
-	// the obfs password to match the server.
-	if finalmask, ok := stream["finalmask"].(map[string]any); ok {
-		applyFinalMaskParams(finalmask, params)
-		if udpMasks, ok := finalmask["udp"].([]any); ok {
-			for _, m := range udpMasks {
-				mask, _ := m.(map[string]any)
-				if mask == nil || mask["type"] != "salamander" {
-					continue
-				}
-				settings, _ := mask["settings"].(map[string]any)
-				if pw, ok := settings["password"].(string); ok && pw != "" {
-					params["obfs"] = "salamander"
-					params["obfs-password"] = pw
-					break
-				}
-			}
-		}
-	}
-
 	var settings map[string]any
-	json.Unmarshal([]byte(inbound.Settings), &settings)
-	version, _ := settings["version"].(float64)
+	_ = json.Unmarshal([]byte(inbound.Settings), &settings)
+
+	params := make(map[string]string)
 	protocol := "hysteria2"
-	if int(version) == 1 {
-		protocol = "hysteria"
+
+	if inbound.Protocol == model.Hysteria2 {
+		if alpns, ok := settings["alpn"].([]any); ok {
+			var alpn []string
+			for _, a := range alpns {
+				if aStr, ok := a.(string); ok && strings.TrimSpace(aStr) != "" {
+					alpn = append(alpn, strings.TrimSpace(aStr))
+				}
+			}
+			if len(alpn) > 0 {
+				params["alpn"] = strings.Join(alpn, ",")
+			}
+		}
+		if _, hasAlpn := params["alpn"]; !hasAlpn {
+			params["alpn"] = "h3"
+		}
+		if sni, _ := settings["serverName"].(string); strings.TrimSpace(sni) != "" {
+			params["sni"] = strings.TrimSpace(sni)
+		}
+		if fp, _ := settings["fingerprint"].(string); strings.TrimSpace(fp) != "" {
+			params["fp"] = strings.TrimSpace(fp)
+		}
+		allowInsecure, _ := settings["allowInsecure"].(bool)
+		if allowInsecure {
+			params["insecure"] = "1"
+		}
+		if pin, _ := settings["pinSHA256"].(string); strings.TrimSpace(pin) != "" {
+			params["pinSHA256"] = strings.TrimSpace(pin)
+		} else if !allowInsecure {
+			certFile, _ := settings["certificateFile"].(string)
+			certFileAlt, _ := settings["certFile"].(string)
+			certInline, _ := settings["certificate"].(string)
+			if strings.TrimSpace(certFile) == "" && strings.TrimSpace(certFileAlt) == "" && strings.TrimSpace(certInline) == "" {
+				if autoPin := s.hysteria2Service.ResolveCertPinSHA256(inbound); autoPin != "" {
+					params["pinSHA256"] = autoPin
+				}
+			}
+		}
+		obfsType, _ := settings["obfsType"].(string)
+		obfsPass, _ := settings["obfsPassword"].(string)
+		if strings.EqualFold(strings.TrimSpace(obfsType), "salamander") && obfsPass != "" {
+			params["obfs"] = "salamander"
+			params["obfs-password"] = obfsPass
+		}
+		if hop, _ := settings["hopPorts"].(string); strings.TrimSpace(hop) != "" {
+			params["mport"] = strings.TrimSpace(hop)
+		}
+	} else {
+		params["security"] = "tls"
+		tlsSetting, _ := stream["tlsSettings"].(map[string]any)
+		alpns, _ := tlsSetting["alpn"].([]any)
+		var alpn []string
+		for _, a := range alpns {
+			if aStr, ok := a.(string); ok && aStr != "" {
+				alpn = append(alpn, aStr)
+			}
+		}
+		if len(alpn) > 0 {
+			params["alpn"] = strings.Join(alpn, ",")
+		}
+		if sniValue, ok := searchKey(tlsSetting, "serverName"); ok {
+			params["sni"], _ = sniValue.(string)
+		}
+
+		tlsSettings, _ := searchKey(tlsSetting, "settings")
+		if tlsSetting != nil {
+			if fpValue, ok := searchKey(tlsSettings, "fingerprint"); ok {
+				params["fp"], _ = fpValue.(string)
+			}
+			if insecure, ok := searchKey(tlsSettings, "allowInsecure"); ok {
+				if allowInsec, _ := insecure.(bool); allowInsec {
+					params["insecure"] = "1"
+				}
+			}
+		}
+
+		// salamander obfs (Hysteria2). The panel-side link generator already
+		// emits these; keep the subscription output in sync so a client has
+		// the obfs password to match the server.
+		if finalmask, ok := stream["finalmask"].(map[string]any); ok {
+			applyFinalMaskParams(finalmask, params)
+			if udpMasks, ok := finalmask["udp"].([]any); ok {
+				for _, m := range udpMasks {
+					mask, _ := m.(map[string]any)
+					if mask == nil || mask["type"] != "salamander" {
+						continue
+					}
+					maskSettings, _ := mask["settings"].(map[string]any)
+					if pw, ok := maskSettings["password"].(string); ok && pw != "" {
+						params["obfs"] = "salamander"
+						params["obfs-password"] = pw
+						break
+					}
+				}
+			}
+		}
+
+		version, _ := settings["version"].(float64)
+		if int(version) == 1 {
+			protocol = "hysteria"
+		}
 	}
 
-	// Fan out one link per External Proxy entry if any. Previously this
-	// generator ignored `externalProxy` entirely, so the link kept the
-	// server's own IP/port even when the admin configured an alternate
-	// endpoint (e.g. a CDN hostname + port that forwards to the node).
-	// Matches the behaviour of genVlessLink / genTrojanLink / ….
-	externalProxies, _ := stream["externalProxy"].([]any)
-	if len(externalProxies) > 0 {
-		links := make([]string, 0, len(externalProxies))
-		for _, externalProxy := range externalProxies {
-			ep, ok := externalProxy.(map[string]any)
-			if !ok {
-				continue
-			}
-			dest, _ := ep["dest"].(string)
-			portF, okPort := ep["port"].(float64)
-			if dest == "" || !okPort {
-				continue
-			}
-			epRemark, _ := ep["remark"].(string)
-
-			link := fmt.Sprintf("%s://%s@%s:%d", protocol, auth, dest, int(portF))
-			u, _ := url.Parse(link)
-			q := u.Query()
-			for k, v := range params {
+	buildHyURI := func(host string, port int, epRemark string) string {
+		u := &url.URL{
+			Scheme: protocol,
+			User:   url.User(auth),
+			Host:   net.JoinHostPort(host, strconv.Itoa(port)),
+		}
+		q := u.Query()
+		for k, v := range params {
+			if v != "" {
 				q.Add(k, v)
 			}
-			u.RawQuery = q.Encode()
-			u.Fragment = s.genRemark(inbound, email, epRemark)
-			links = append(links, u.String())
+		}
+		u.RawQuery = q.Encode()
+		u.Fragment = s.genRemark(inbound, email, epRemark)
+		return u.String()
+	}
+
+	// Fan out one link per External Proxy entry if any.
+	externalProxies := extractExternalProxies(stream, settings, s.resolveInboundAddress(inbound), inbound.Port)
+	if len(externalProxies) > 0 {
+		links := make([]string, 0, len(externalProxies))
+		for _, ep := range externalProxies {
+			links = append(links, buildHyURI(ep.Dest, ep.Port, ep.Remark))
 		}
 		return strings.Join(links, "\n")
 	}
 
-	// No external proxy configured — fall back to the request host.
-	link := fmt.Sprintf("%s://%s@%s:%d", protocol, auth, s.address, inbound.Port)
-	url, _ := url.Parse(link)
-	q := url.Query()
-	for k, v := range params {
-		q.Add(k, v)
-	}
-	url.RawQuery = q.Encode()
-	url.Fragment = s.genRemark(inbound, email, "")
-	return url.String()
+	// No external proxy configured — fall back to resolved address.
+	return buildHyURI(s.resolveInboundAddress(inbound), inbound.Port, "")
 }
 
 // genAnytlsLink emits `anytls://<password>@host:port?<stream params>#<remark>`, the URI
@@ -977,7 +1061,9 @@ func (s *SubService) genAnytlsLink(inbound *model.Inbound, email string) string 
 		params["security"] = "none"
 	}
 
-	externalProxies, _ := stream["externalProxy"].([]any)
+	var settings map[string]any
+	_ = json.Unmarshal([]byte(inbound.Settings), &settings)
+	externalProxies := extractExternalProxies(stream, settings, address, inbound.Port)
 	if len(externalProxies) > 0 {
 		return s.buildExternalProxyURLLinks(
 			externalProxies,
@@ -986,8 +1072,8 @@ func (s *SubService) genAnytlsLink(inbound *model.Inbound, email string) string 
 			func(dest string, port int) string {
 				return fmt.Sprintf("anytls://%s@%s", userinfo, net.JoinHostPort(dest, strconv.Itoa(port)))
 			},
-			func(ep map[string]any) string {
-				return s.genRemark(inbound, email, ep["remark"].(string))
+			func(ep externalProxySpec) string {
+				return s.genRemark(inbound, email, ep.Remark)
 			},
 		)
 	}
@@ -1029,7 +1115,7 @@ func (s *SubService) genTuicLink(inbound *model.Inbound, email string) string {
 	applyFixedTLSParams(stream, params)
 
 	userinfo := url.UserPassword(client.ID, client.Password).String()
-	return s.buildEndpointLinks(inbound, email, stream, params, func(dest string, port int) string {
+	return s.buildEndpointLinks(inbound, email, stream, settings, params, func(dest string, port int) string {
 		return fmt.Sprintf("tuic://%s@%s", userinfo, net.JoinHostPort(dest, strconv.Itoa(port)))
 	})
 }
@@ -1074,7 +1160,7 @@ func (s *SubService) genNaiveLink(inbound *model.Inbound, email string) string {
 		username = email
 	}
 	userinfo := url.UserPassword(username, clients[clientIndex].Password).String()
-	return s.buildEndpointLinks(inbound, email, stream, params, func(dest string, port int) string {
+	return s.buildEndpointLinks(inbound, email, stream, settings, params, func(dest string, port int) string {
 		return fmt.Sprintf("%s://%s@%s", scheme, userinfo, net.JoinHostPort(dest, strconv.Itoa(port)))
 	})
 }
@@ -1117,14 +1203,119 @@ func applyFixedTLSParams(stream map[string]any, params map[string]string) {
 // from the entry's forceTls and strips alpn/sni/fp when an entry says "none". TUIC and
 // naive have no plaintext mode to force, so honouring forceTls there would drop the
 // mandatory alpn=h3 and hand out a link that cannot connect.
+type externalProxySpec struct {
+	Dest     string
+	Port     int
+	ForceTls string
+	Remark   string
+}
+
+func parseExternalProxyPort(v any) int {
+	switch p := v.(type) {
+	case float64:
+		return int(p)
+	case float32:
+		return int(p)
+	case int:
+		return p
+	case int64:
+		return int(p)
+	case int32:
+		return int(p)
+	case uint:
+		return int(p)
+	case uint16:
+		return int(p)
+	case uint64:
+		return int(p)
+	case json.Number:
+		if n, err := p.Int64(); err == nil {
+			return int(n)
+		}
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(p)); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+func extractExternalProxyMaps(source map[string]any) []map[string]any {
+	if source == nil {
+		return nil
+	}
+	raw, ok := source["externalProxy"]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch typed := raw.(type) {
+	case []any:
+		out := make([]map[string]any, 0, len(typed))
+		for _, item := range typed {
+			if m, ok := item.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	case []map[string]any:
+		return typed
+	}
+	return nil
+}
+
+// extractExternalProxies parses externalProxy entries safely across streamSettings
+// and settings without unguarded type assertions, falling back to defaultHost/Port
+// and "same" when individual fields are omitted or non-float64 JSON numbers.
+func extractExternalProxies(stream, settings map[string]any, defaultHost string, defaultPort int) []externalProxySpec {
+	rawList := extractExternalProxyMaps(stream)
+	if len(rawList) == 0 {
+		rawList = extractExternalProxyMaps(settings)
+	}
+	if len(rawList) == 0 {
+		return nil
+	}
+	out := make([]externalProxySpec, 0, len(rawList))
+	for _, ep := range rawList {
+		dest, _ := ep["dest"].(string)
+		dest = strings.TrimSpace(dest)
+		if dest == "" {
+			dest = defaultHost
+		}
+		if dest == "" {
+			continue
+		}
+		port := parseExternalProxyPort(ep["port"])
+		if port <= 0 || port > 65535 {
+			port = defaultPort
+		}
+		if port <= 0 {
+			continue
+		}
+		forceTls, _ := ep["forceTls"].(string)
+		forceTls = strings.TrimSpace(forceTls)
+		if forceTls == "" {
+			forceTls = "same"
+		}
+		remark, _ := ep["remark"].(string)
+		out = append(out, externalProxySpec{
+			Dest:     dest,
+			Port:     port,
+			ForceTls: forceTls,
+			Remark:   remark,
+		})
+	}
+	return out
+}
+
 func (s *SubService) buildEndpointLinks(
 	inbound *model.Inbound,
 	email string,
 	stream map[string]any,
+	settings map[string]any,
 	params map[string]string,
 	makeLink func(dest string, port int) string,
 ) string {
-	externalProxies, _ := stream["externalProxy"].([]any)
+	externalProxies := extractExternalProxies(stream, settings, s.resolveInboundAddress(inbound), inbound.Port)
 	if len(externalProxies) == 0 {
 		return buildLinkWithParams(
 			makeLink(s.resolveInboundAddress(inbound), inbound.Port),
@@ -1134,21 +1325,11 @@ func (s *SubService) buildEndpointLinks(
 	}
 
 	links := make([]string, 0, len(externalProxies))
-	for _, externalProxy := range externalProxies {
-		ep, ok := externalProxy.(map[string]any)
-		if !ok {
-			continue
-		}
-		dest, _ := ep["dest"].(string)
-		port, okPort := ep["port"].(float64)
-		if dest == "" || !okPort {
-			continue
-		}
-		remark, _ := ep["remark"].(string)
+	for _, ep := range externalProxies {
 		links = append(links, buildLinkWithParams(
-			makeLink(dest, int(port)),
+			makeLink(ep.Dest, ep.Port),
 			params,
-			s.genRemark(inbound, email, remark),
+			s.genRemark(inbound, email, ep.Remark),
 		))
 	}
 	return strings.Join(links, "\n")
@@ -1389,17 +1570,16 @@ func cloneVmessShareObj(baseObj map[string]any, newSecurity string) map[string]a
 	return newObj
 }
 
-func (s *SubService) buildVmessExternalProxyLinks(externalProxies []any, baseObj map[string]any, inbound *model.Inbound, email string) string {
+func (s *SubService) buildVmessExternalProxyLinks(externalProxies []externalProxySpec, baseObj map[string]any, inbound *model.Inbound, email string) string {
 	var links strings.Builder
-	for index, externalProxy := range externalProxies {
-		ep, _ := externalProxy.(map[string]any)
-		newSecurity, _ := ep["forceTls"].(string)
+	for index, ep := range externalProxies {
+		newSecurity := ep.ForceTls
 		newObj := cloneVmessShareObj(baseObj, newSecurity)
-		newObj["ps"] = s.genRemark(inbound, email, ep["remark"].(string))
-		newObj["add"] = ep["dest"].(string)
-		newObj["port"] = int(ep["port"].(float64))
+		newObj["ps"] = s.genRemark(inbound, email, ep.Remark)
+		newObj["add"] = ep.Dest
+		newObj["port"] = ep.Port
 
-		if newSecurity != "same" {
+		if newSecurity != "" && newSecurity != "same" {
 			newObj["tls"] = newSecurity
 		}
 		if index > 0 {
@@ -1439,28 +1619,24 @@ func buildLinkWithParamsAndSecurity(link string, params map[string]string, fragm
 }
 
 func (s *SubService) buildExternalProxyURLLinks(
-	externalProxies []any,
+	externalProxies []externalProxySpec,
 	params map[string]string,
 	baseSecurity string,
 	makeLink func(dest string, port int) string,
-	makeRemark func(ep map[string]any) string,
+	makeRemark func(ep externalProxySpec) string,
 ) string {
 	links := make([]string, 0, len(externalProxies))
-	for _, externalProxy := range externalProxies {
-		ep, _ := externalProxy.(map[string]any)
-		newSecurity, _ := ep["forceTls"].(string)
-		dest, _ := ep["dest"].(string)
-		port := int(ep["port"].(float64))
-
+	for _, ep := range externalProxies {
+		newSecurity := ep.ForceTls
 		securityToApply := baseSecurity
-		if newSecurity != "same" {
+		if newSecurity != "" && newSecurity != "same" {
 			securityToApply = newSecurity
 		}
 
 		links = append(
 			links,
 			buildLinkWithParamsAndSecurity(
-				makeLink(dest, port),
+				makeLink(ep.Dest, ep.Port),
 				params,
 				makeRemark(ep),
 				securityToApply,

@@ -182,6 +182,15 @@
           </a-col>
         </a-row>
 
+        <div class="bo-cf-field" v-if="clientsBulkModal.canEnableTlsFlow">
+          <label>Flow</label>
+          <a-select v-model="clientsBulkModal.flow" :style="{ width: '100%' }"
+            :dropdown-class-name="themeSwitcher.currentTheme">
+            <a-select-option value="">{{ i18n "none" }}</a-select-option>
+            <a-select-option v-for="key in TLS_FLOW_CONTROL" :key="key" :value="key">[[ key ]]</a-select-option>
+          </a-select>
+        </div>
+
         <div class="bo-cf-switch" v-if="!clientsBulkModal.resellerForcedDays">
           <div>
             <div class="bo-cf-t">{{ i18n "pages.client.delayedStart" }}</div>
@@ -190,7 +199,7 @@
           <a-switch :checked="clientsBulkModal.delayedStart"
             @change="v => clientsBulkModal.setDelayedStart(v)"></a-switch>
         </div>
-        <div class="bo-cf-switch">
+        <div class="bo-cf-switch" v-if="!clientsBulkModal.isReseller">
           <div>
             <div class="bo-cf-t">{{ i18n "pages.clients.renewEvery" }}</div>
             <div class="bo-cf-d">{{ i18n "pages.clients.renewDesc" }}</div>
@@ -305,6 +314,7 @@
     emailPostfix: '',
     comment: '',
     tgId: '',
+    flow: '',
     totalGb: 0,
     days: 0,
     // A negative expiryTime means "N days from first use" and the clock has not
@@ -366,11 +376,18 @@
     get firstIndex() { return this.usesNum ? (Number(this.firstNum) || 0) : 0; },
 
     // --- the summary rail ---------------------------------------------------
+    get canEnableTlsFlow() {
+      return this.selected.some(id => {
+        const ib = this.assignable.find(x => x.inboundId === id);
+        return ib && ib.protocol === 'vless' && !!ib.canEnableTlsFlow;
+      });
+    },
     get quotaText() {
       if (!this.totalGb) return '{{ i18n "pages.clients.summaryUnlimited" }}';
       return SizeFormatter.sizeFormat(this.totalGb * 1073741824);
     },
     get expiresText() {
+      if (this.resellerForcedDays) return this.resellerForcedDaysText;
       if (!this.days) return '{{ i18n "pages.clients.summaryNever" }}';
       return this.days + ' {{ i18n "pages.clients.summaryDays" }}';
     },
@@ -421,8 +438,11 @@
     // --- the deadline -------------------------------------------------------
     // A reseller on a days-per-GB plan does not pick a duration: the backend
     // derives it from the traffic and overwrites anything posted.
+    get isReseller() {
+      return !!(typeof RESELLER !== 'undefined' && RESELLER && RESELLER.isReseller);
+    },
     get resellerForcedDays() {
-      return !!(RESELLER.isReseller && RESELLER.daysPerGb > 0);
+      return !!(this.isReseller && RESELLER.daysPerGb > 0);
     },
     get resellerForcedDaysText() {
       const days = NumberFormatter.toFixed((this.totalGb || 0) * RESELLER.daysPerGb, 1);
@@ -525,7 +545,7 @@
         limitIp: 0,
         comment: this.comment || '',
         subId: acc.subId,
-        reset: Number(this.reset) || 0,
+        reset: this.isReseller ? 0 : (Number(this.reset) || 0),
         tgId: Number(this.tgId) || 0,
         totalGB: (this.totalGb || 0) * 1073741824,
         expiryTime,
@@ -540,12 +560,13 @@
         // l2tp and the email on wg-c.
         password: acc.password,
         uuid: acc.id,
+        flow: this.flow || '',
       };
       switch (protocol) {
         case 'vmess':
           return Object.assign(base, { id: acc.id, security: 'auto' });
         case 'vless':
-          return Object.assign(base, { id: acc.id });
+          return Object.assign(base, { id: acc.id, flow: this.flow || '' });
         case 'tuic':
           return Object.assign(base, { id: acc.id, password: acc.password });
         case 'trojan': case 'shadowsocks': case 'anytls':
@@ -619,6 +640,7 @@
       this.emailPostfix = '';
       this.comment = '';
       this.tgId = '';
+      this.flow = '';
       this.totalGb = 0;
       this.days = 0;
       this.delayedStart = false;

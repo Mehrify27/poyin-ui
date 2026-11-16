@@ -201,6 +201,14 @@
           <a-input-number v-model="clientMembershipModal.client.reset" :min="0"
             :style="{ width: '96px' }"></a-input-number>
         </div>
+        <div class="bo-cf-field" v-if="clientMembershipModal.canEnableTlsFlow">
+          <label>Flow</label>
+          <a-select v-model="clientMembershipModal.client.flow" :style="{ width: '100%' }"
+            :dropdown-class-name="themeSwitcher.currentTheme">
+            <a-select-option value="">{{ i18n "none" }}</a-select-option>
+            <a-select-option v-for="key in TLS_FLOW_CONTROL" :key="key" :value="key">[[ key ]]</a-select-option>
+          </a-select>
+        </div>
         <div class="bo-cf-switch">
           <div>
             <div class="bo-cf-t">{{ i18n "pages.inbounds.enable" }}</div>
@@ -220,7 +228,7 @@
             {{ i18n "pages.clients.selectAll" }}
           </a-checkbox>
         </div>
-        <a-checkbox-group v-model="clientMembershipModal.selected" :style="{ width: '100%' }">
+        <a-checkbox-group v-model="clientMembershipModal.selected" @change="vals => clientMembershipModal.onSelectionChange(vals)" :style="{ width: '100%' }">
           <div class="bo-cf-ib" v-for="ib in clientMembershipModal.assignable" :key="ib.inboundId"
             :class="{ on: clientMembershipModal.selected.includes(ib.inboundId) }">
             <a-checkbox :value="ib.inboundId">
@@ -297,6 +305,14 @@
               <span>{{ i18n "pages.xray.mtproto.adtagClientWarn" }}</span>
             </div>
           </div>
+        </div>
+        <div class="bo-cf-field" v-if="clientMembershipModal.canEnableTlsFlow">
+          <label>Flow</label>
+          <a-select v-model="clientMembershipModal.client.flow" :style="{ width: '100%' }"
+            :dropdown-class-name="themeSwitcher.currentTheme">
+            <a-select-option value="">{{ i18n "none" }}</a-select-option>
+            <a-select-option v-for="key in TLS_FLOW_CONTROL" :key="key" :value="key">[[ key ]]</a-select-option>
+          </a-select>
         </div>
         <a-alert v-if="clientMembershipModal.strictSsBytes" type="info" show-icon
           :style="{ marginTop: '4px' }"
@@ -468,6 +484,26 @@
     },
     toggleAll(e) {
       this.selected = e.target.checked ? this.assignable.map(i => i.inboundId) : [];
+      this.onSelectionChange(this.selected);
+    },
+
+    onSelectionChange(vals) {
+      if (this.client && !this.client.flow) {
+        for (const id of (vals || [])) {
+          const ib = this.assignable.find(x => x.inboundId === id);
+          if (ib && ib.protocol === 'vless' && ib.canEnableTlsFlow && ib.flow) {
+            this.client.flow = ib.flow;
+            break;
+          }
+        }
+      }
+    },
+
+    get canEnableTlsFlow() {
+      return this.selected.some(id => {
+        const ib = this.assignable.find(x => x.inboundId === id);
+        return ib && ib.protocol === 'vless' && !!ib.canEnableTlsFlow;
+      });
     },
 
     // Every key this form ever binds, present from the moment `client` is assigned.
@@ -498,7 +534,7 @@
         email: '', enable: true, limitIp: 0, comment: '', subId: '', reset: 0,
         tgId: 0, adtagEnable: false, adtag: '',
         id: '', password: '', vpnUsername: '', auth: '', secret: '',
-        naiveUsername: '', security: '',
+        naiveUsername: '', security: '', flow: '',
       };
     },
 
@@ -855,6 +891,7 @@
         if (e.secret) c.secret = c.secret || e.secret;
         if (e.username) c.naiveUsername = c.naiveUsername || e.username;
         if (e.security) c.security = c.security || e.security;
+        if (m.protocol === 'vless' && !c.flow) c.flow = m.flow || e.flow || '';
         // Only an mtproto entry carries a tag. First-wins like everything above, so
         // an account on two mtproto inbounds shows the first tag it holds; the pair
         // is read together because an enabled switch over a blank box means nothing.
@@ -1031,6 +1068,7 @@
         subId: c.subId || '',
         reset: Number(c.reset) || 0,
         tgId: Number(c.tgId) || 0,
+        flow: c.flow || '',
         totalGB: (this.totalGb || 0) * 1073741824,
         // A NEGATIVE expiry is not a date. It is "this many days from first use",
         // and the server starts the clock on the first connection.
@@ -1057,7 +1095,7 @@
         case 'vmess':
           return Object.assign(base, { id: c.id, security: c.security || 'auto' });
         case 'vless':
-          return Object.assign(base, { id: c.id });
+          return Object.assign(base, { id: c.id, flow: c.flow || '' });
         case 'tuic':
           return Object.assign(base, { id: c.id, password: c.password });
         case 'trojan': case 'shadowsocks': case 'anytls':

@@ -70,8 +70,27 @@ type ClientTraffic struct {
 	// inbound - attributing them to one would be a fiction.
 	CoreCounted bool `json:"-" gorm:"-"`
 
+	// InboundTraffics carries the full per-inbound traffic breakdown across every
+	// inbound serving this account so API consumers receive both the aggregate
+	// account consumption (Up/Down/AllTime) and each inbound's individual stats.
+	InboundTraffics []InboundTrafficBreakdown `json:"inboundTraffics,omitempty" gorm:"-"`
+
 	ExpiryTime int64 `json:"expiryTime" form:"expiryTime"`
 	Total      int64 `json:"total" form:"total"`
 	Reset      int   `json:"reset" form:"reset" gorm:"default:0"`
 	LastOnline int64 `json:"lastOnline" form:"lastOnline" gorm:"default:0"`
+}
+
+// InboundTrafficBreakdown reports one inbound's share of a client's traffic.
+type InboundTrafficBreakdown struct {
+	InboundId int    `json:"inboundId"`
+	Protocol  string `json:"protocol"`
+	Remark    string `json:"remark"`
+	Port      int    `json:"port"`
+	Enable    bool   `json:"enable"`
+	Up        int64  `json:"up"`
+	Down      int64  `json:"down"`
+	Total     int64  `json:"total"`
+	AllTime   int64  `json:"allTime"`
+	Shared    bool   `json:"shared,omitempty"`
 }

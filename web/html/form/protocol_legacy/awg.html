@@ -199,17 +199,33 @@
             </template>
         </a-input>
     </a-input-group>
-    <!-- AmneziaWG DPI-obfuscation parameters (AWG 1.0). Jc/Jmin/Jmax/S1/S2 are the junk
-         and header-size knobs (numbers); H1-H4 are the magic-header values, minted by
-         the backend and shown read-only. These must match the client, which the
-         generated client config / QR handles automatically. -->
+    <!-- AmneziaWG DPI-obfuscation parameters (AWG 1.0 / 1.5 / 2.0). Backend picks
+         kernel module vs userspace amneziawg-go engine; Jc/Jmin/Jmax/S1..S4 control
+         junk and packet padding; H1-H4 accept scalar values (auto-minted when blank)
+         or AWG 2.0 non-overlapping "min-max" ranges; I1-I5 set CPS handshake packets. -->
     <a-collapse :style="{ margin: '10px 0' }">
         <a-collapse-panel header="Obfuscation (AmneziaWG)">
             <p :style="{ color: '#888', marginBottom: '12px' }">
-                DPI-obfuscation parameters. These must match on the client, which the
-                generated config and QR embed automatically, so you rarely need to touch
-                them. The magic headers (H1-H4) are minted by the server.
+                DPI-obfuscation parameters (AWG 1.0, 1.5 &amp; 2.0). Generated client configs
+                and QR codes embed these automatically. Leave H1-H4 blank to auto-mint, or enter
+                non-overlapping integers or <code>min-max</code> ranges; set S3/S4 or I1-I5 for AWG 1.5/2.0.
             </p>
+            <a-row type="flex" :gutter="8">
+                <a-col :xs="24" :md="12" :style="{ marginBottom: '8px' }">
+                    <a-tooltip title="Auto uses the kernel module when loaded & compatible, otherwise amneziawg-go userspace">
+                        <div :style="{ marginBottom: '4px' }">Backend</div>
+                    </a-tooltip>
+                    <a-select
+                        v-model="inbound.settings.backend"
+                        :dropdown-class-name="themeSwitcher.currentTheme"
+                        :style="{ width: '100%' }"
+                    >
+                        <a-select-option value="auto">Auto (Kernel / amneziawg-go)</a-select-option>
+                        <a-select-option value="kernel">Kernel Module</a-select-option>
+                        <a-select-option value="userspace">Userspace (amneziawg-go AWG 2.0)</a-select-option>
+                    </a-select>
+                </a-col>
+            </a-row>
             <a-row type="flex" :gutter="8">
                 <a-col :xs="12" :md="8" :style="{ marginBottom: '8px' }">
                     <a-tooltip title="Junk packet count sent before the handshake">
@@ -217,7 +233,7 @@
                     </a-tooltip>
                     <a-input-number
                         v-model.number="inbound.settings.jc"
-                        :min="1" :max="128" :step="1" :precision="0"
+                        :min="0" :max="128" :step="1" :precision="0"
                         :style="{ width: '100%' }"
                     ></a-input-number>
                 </a-col>
@@ -261,31 +277,83 @@
                         :style="{ width: '100%' }"
                     ></a-input-number>
                 </a-col>
+                <a-col :xs="12" :md="8" :style="{ marginBottom: '8px' }">
+                    <a-tooltip title="AWG 2.0 junk prepended to the cookie reply packet (0 = off)">
+                        <div :style="{ marginBottom: '4px' }">S3 (AWG 2.0)</div>
+                    </a-tooltip>
+                    <a-input-number
+                        v-model.number="inbound.settings.s3"
+                        :min="0" :max="1280" :step="1" :precision="0"
+                        :style="{ width: '100%' }"
+                    ></a-input-number>
+                </a-col>
+                <a-col :xs="12" :md="8" :style="{ marginBottom: '8px' }">
+                    <a-tooltip title="AWG 2.0 junk prepended to transport data packets (0 = off)">
+                        <div :style="{ marginBottom: '4px' }">S4 (AWG 2.0)</div>
+                    </a-tooltip>
+                    <a-input-number
+                        v-model.number="inbound.settings.s4"
+                        :min="0" :max="1280" :step="1" :precision="0"
+                        :style="{ width: '100%' }"
+                    ></a-input-number>
+                </a-col>
             </a-row>
             <a-row type="flex" :gutter="8">
                 <a-col :xs="12" :md="8" :style="{ marginBottom: '8px' }">
-                    <a-tooltip title="Magic header for the init packet (server-minted)">
+                    <a-tooltip title="Magic header for init packet (integer or AWG 2.0 min-max range; blank = auto-mint)">
                         <div :style="{ marginBottom: '4px' }">H1</div>
                     </a-tooltip>
-                    <a-input :value="inbound.settings.h1" read-only></a-input>
+                    <a-input v-model.trim="inbound.settings.h1" placeholder="Auto or min-max"></a-input>
                 </a-col>
                 <a-col :xs="12" :md="8" :style="{ marginBottom: '8px' }">
-                    <a-tooltip title="Magic header for the response packet (server-minted)">
+                    <a-tooltip title="Magic header for response packet (integer or AWG 2.0 min-max range; blank = auto-mint)">
                         <div :style="{ marginBottom: '4px' }">H2</div>
                     </a-tooltip>
-                    <a-input :value="inbound.settings.h2" read-only></a-input>
+                    <a-input v-model.trim="inbound.settings.h2" placeholder="Auto or min-max"></a-input>
                 </a-col>
                 <a-col :xs="12" :md="8" :style="{ marginBottom: '8px' }">
-                    <a-tooltip title="Magic header for the cookie packet (server-minted)">
+                    <a-tooltip title="Magic header for cookie packet (integer or AWG 2.0 min-max range; blank = auto-mint)">
                         <div :style="{ marginBottom: '4px' }">H3</div>
                     </a-tooltip>
-                    <a-input :value="inbound.settings.h3" read-only></a-input>
+                    <a-input v-model.trim="inbound.settings.h3" placeholder="Auto or min-max"></a-input>
                 </a-col>
                 <a-col :xs="12" :md="8" :style="{ marginBottom: '8px' }">
-                    <a-tooltip title="Magic header for the transport packet (server-minted)">
+                    <a-tooltip title="Magic header for transport packet (integer or AWG 2.0 min-max range; blank = auto-mint)">
                         <div :style="{ marginBottom: '4px' }">H4</div>
                     </a-tooltip>
-                    <a-input :value="inbound.settings.h4" read-only></a-input>
+                    <a-input v-model.trim="inbound.settings.h4" placeholder="Auto or min-max"></a-input>
+                </a-col>
+            </a-row>
+            <a-row type="flex" :gutter="8">
+                <a-col :xs="24" :md="12" :style="{ marginBottom: '8px' }">
+                    <a-tooltip title="AWG 1.5/2.0 Custom Protocol Signature packet I1 using <b 0x...>, <c>, <t>, <r N>, <rc N>, <rd N>">
+                        <div :style="{ marginBottom: '4px' }">I1 (CPS)</div>
+                    </a-tooltip>
+                    <a-input v-model.trim="inbound.settings.i1" placeholder="e.g. <b 0x16030100><c><t><r 16>"></a-input>
+                </a-col>
+                <a-col :xs="24" :md="12" :style="{ marginBottom: '8px' }">
+                    <a-tooltip title="AWG 1.5/2.0 Custom Protocol Signature packet I2">
+                        <div :style="{ marginBottom: '4px' }">I2 (CPS)</div>
+                    </a-tooltip>
+                    <a-input v-model.trim="inbound.settings.i2" placeholder="<b 0x...>"></a-input>
+                </a-col>
+                <a-col :xs="24" :md="12" :style="{ marginBottom: '8px' }">
+                    <a-tooltip title="AWG 1.5/2.0 Custom Protocol Signature packet I3">
+                        <div :style="{ marginBottom: '4px' }">I3 (CPS)</div>
+                    </a-tooltip>
+                    <a-input v-model.trim="inbound.settings.i3" placeholder="<b 0x...>"></a-input>
+                </a-col>
+                <a-col :xs="24" :md="12" :style="{ marginBottom: '8px' }">
+                    <a-tooltip title="AWG 1.5/2.0 Custom Protocol Signature packet I4">
+                        <div :style="{ marginBottom: '4px' }">I4 (CPS)</div>
+                    </a-tooltip>
+                    <a-input v-model.trim="inbound.settings.i4" placeholder="<b 0x...>"></a-input>
+                </a-col>
+                <a-col :xs="24" :md="12" :style="{ marginBottom: '8px' }">
+                    <a-tooltip title="AWG 1.5/2.0 Custom Protocol Signature packet I5">
+                        <div :style="{ marginBottom: '4px' }">I5 (CPS)</div>
+                    </a-tooltip>
+                    <a-input v-model.trim="inbound.settings.i5" placeholder="<b 0x...>"></a-input>
                 </a-col>
             </a-row>
         </a-collapse-panel>

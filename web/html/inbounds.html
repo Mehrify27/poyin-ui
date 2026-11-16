@@ -935,7 +935,7 @@
           to_inbound = dbInbound.toInbound()
           this.inbounds.push(to_inbound);
           this.dbInbounds.push(dbInbound);
-          if ([Protocols.VMESS, Protocols.VLESS, Protocols.TROJAN, Protocols.SHADOWSOCKS, Protocols.ANYTLS, Protocols.TUIC, Protocols.NAIVE, Protocols.L2TP, Protocols.PPTP, Protocols.OPENVPN, Protocols.OPENCONNECT, Protocols.SSTP, Protocols.IKEV2, Protocols.WGC, Protocols.AWG, Protocols.MTPROTO, Protocols.SSH].includes(inbound.protocol)) {
+          if ([Protocols.VMESS, Protocols.VLESS, Protocols.TROJAN, Protocols.SHADOWSOCKS, Protocols.HYSTERIA, Protocols.HYSTERIA2, Protocols.ANYTLS, Protocols.TUIC, Protocols.NAIVE, Protocols.L2TP, Protocols.PPTP, Protocols.OPENVPN, Protocols.OPENCONNECT, Protocols.SSTP, Protocols.IKEV2, Protocols.WGC, Protocols.AWG, Protocols.MTPROTO, Protocols.SSH].includes(inbound.protocol)) {
             if (dbInbound.isSS && (!to_inbound.isSSMultiUser)) {
               continue;
             }
@@ -1474,7 +1474,7 @@
         if (protocol === Protocols.WGC) return 'wgc';
         const hasCore = [Protocols.L2TP, Protocols.PPTP, Protocols.OPENVPN,
           Protocols.OPENCONNECT, Protocols.SSTP, Protocols.IKEV2, Protocols.AWG,
-          Protocols.GRE, Protocols.MTPROTO].includes(protocol);
+          Protocols.GRE, Protocols.MTPROTO, Protocols.HYSTERIA2].includes(protocol);
         return hasCore ? protocol : '';
       },
       async submit(url, data, modal) {

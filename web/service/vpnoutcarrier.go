@@ -1013,9 +1013,9 @@ func vpnOutSshViaFacts(sshList []SshOutboundConfig, carriers []vpnOutCarrier) []
 // made is a warning and a blackholed rider, not a panel that refuses to start.
 func InitVpnOutCarriers() {
 	tunnels := (&VpnOutboundService{}).List()
-	sshList := (&SshOutboundService{}).List()
-	extra := vpnOutApplyCarriers(tunnels, sshList)
-	if len(extra) == 0 && len(sshList) == 0 {
+	proxyList := loadedProxyTunnels()
+	extra := vpnOutApplyCarriers(tunnels, proxyList)
+	if len(extra) == 0 && len(proxyList) == 0 {
 		return
 	}
 	vpnOutApplyVia(tunnels, extra)
@@ -1035,8 +1035,8 @@ func InitVpnOutCarriers() {
 // this file.
 func vpnOutReassertCarriers() {
 	tunnels := (&VpnOutboundService{}).List()
-	sshList := (&SshOutboundService{}).List()
-	carriers, _ := vpnOutCarrierPlan(tunnels, sshList, vpnOutTemplateOutbounds())
+	proxyList := loadedProxyTunnels()
+	carriers, _ := vpnOutCarrierPlan(tunnels, proxyList, vpnOutTemplateOutbounds())
 	for _, c := range carriers {
 		if !c.Bridged() {
 			continue
@@ -1086,4 +1086,29 @@ func vpnOutCarrierRefusal(cfg VpnOutboundConfig, c vpnOutCarrier) string {
 		return fmt.Sprintf("%s cannot be carried by the %q outbound: %s", cfg.Tag, c.Tag, why)
 	}
 	return ""
+}
+
+func combinedProxyTunnels(sshList []SshOutboundConfig, hy2List []Hysteria2OutboundConfig) []SshOutboundConfig {
+	out := make([]SshOutboundConfig, 0, len(sshList)+len(hy2List))
+	out = append(out, sshList...)
+	for _, h := range hy2List {
+		out = append(out, SshOutboundConfig{
+			Tag:     h.Tag,
+			Address: h.Address,
+			Via:     h.Via,
+		})
+	}
+	return out
+}
+
+func loadedProxyTunnels() []SshOutboundConfig {
+	return combinedProxyTunnels((&SshOutboundService{}).List(), (&Hysteria2OutboundService{}).List())
+}
+
+func vpnOutCarrierPlanFull(tunnels []VpnOutboundConfig, sshList []SshOutboundConfig, hy2List []Hysteria2OutboundConfig, obs []map[string]any) ([]vpnOutCarrier, []string) {
+	return vpnOutCarrierPlan(tunnels, combinedProxyTunnels(sshList, hy2List), obs)
+}
+
+func reconcileAllVpnCarriers() {
+	InitVpnOutCarriers()
 }

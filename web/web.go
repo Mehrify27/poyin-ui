@@ -116,6 +116,8 @@ type Server struct {
 	awgService         service.AwgService
 	greService         service.GreService
 	mtprotoService     service.MtprotoService
+	hysteria2Service   service.Hysteria2Service
+	hy2OutboundService service.Hysteria2OutboundService
 	sshService         service.SshService
 	sshOutboundService service.SshOutboundService
 	vpnOutboundService service.VpnOutboundService
@@ -387,6 +389,7 @@ func (s *Server) startTask() {
 	s.awgService.InitAwg()
 	s.greService.InitGre()
 	s.mtprotoService.InitMtproto()
+	s.hysteria2Service.InitHysteria2()
 	s.sshService.InitSsh()
 	// BEFORE anything dials, which is why it is here and not beside InitVpnOutbound
 	// below. A carrier is a device plus a routing table, and whatever rides on it sends
@@ -396,6 +399,7 @@ func (s *Server) startTask() {
 	// packet it was meant to carry had already left in the clear.
 	service.InitVpnOutCarriers()
 	s.sshOutboundService.InitSshOutbound()
+	s.hy2OutboundService.InitHy2Outbound()
 	// Before RestartXray below, like every Init above it: the synthesized freedom
 	// outbound binds to the netdev the client tunnel brings up, so the tunnel has to
 	// exist by the time the core reads the config.
@@ -670,6 +674,7 @@ func (s *Server) Stop() error {
 	// SSH is an in-binary listener, not a supervised child, so StopAll does not cover it.
 	s.sshService.StopServices()
 	s.sshOutboundService.StopAll()
+	s.hy2OutboundService.StopAll()
 	// Client tunnels are kernel netdevs (and, for some protocols, their own client
 	// daemons), so they outlive the panel unless they are taken down explicitly.
 	s.vpnOutboundService.StopAll()

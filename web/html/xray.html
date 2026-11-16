@@ -318,6 +318,8 @@
       // form out of this, because the row it opens from is a socks outbound and
       // carries none of the tunnel (see sshOutboundModel).
       sshOutbounds: {},
+      hy2OutboundTags: [],
+      hy2Outbounds: {},
       // The client VPN tunnels the panel manages, keyed by tag. Same problem as
       // the SSH tags and one step worse: a VPN tunnel lands in the config as a
       // freedom outbound, which is also what a plain direct outbound is, so
@@ -478,6 +480,19 @@
           this.sshOutboundTags = [];
         }
       },
+      async loadHy2OutboundTags() {
+        try {
+          const resp = await axios.post('/panel/xray/hy2outbound/list');
+          const list = resp && resp.data ? resp.data.obj : null;
+          const byTag = {};
+          (Array.isArray(list) ? list : []).forEach(t => { if (t && t.tag) byTag[t.tag] = t; });
+          this.hy2Outbounds = byTag;
+          this.hy2OutboundTags = Object.keys(byTag);
+        } catch (e) {
+          this.hy2Outbounds = {};
+          this.hy2OutboundTags = [];
+        }
+      },
       // The client VPN tunnels, by tag. Raw axios and best effort for the same
       // reason as the SSH tags: this decides labels and an Edit path, so a failed
       // fetch should leave rows reading `freedom` rather than red-bar the page.
@@ -520,6 +535,9 @@
       sshOutboundOf(outbound) {
         return outbound && outbound.tag ? this.sshOutbounds[outbound.tag] : undefined;
       },
+      hy2OutboundOf(outbound) {
+        return outbound && outbound.tag ? this.hy2Outbounds[outbound.tag] : undefined;
+      },
       // Which tunnel protocols this host can actually raise, and why not when it
       // cannot. The driver registry is the only thing that knows: a kind whose
       // client binary was never bundled for this arch is a runtime fact, not a
@@ -560,6 +578,9 @@
       outboundProtocolLabel(outbound) {
         if (outbound && outbound.tag && this.sshOutboundTags.includes(outbound.tag)) {
           return Protocols.SSH;
+        }
+        if (outbound && outbound.tag && this.hy2OutboundTags.includes(outbound.tag)) {
+          return protocolLabel(Protocols.Hysteria2, 'Hysteria2');
         }
         const vpn = this.vpnOutboundOf(outbound);
         if (vpn) return protocolLabel(vpnProtocolFor(vpn.kind), vpn.kind);
@@ -784,6 +805,11 @@
           const peer = s.endpoint || s.server || '';
           return peer ? [peer] : null;
         }
+        const hy2 = this.hy2OutboundOf(o);
+        if (hy2) {
+          const hp = hy2.hopPorts ? ` (${hy2.hopPorts})` : '';
+          return hy2.address ? [`${hy2.address}:${hy2.port || 443}${hp}`] : null;
+        }
         switch (o.protocol) {
           case Protocols.VMess:
             serverObj = o.settings.vnext;
@@ -867,6 +893,16 @@
               // So the new row reads "ssh" rather than "socks" straight away.
               await this.loadSshOutboundTags();
             }
+            if (outModal.outbound.protocol === Protocols.Hysteria2) {
+              const port = await this.saveHy2Tunnel(outModal.outbound);
+              if (!port) {
+                outModal.loading(false);
+                return;
+              }
+              outModal.outbound.settings.socksPort = port;
+              outbound = outModal.outbound.toJson();
+              await this.loadHy2OutboundTags();
+            }
             if (outbound.tag.length > 0) {
               this.templateSettings.outbounds.push(outbound);
               this.outboundSettings = JSON.stringify(this.templateSettings.outbounds);
@@ -887,7 +923,7 @@
       // tags are taken. Two answers to that question would drift the first time a
       // tunnel kind is added.
       tunnelTags() {
-        return [...this.sshOutboundTags, ...Object.keys(this.vpnOutbounds)];
+        return [...this.sshOutboundTags, ...this.hy2OutboundTags, ...Object.keys(this.vpnOutbounds)];
       },
       // Every tag an outbound may not reuse: the ones in the template plus the
       // ones the SSH and VPN tunnels hold. `except` drops the row being edited so
@@ -933,6 +969,31 @@
           // Sent on every save including the blank one: the server treats it as the
           // whole answer, so leaving it out of a save that cleared the box would
           // keep the old carrier and the routing rules with it.
+          via: model.stream?.sockopt?.dialerProxy || '',
+        });
+        if (!msg || !msg.success || !msg.obj) return 0;
+        return Number(msg.obj.socksPort) || 0;
+      },
+      async saveHy2Tunnel(model) {
+        const s = model.settings;
+        const msg = await HttpUtil.post('/panel/xray/hy2outbound/save', {
+          tag: model.tag,
+          remark: s.remark || '',
+          address: s.address,
+          port: parseInt(s.port) || 443,
+          hopPorts: s.hopPorts || '',
+          hopInterval: s.hopInterval || '',
+          password: s.password || '',
+          obfsType: s.obfsType || '',
+          obfsPassword: s.obfsPassword || '',
+          upMbps: parseInt(s.upMbps) || 0,
+          downMbps: parseInt(s.downMbps) || 0,
+          serverName: s.serverName || '',
+          alpnStr: Array.isArray(s.alpn) ? s.alpn.join(',') : (s.alpn || 'h3'),
+          allowInsecure: !!s.allowInsecure,
+          pinSHA256: s.pinSHA256 || '',
+          certificatePEM: s.certificatePEM || '',
+          socksPort: parseInt(s.socksPort) || 0,
           via: model.stream?.sockopt?.dialerProxy || '',
         });
         if (!msg || !msg.success || !msg.obj) return 0;
@@ -988,9 +1049,11 @@
         // list instead, which is where the real settings live.
         const vpn = this.vpnOutboundOf(editing);
         const ssh = vpn ? undefined : this.sshOutboundOf(editing);
+        const hy2 = (vpn || ssh) ? undefined : this.hy2OutboundOf(editing);
         let model = editing;
         if (vpn) model = this.vpnOutboundModel(editing, vpn);
         else if (ssh) model = this.sshOutboundModel(editing, ssh);
+        else if (hy2) model = this.hy2OutboundModel(editing, hy2);
         outModal.show({
           title: '{{ i18n "pages.xray.outbound.editOutbound"}} ' + (index + 1),
           outbound: model,
@@ -1035,6 +1098,19 @@
                 await HttpUtil.post('/panel/xray/sshoutbound/delete', { tag: ssh.tag });
               }
               await this.loadSshOutboundTags();
+            }
+            if (outModal.outbound.protocol === Protocols.Hysteria2) {
+              const port = await this.saveHy2Tunnel(outModal.outbound);
+              if (!port) {
+                outModal.loading(false);
+                return;
+              }
+              outModal.outbound.settings.socksPort = port;
+              outbound = outModal.outbound.toJson();
+              if (hy2 && hy2.tag !== outModal.outbound.tag) {
+                await HttpUtil.post('/panel/xray/hy2outbound/delete', { tag: hy2.tag });
+              }
+              await this.loadHy2OutboundTags();
             }
             this.templateSettings.outbounds[index] = outbound;
             this.outboundSettings = JSON.stringify(this.templateSettings.outbounds);
@@ -1094,6 +1170,32 @@
         }
         return new Outbound(row.tag, Protocols.SSH, settings, stream, row.sendThrough);
       },
+      hy2OutboundModel(row, hy2) {
+        const settings = new Outbound.Hysteria2Settings(
+          hy2.address || '',
+          hy2.port || 443,
+          hy2.hopPorts || '',
+          hy2.hopInterval || '',
+          '',
+          hy2.obfsType || '',
+          '',
+          hy2.upMbps || 0,
+          hy2.downMbps || 0,
+          hy2.serverName || '',
+          hy2.alpn || ['h3'],
+          !!hy2.allowInsecure,
+          hy2.pinSHA256 || '',
+          hy2.certificatePEM || '',
+          hy2.socksPort || 0,
+          hy2.remark || '',
+        );
+        const stream = StreamSettings.fromJson(row.streamSettings);
+        if (hy2.via && !(stream.sockopt && stream.sockopt.dialerProxy)) {
+          if (!stream.sockopt) stream.sockoptSwitch = true;
+          stream.sockopt.dialerProxy = hy2.via;
+        }
+        return new Outbound(row.tag, Protocols.Hysteria2, settings, stream, row.sendThrough);
+      },
       // Removing the row has to remove the tunnel behind it. Splicing alone left
       // the tunnel in the `sshOutbounds`/`vpnOutbounds` setting still dialling
       // (holding a loopback port, or a netdev the kernel keeps up), invisible on
@@ -1106,6 +1208,10 @@
         if (gone && gone.tag && this.sshOutboundTags.includes(gone.tag)) {
           await HttpUtil.post('/panel/xray/sshoutbound/delete', { tag: gone.tag });
           await this.loadSshOutboundTags();
+        }
+        if (gone && gone.tag && this.hy2OutboundTags.includes(gone.tag)) {
+          await HttpUtil.post('/panel/xray/hy2outbound/delete', { tag: gone.tag });
+          await this.loadHy2OutboundTags();
         }
         if (gone && gone.tag && this.vpnOutbounds[gone.tag]) {
           await HttpUtil.post('/panel/xray/vpnoutbound/delete', { tag: gone.tag });
@@ -1619,7 +1725,7 @@
       }
       // In parallel: awaiting the tags AFTER the settings let the table paint once
       // with an empty tag list, so every ssh row flashed "socks" before correcting.
-      await Promise.all([this.getXraySetting(), this.loadSshOutboundTags(), this.loadVpnOutbounds(), this.loadVpnOutKinds()]);
+      await Promise.all([this.getXraySetting(), this.loadSshOutboundTags(), this.loadHy2OutboundTags(), this.loadVpnOutbounds(), this.loadVpnOutKinds()]);
       // Not awaited with the rest: this is one request per tunnel and only decides
       // a status dot, so the table should not wait on a driver that is slow to
       // answer (a dialling client, an unreachable peer).

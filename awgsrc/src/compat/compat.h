@@ -18,6 +18,8 @@
 #define ISRHEL8
 #elif RHEL_MAJOR == 9
 #define ISRHEL9
+#elif RHEL_MAJOR >= 10
+#define ISRHEL10
 #endif
 #endif
 #ifdef UTS_UBUNTU_RELEASE_ABI
@@ -1270,7 +1272,7 @@ static inline u32 get_random_u32_inclusive(u32 floor, u32 ceil)
 #define dev_get_tstats64 ip_tunnel_get_stats64
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0) || defined(ISRHEL9)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0) || defined(ISRHEL9) || defined(ISRHEL10)
 #define COMPAT_NETDEV_HAS_LLTX_PARAM
 #endif
 
@@ -1288,7 +1290,7 @@ static inline void dev_sw_netstats_rx_add(struct net_device *dev, unsigned int l
 }
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 91) && !defined(ISUBUNTU2004) && !defined(ISUBUNTU2204) && !defined(ISRHEL9)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 91) && !defined(ISUBUNTU2004) && !defined(ISUBUNTU2204) && !defined(ISRHEL9) && !defined(ISRHEL10)
 #include <linux/timer.h>
 static inline int timer_delete(struct timer_list *timer)
 {
@@ -1296,7 +1298,7 @@ static inline int timer_delete(struct timer_list *timer)
 }
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0) && !defined(timer_container_of) && !defined(ISRHEL9) && !defined(ISRHEL10)
 #define timer_container_of from_timer
 #endif
 
@@ -1309,7 +1311,7 @@ struct sockaddr_inet {
 };
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0) && !defined(ISRHEL9) && !defined(ISRHEL10)
 #include <linux/netdevice.h>
 static inline void netif_threaded_enable(struct net_device *dev) { }
 #endif
@@ -1338,13 +1340,13 @@ static inline struct net *rtnl_newlink_link_net(struct rtnl_newlink_params *p)
 }
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0) && !defined(ISRHEL9)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0) && !defined(ISRHEL9) && !defined(ISRHEL10)
 #include <linux/notifier.h>
 static inline int register_random_vmfork_notifier(struct notifier_block *nb) { return 0; }
 static inline int unregister_random_vmfork_notifier(struct notifier_block *nb) { return 0; }
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 19, 0) && !defined(ISRHEL9)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 19, 0) && !defined(ISRHEL9) && !defined(ISRHEL10)
 #include <linux/netdevice.h>
 static inline void netif_set_tso_max_size(struct net_device *dev, unsigned int size) {}
 #endif

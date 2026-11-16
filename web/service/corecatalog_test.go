@@ -29,7 +29,7 @@ func TestCatalogNamesAreUniqueAndTitled(t *testing.T) {
 	// gets forced to "not installed" by GetCoresStatus with nothing to install.
 	for _, name := range []string{
 		"xray", "l2tp", "pptp", "openvpn", "openconnect",
-		"sstp", "ikev2", "wgc", "awg", "mtproto", "ssh", "radius",
+		"sstp", "ikev2", "wgc", "awg", "mtproto", "hysteria2", "ssh", "radius",
 	} {
 		if coreSpecFor(name) == nil {
 			t.Errorf("core %q is shown by the panel but missing from the catalog", name)
@@ -164,6 +164,7 @@ func TestProtocolCoreNameMapping(t *testing.T) {
 		"l2tp":        "l2tp",
 		"ikev2":       "ikev2",
 		"mtproto":     "mtproto",
+		"hysteria2":   "hysteria2",
 		"openconnect": "openconnect",
 		"vless":       "", // Xray-native: no core to install
 		"vmess":       "",
@@ -417,6 +418,7 @@ func TestEveryVpnProtocolMapsToItsCore(t *testing.T) {
 		"awg":         "awg",
 		"gre":         "gre",
 		"mtproto":     "mtproto",
+		"hysteria2":   "hysteria2",
 	} {
 		if got := protocolCoreName(protocol); got != core {
 			t.Errorf("protocolCoreName(%q) = %q, want %q: a protocol with no core is never gated", protocol, got, core)
@@ -438,7 +440,7 @@ func TestEveryVpnProtocolMapsToItsCore(t *testing.T) {
 	// is the only thing the operator can ever do with it.
 	served := map[string]bool{}
 	for _, p := range []string{"l2tp", "pptp", "openvpn", "openconnect", "sstp",
-		"ikev2", "wg-c", "awg", "gre", "mtproto"} {
+		"ikev2", "wg-c", "awg", "gre", "mtproto", "hysteria2"} {
 		served[protocolCoreName(p)] = true
 	}
 	for _, core := range installableCores() {

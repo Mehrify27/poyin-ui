@@ -1,0 +1,1530 @@
+diff --git a/app/dispatcher/default.go b/app/dispatcher/default.go
+index b85869c8..6090b648 100644
+--- a/app/dispatcher/default.go
++++ b/app/dispatcher/default.go
+@@ -287,6 +287,14 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
+ 	if !destination.IsValid() {
+ 		panic("Dispatcher: Invalid destination.")
+ 	}
++	// Refuse an account that is over its IP limit before anything is allocated.
++	// Both dispatcher entry points are gated: this one carries vmess, trojan,
++	// shadowsocks and every mux sub-stream, DispatchLink the rest. The returned
++	// ctx carries this connection's eviction token for the speedlimit wrappers.
++	ctx, err := speedlimit.Admit(ctx)
++	if err != nil {
++		return nil, err
++	}
+ 	outbounds := session.OutboundsFromContext(ctx)
+ 	if len(outbounds) == 0 {
+ 		outbounds = []*session.Outbound{{}}
+@@ -344,6 +352,10 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
+ 	if !destination.IsValid() {
+ 		return errors.New("Dispatcher: Invalid destination.")
+ 	}
++	ctx, err := speedlimit.Admit(ctx)
++	if err != nil {
++		return err
++	}
+ 	outbounds := session.OutboundsFromContext(ctx)
+ 	if len(outbounds) == 0 {
+ 		outbounds = []*session.Outbound{{}}
+diff --git a/common/speedlimit/io.go b/common/speedlimit/io.go
+index f504dad3..54ab3169 100644
+--- a/common/speedlimit/io.go
++++ b/common/speedlimit/io.go
+@@ -42,7 +42,8 @@ func wait(ctx context.Context, l *rate.Limiter, n int) error {
+ 	return nil
+ }
+ 
+-// Writer paces a buf.Writer against one direction of an account's bucket.
++// Writer paces a buf.Writer against one direction of an account's bucket, and
++// carries the eviction token that lets the IP limiter stop it.
+ //
+ // Shaping counts payload bytes only. Encryption overhead, padding and transport
+ // headers are added below this layer and are invisible here, so a limit measures
+@@ -51,19 +52,46 @@ type Writer struct {
+ 	ctx     context.Context
+ 	writer  buf.Writer
+ 	limiter *rate.Limiter
++	conn    *conn
+ }
+ 
+-// NewWriter wraps writer so its throughput is paced by limiter. A nil limiter
+-// returns writer untouched, so an unlimited direction costs nothing.
++// NewWriter wraps writer so that its throughput is paced by limiter and an
++// eviction stops it.
++//
++// The token is taken from ctx rather than passed in, because ctx is what the
++// dispatcher already hands to both seams; see Admit.
++//
++// The writer is returned untouched only when there is NEITHER a limiter nor a
++// token, so an unlimited direction on a connection that cannot be evicted still
++// costs nothing. A limiter is kept even at rate.Inf, since a reload can re-rate
++// it under a connection that is already open. A token is kept even with no
++// limiter at all, which is the account that has an ipLimit and no speed limit:
++// without this wrapper its eviction would set a flag nothing ever reads.
+ func NewWriter(ctx context.Context, writer buf.Writer, limiter *rate.Limiter) buf.Writer {
+-	if limiter == nil {
++	c := connFromContext(ctx)
++	if limiter == nil && c == nil {
+ 		return writer
+ 	}
+-	return &Writer{ctx: ctx, writer: writer, limiter: limiter}
++	if c != nil {
++		// Handed to the token so an eviction can interrupt this writer where it
++		// parks, rather than wait for it to come back and test the flag. A full
++		// pipe blocks inside the write below for as long as the client takes to
++		// drain it, which is forever for a client that has stopped reading.
++		c.track(writer)
++	}
++	return &Writer{ctx: ctx, writer: writer, limiter: limiter, conn: c}
+ }
+ 
+ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
+-	if n := int(mb.Len()); n > 0 {
++	// Checked before the write, so an evicted connection cannot push one more
++	// buffer. This is where "accept" lands: the proxy's copy loop takes the error,
++	// closes the connection, the inbound worker cancels its context, and the
++	// release Admit registered frees whatever is left.
++	if w.conn != nil && w.conn.killed.Load() {
++		buf.ReleaseMulti(mb)
++		return errEvicted
++	}
++	if n := int(mb.Len()); n > 0 && w.limiter != nil {
+ 		if err := wait(w.ctx, w.limiter, n); err != nil {
+ 			buf.ReleaseMulti(mb)
+ 			return err
+@@ -93,22 +121,33 @@ type Reader struct {
+ 	ctx     context.Context
+ 	reader  buf.Reader
+ 	limiter *rate.Limiter
++	conn    *conn
+ }
+ 
+-// NewReader wraps reader so its throughput is paced by limiter. A nil limiter
+-// returns reader untouched.
++// NewReader wraps reader so that its throughput is paced by limiter and an
++// eviction stops it. See NewWriter for when the wrapper is skipped.
+ func NewReader(ctx context.Context, reader buf.Reader, limiter *rate.Limiter) buf.Reader {
+-	if limiter == nil {
++	c := connFromContext(ctx)
++	if limiter == nil && c == nil {
+ 		return reader
+ 	}
+-	return &Reader{ctx: ctx, reader: reader, limiter: limiter}
++	if c != nil {
++		// See NewWriter: a read parks on a client that may never speak again.
++		c.track(reader)
++	}
++	return &Reader{ctx: ctx, reader: reader, limiter: limiter, conn: c}
+ }
+ 
+ func (r *Reader) ReadMultiBuffer() (buf.MultiBuffer, error) {
++	// Checked before the read, not after it: an evicted connection must not go
++	// back to waiting on a client that may never send another byte.
++	if r.conn != nil && r.conn.killed.Load() {
++		return nil, errEvicted
++	}
+ 	mb, err := r.reader.ReadMultiBuffer()
+ 	// Pace after the read: the bytes have already arrived, so it is delaying their
+ 	// hand-off upstream that pushes back on the sender's window.
+-	if n := int(mb.Len()); n > 0 {
++	if n := int(mb.Len()); n > 0 && r.limiter != nil {
+ 		if werr := wait(r.ctx, r.limiter, n); werr != nil {
+ 			buf.ReleaseMulti(mb)
+ 			return nil, werr
+diff --git a/common/speedlimit/iplimit.go b/common/speedlimit/iplimit.go
+new file mode 100644
+index 00000000..7e3d287e
+--- /dev/null
++++ b/common/speedlimit/iplimit.go
+@@ -0,0 +1,377 @@
++package speedlimit
++
++import (
++	"context"
++	"net/netip"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/common/session"
++)
++
++// strategyAccept is the sidecar's word for evict-oldest; every other value,
++// including the absent field of a document written before the field existed, is
++// "reject".
++//
++// The two words are the VPN User Limit's existing vocabulary, spelled the same
++// here on purpose: the panel has one strategy setting per account and it must
++// not mean one thing on l2tp and another on vless.
++const strategyAccept = "accept"
++
++// errEvicted is what an evicted connection's next read or write returns.
++//
++// One shared value, built once: it carries no per-connection detail, and the
++// kill sets a flag rather than formatting anything, so that evicting an address
++// with many connections open costs nothing per connection.
++var errEvicted = errors.New("speedlimit: connection evicted, a newer address took the account's IP slot")
++
++// conn is one dispatch's kill state, and the whole of what makes a connection
++// evictable.
++//
++// It is per CONNECTION, not per account: eviction takes ONE address's
++// connections and must leave the account's other addresses untouched.
++//
++// killed is written by whichever goroutine admits the evicting connection and
++// read by this connection's io wrappers, so it is atomic rather than guarded by
++// ipMu. The wrappers see every buffer, and taking an account-wide lock on each
++// of them would funnel the account's entire throughput through the admission
++// lock.
++type conn struct {
++	killed atomic.Bool
++
++	// mu guards links, which the io wrappers append to as the dispatcher builds
++	// this connection's chain while another goroutine may be evicting it. It
++	// cannot be folded into the atomic above, and it is never held while ipMu is
++	// taken, only the other way round (see evictOldestIP).
++	mu sync.Mutex
++	// links are the objects this connection's io wrappers pace, which at both
++	// dispatcher seams are its pipes. kill interrupts them.
++	links []any
++}
++
++// track records an object an io wrapper is about to pace, so that kill can
++// interrupt it. See kill for why the flag alone is not enough.
++func (c *conn) track(o any) {
++	c.mu.Lock()
++	c.links = append(c.links, o)
++	c.mu.Unlock()
++}
++
++// kill evicts this connection: it flags it AND interrupts everything it has
++// open.
++//
++// The interrupt is not belt-and-braces, it is the eviction. Flagging alone was
++// the original bug: a wrapper only tests the flag BETWEEN buffers, but a writer
++// whose downstream pipe is full parks INSIDE pipe.WriteMultiBuffer waiting for
++// the reader to drain it, and never returns to the test. That is not a corner
++// case, it is the steady state of every connection whose client is slower than
++// its origin, which is precisely the connection an operator wants evicted. The
++// kill was therefore deferred by roughly (pipe depth / client drain rate), which
++// measured 25s against a 60KB/s client and 3s against a 300KB/s one, and is
++// unbounded for a client that stops reading altogether.
++//
++// Interrupting is how upstream already tears a link down (the outbound handler
++// does it on every error), and it does the two things the flag cannot: it
++// unblocks the parked writer at once, and it DISCARDS the bytes already sitting
++// in the pipe, which the flag would otherwise let drain to the very client being
++// evicted.
++//
++// The flag is kept for two reasons. It is what makes the wrapper report
++// errEvicted rather than an anonymous io.ErrClosedPipe, and the outbound handler
++// turns that error into the Interrupt (not Close) branch, so the rest of the
++// chain is torn down rather than drained. And it alone covers a wrapper built
++// after this point: track then appends to a list nothing will read again, but
++// such a wrapper has not blocked yet and its first buffer tests the flag.
++func (c *conn) kill() {
++	c.killed.Store(true)
++
++	c.mu.Lock()
++	links := c.links
++	c.links = nil
++	c.mu.Unlock()
++
++	// Interrupted outside c.mu: these run foreign code (pipe.Interrupt takes the
++	// pipe's own lock), and nothing downstream of a pipe reaches back into this
++	// package, so ipMu -> pipe lock cannot cycle.
++	for _, o := range links {
++		common.Interrupt(o)
++	}
++}
++
++// connKey types the context value carrying the eviction token.
++type connKey struct{}
++
++// connFromContext returns the token Admit put on the dispatch context, or nil
++// when the connection is not evictable: no IP limit, or a caller that never went
++// through Admit at all, such as the VLESS reverse-proxy mux, which reaches
++// WrapLink directly (proxy/vless/inbound/inbound.go).
++func connFromContext(ctx context.Context) *conn {
++	c, _ := ctx.Value(connKey{}).(*conn)
++	return c
++}
++
++// ipEntry is one live source address of one account.
++//
++// The set of connections IS the refcount: len(conns). Holding the connections
++// themselves rather than a bare counter is what makes "accept" possible, since
++// evicting an address means killing exactly the connections that address has
++// open, and it is also what lets a release tell its own entry from a later one
++// (see releaseIP).
++//
++// firstSeen is stamped when the address takes its slot and is never refreshed,
++// so "oldest" means the address that has held its slot longest, not the least
++// recently used one. That is the reference implementation's rule
++// (web/service/ssh_server.go admit) and it is the predictable one: a device's
++// slot cannot be taken back by its own idleness.
++type ipEntry struct {
++	firstSeen time.Time
++	conns     map[*conn]struct{}
++}
++
++// Admit applies an account's limit on concurrent distinct source IPs, reserving
++// a slot for this dispatch and releasing it when ctx is done.
++//
++// It returns a context carrying this connection's eviction token, which the io
++// wrappers read back out in NewWriter/NewReader. That is the whole of the
++// plumbing for the "accept" strategy: getLink and WrapLink are already called
++// with this context, so nothing in app/dispatcher has to learn that the token
++// exists. The returned context is the argument itself for every connection that
++// reserved nothing, so an unlimited account allocates nothing here.
++//
++// At K, "reject" refuses by returning an error, which the inbound proxy turns
++// into a closed client connection: nothing has been allocated yet and no byte
++// has flowed. "accept" instead evicts the account's oldest address and admits
++// the newcomer.
++//
++// The slot is released through context.AfterFunc, exactly as trackOnlineIP does
++// in the dispatcher, and that release is the whole safety argument. All three
++// inbound workers cancel the dispatch context as soon as the proxy stops
++// handling the connection (app/proxyman/inbound/worker.go: tcpWorker.callback
++// cancels after Process returns, dsWorker.callback likewise, and udpWorker hands
++// its cancel to udpConn.Close). So a slot cannot outlive the connection holding
++// it, which is the one failure mode that would matter: a leaked refcount would
++// lock the account out of its own service, indistinguishable from the fail2ban
++// behaviour this replaces.
++//
++// Errors are only ever returned for a real refusal. Anything the limiter cannot
++// evaluate (no session, no source IP) is admitted, because failing open costs an
++// unenforced limit while failing closed costs the account its service.
++//
++// Both dispatcher entry points must call this. Gating only one would miss half
++// the protocols: Dispatch carries vmess, trojan, shadowsocks and every mux
++// sub-stream, while DispatchLink carries vless, socks, dokodemo, http and the
++// rest.
++//
++// Mux is the one case where the context is coarser than a connection.
++// mux.ServerWorker dispatches each sub-stream on a context derived from the
++// whole muxed connection's (common/mux/server.go handleStatusNew, whose
++// SubContextFromMuxInbound only adds values), so a sub-stream's refcount is not
++// released when that sub-stream ends, only when the muxed connection does. That
++// is correct for an IP limit rather than merely tolerable: the sub-streams share
++// one source address, so they are one entry with a high refcount, and the entry
++// is freed when the connection that owns the address really is gone. It does
++// mean the refcount is not a connection count, and that a long-lived muxed
++// connection accumulates one pending AfterFunc per sub-stream, exactly as
++// upstream's trackOnlineIP already does.
++func Admit(ctx context.Context) (context.Context, error) {
++	// The disabled case: no sidecar path, no table, no work. An unpatched
++	// deployment pays one nil compare per dispatch.
++	if defaultTable == nil {
++		return ctx, nil
++	}
++	return defaultTable.admit(ctx)
++}
++
++func (t *table) admit(ctx context.Context) (context.Context, error) {
++	inbound := session.InboundFromContext(ctx)
++	if inbound == nil {
++		return ctx, nil
++	}
++	// Same resolution as the rate limiter: the email if the protocol carries one,
++	// otherwise the account that owns the source address. Read, never written back
++	// onto user.Email.
++	l := t.lookupSession(inbound.User, inbound)
++	if l == nil {
++		// Not in the sidecar at all, so unlimited. This is the common case and it
++		// costs one map miss and no allocation.
++		return ctx, nil
++	}
++	c, release, err := l.admitIP(inbound)
++	if err != nil {
++		return ctx, err
++	}
++	// A nil release means no slot was reserved, so there is nothing to release and
++	// nothing that could be evicted. Only release what was allocated: neither a
++	// refused dispatch nor an IP-unlimited one may decrement anything.
++	if release == nil {
++		return ctx, nil
++	}
++	context.AfterFunc(ctx, release)
++	return context.WithValue(ctx, connKey{}, c), nil
++}
++
++// sourceAddr canonicalises the client's source address into a map key.
++//
++// The port is deliberately dropped: the unit being limited is the address, not
++// the connection.
++func sourceAddr(inbound *session.Inbound) (netip.Addr, bool) {
++	// Address.IP() panics on a domain address, hence the family check.
++	if inbound.Source.Address == nil || !inbound.Source.Address.Family().IsIP() {
++		return netip.Addr{}, false
++	}
++	addr, ok := netip.AddrFromSlice(inbound.Source.Address.IP())
++	if !ok {
++		return netip.Addr{}, false
++	}
++	// net.IP carries IPv4 in 16-byte v4-in-v6 form as often as not, and the two
++	// forms are different netip.Addr values. Without the unmap one device could key
++	// two entries and burn two of its K slots.
++	return addr.Unmap(), true
++}
++
++// admitIP reserves a slot for the connection's source address and returns its
++// kill flag and the release to run when it ends. A nil release with a nil error
++// means no slot was reserved and nothing must be released.
++//
++// The results are deliberately unnamed. The release closure captures the kill
++// flag, and a captured NAMED result is declared at function entry, so naming it
++// would heap-allocate its cell on every call, including the early returns that
++// an account with no IP limit takes on every single dispatch.
++func (l *Limits) admitIP(inbound *session.Inbound) (*conn, func(), error) {
++	l.ipMu.Lock()
++	defer l.ipMu.Unlock()
++
++	if l.ipLimit <= 0 {
++		return nil, nil, nil
++	}
++	// Resolved inside the lock, after the K check, and not before it: Address.IP()
++	// allocates, because common/net's ipv4Address is an array whose slice escapes.
++	// An account with only a rate limit must not pay that on every dispatch.
++	addr, valid := sourceAddr(inbound)
++	if !valid {
++		// No source address to count. There is nothing to enforce, and refusing
++		// would break the account on a transport that presents none.
++		return nil, nil, nil
++	}
++	e := l.ips[addr]
++	switch {
++	case e != nil:
++		// A known IP is ALWAYS admitted, no matter how many slots are taken. One
++		// device routinely opens dozens of concurrent connections, so refusing its
++		// 50th would break ordinary browsing while protecting nothing: the slot is
++		// the address, and this address already holds one.
++	case len(l.ips) < l.ipLimit:
++		if l.ips == nil {
++			l.ips = make(map[netip.Addr]*ipEntry, l.ipLimit)
++		}
++	case l.evictOldest:
++		// Exactly one address is evicted per admission, never a sweep down to K.
++		// Only a reload that lowers K on a live account can leave the tally above
++		// K, and evicting the excess in one go would kill several of the account's
++		// devices for an operator's edit; letting it drain by attrition, one
++		// address per newcomer, mirrors the reference implementation.
++		l.evictOldestIP()
++	default:
++		// Formatting here costs an allocation, but only on the refusal path, which
++		// is rare by construction and is the one place an operator needs to be told
++		// what happened: with the access log off by default, this line is all they
++		// get.
++		return nil, nil, errors.New("speedlimit: refusing ", addr.String(), ": account is at its limit of ", l.ipLimit, " concurrent IPs")
++	}
++	if e == nil {
++		e = &ipEntry{firstSeen: time.Now(), conns: make(map[*conn]struct{}, 1)}
++		l.ips[addr] = e
++	}
++	c := &conn{}
++	e.conns[c] = struct{}{}
++	return c, func() { l.releaseIP(addr, c) }, nil
++}
++
++// evictOldestIP frees the slot held by the account's earliest-seen address and
++// kills every connection that address has open. ipMu is held.
++//
++// The kill is immediate rather than advisory: conn.kill interrupts the victim's
++// pipes instead of merely asking its io wrappers to notice a flag next time they
++// pass one. Nothing here owns the victim's connection or its context (the
++// inbound worker does, and it cancels only once the proxy has already finished
++// with it), so interrupting what it reads and writes is the whole of the reach
++// this side has, and it is enough: the proxies' copy loops take the error and
++// unwind the connection from both ends.
++func (l *Limits) evictOldestIP() {
++	var oldestAddr netip.Addr
++	var oldest *ipEntry
++	for addr, e := range l.ips {
++		// The address breaks ties so that the choice is deterministic. Map iteration
++		// order is not, and two addresses admitted in the same clock tick would
++		// otherwise evict a different one on every run.
++		if oldest == nil || e.firstSeen.Before(oldest.firstSeen) ||
++			(e.firstSeen.Equal(oldest.firstSeen) && addr.Compare(oldestAddr) < 0) {
++			oldestAddr, oldest = addr, e
++		}
++	}
++	if oldest == nil {
++		return
++	}
++	// The slot frees HERE, not when the victims notice: the newcomer is admitted
++	// in the same critical section and must find room. The victims' releases are
++	// already registered and will fire when their contexts are cancelled; they
++	// find their entry gone and decrement nothing (see releaseIP).
++	delete(l.ips, oldestAddr)
++	for c := range oldest.conns {
++		c.kill()
++	}
++	errors.LogInfo(context.Background(), "speedlimit: evicting ", oldestAddr.String(), " and its ", len(oldest.conns),
++		" connection(s): the account is at its limit of ", l.ipLimit, " concurrent IPs and strategy is accept")
++}
++
++func (l *Limits) releaseIP(addr netip.Addr, c *conn) {
++	l.ipMu.Lock()
++	defer l.ipMu.Unlock()
++
++	e := l.ips[addr]
++	if e == nil {
++		return
++	}
++	// Identity, not a bare refcount. An evicted connection's entry is gone, and by
++	// the time its context is cancelled the same address may have dialled back in
++	// and built a NEW entry; decrementing that one would charge a live address for
++	// a connection that was never its own, and two evicted connections would free
++	// its slot outright.
++	if _, ok := e.conns[c]; !ok {
++		return
++	}
++	delete(e.conns, c)
++	if len(e.conns) == 0 {
++		// The address frees the instant its last connection ends. That exactness is
++		// the entire point of refcounting here: there is no staleness window, so
++		// there is no idle guess to get wrong and no way to ban an address that is
++		// still in use.
++		delete(l.ips, addr)
++	}
++}
++
++// setIPLimit changes K and the strategy in place, on the same object open
++// connections already hold, so a reload never disturbs them.
++//
++// Lowering K below the number of addresses already live evicts nobody at reload
++// time: they keep their slots, because a known IP is always admitted. Under
++// "reject" the account simply takes on no new address until it falls back under
++// K; under "accept" each new address evicts one incumbent, so the tally drains
++// toward K rather than being cut down to it in one edit.
++//
++// The tally is deliberately not cleared, for two reasons. Releases for
++// connections admitted under the old K are still pending and must still find
++// their entries. And while an account is unlimited nothing is recorded, so a
++// limit that is removed and later restored resumes with a tally that can only
++// UNDER-count the live addresses. That direction is the safe one: it admits an
++// address it might have refused, and self-heals as connections cycle, whereas
++// over-counting would refuse a device that is not there.
++func (l *Limits) setIPLimit(k int, strategy string) {
++	l.ipMu.Lock()
++	l.ipLimit = k
++	l.evictOldest = strategy == strategyAccept
++	l.ipMu.Unlock()
++}
+diff --git a/common/speedlimit/iplimit_test.go b/common/speedlimit/iplimit_test.go
+new file mode 100644
+index 00000000..b195c369
+--- /dev/null
++++ b/common/speedlimit/iplimit_test.go
+@@ -0,0 +1,883 @@
++package speedlimit
++
++import (
++	"context"
++	"fmt"
++	"net/netip"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/transport/pipe"
++	"golang.org/x/time/rate"
++)
++
++// newInboundCtx builds a dispatch context shaped like the one an inbound worker
++// hands to the dispatcher, and returns its cancel.
++//
++// The cancel is the point of the helper: app/proxyman/inbound/worker.go derives
++// every connection's context with context.WithCancel and calls that cancel the
++// moment the proxy stops handling the connection, so calling it here is what a
++// closing client connection does in production.
++//
++// An empty email models the tunnel protocols, where dokodemo-door allocates a
++// MemoryUser with no email and the account is resolved from the source address.
++func newInboundCtx(email, ip string) (context.Context, context.CancelFunc) {
++	ctx, cancel := context.WithCancel(context.Background())
++	inb := &session.Inbound{
++		Source: net.TCPDestination(net.ParseAddress(ip), 12345),
++		User:   &protocol.MemoryUser{Email: email},
++	}
++	return session.ContextWithInbound(ctx, inb), cancel
++}
++
++// dialCtx admits one connection and returns the context the dispatcher would
++// carry onward, which is the one holding the eviction token, plus its cancel.
++func dialCtx(t *testing.T, tb *table, email, ip string) (context.Context, context.CancelFunc) {
++	t.Helper()
++	ctx, cancel := newInboundCtx(email, ip)
++	ctx, err := tb.admit(ctx)
++	if err != nil {
++		cancel()
++		t.Fatalf("admit from %s was refused: %v", ip, err)
++	}
++	return ctx, cancel
++}
++
++// dial admits one connection and returns its cancel, failing the test if the
++// dispatch was refused.
++func dial(t *testing.T, tb *table, email, ip string) context.CancelFunc {
++	t.Helper()
++	_, cancel := dialCtx(t, tb, email, ip)
++	return cancel
++}
++
++// refused admits one connection expecting refusal, and cancels it the way the
++// inbound proxy would after the dispatcher returned an error.
++func refused(t *testing.T, tb *table, email, ip string) {
++	t.Helper()
++	ctx, cancel := newInboundCtx(email, ip)
++	defer cancel()
++	if _, err := tb.admit(ctx); err == nil {
++		t.Fatalf("admit from %s was allowed, want a refusal", ip)
++	}
++}
++
++func ipCount(l *Limits) int {
++	l.ipMu.Lock()
++	defer l.ipMu.Unlock()
++	return len(l.ips)
++}
++
++// refcount is the number of live connections the address holds, which is the
++// size of its connection set.
++func refcount(l *Limits, ip string) int {
++	l.ipMu.Lock()
++	defer l.ipMu.Unlock()
++	e := l.ips[netip.MustParseAddr(ip)]
++	if e == nil {
++		return 0
++	}
++	return len(e.conns)
++}
++
++func holdsIP(l *Limits, ip string) bool {
++	l.ipMu.Lock()
++	defer l.ipMu.Unlock()
++	_, ok := l.ips[netip.MustParseAddr(ip)]
++	return ok
++}
++
++// waitForIPCount polls because context.AfterFunc runs the release on its own
++// goroutine, so a release is ordered after cancel but not synchronous with it.
++func waitForIPCount(t *testing.T, l *Limits, want int) {
++	t.Helper()
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		if ipCount(l) == want {
++			return
++		}
++		time.Sleep(time.Millisecond)
++	}
++	t.Fatalf("holding %d addresses, want %d", ipCount(l), want)
++}
++
++const ipSample = `{"users":[
++	{"email":"k1@x","downBps":0,"upBps":0,"ipLimit":1,"ips":[]},
++	{"email":"k2@x","downBps":0,"upBps":0,"ipLimit":2,"ips":["10.0.0.5/32"]},
++	{"email":"rate@x","downBps":65536,"upBps":0,"ips":[]}
++]}`
++
++// TestKnownIPIsAlwaysAdmitted is the load-bearing rule. A device opens dozens of
++// concurrent connections; refusing its 50th because K is 1 would break ordinary
++// browsing while protecting nothing, since they all share the one address.
++func TestKnownIPIsAlwaysAdmitted(t *testing.T) {
++	tb, _ := newTestTable(t, ipSample)
++	l := tb.lookup("k1@x", nil)
++	if l == nil {
++		t.Fatal("setup: no entry for k1@x")
++	}
++
++	const conns = 50
++	cancels := make([]context.CancelFunc, 0, conns)
++	for i := 0; i < conns; i++ {
++		cancels = append(cancels, dial(t, tb, "k1@x", "198.51.100.7"))
++	}
++
++	if got := ipCount(l); got != 1 {
++		t.Fatalf("%d connections from one address hold %d slots, want 1", conns, got)
++	}
++	if got := refcount(l, "198.51.100.7"); got != conns {
++		t.Fatalf("refcount = %d, want %d", got, conns)
++	}
++
++	// The address keeps its slot until its LAST connection ends.
++	for _, c := range cancels[:conns-1] {
++		c()
++	}
++	waitForIPCount(t, l, 1)
++	if got := ipCount(l); got != 1 {
++		t.Fatalf("address freed its slot with a connection still open")
++	}
++	cancels[conns-1]()
++	waitForIPCount(t, l, 0)
++}
++
++func TestNewIPBeyondKIsRefused(t *testing.T) {
++	tb, _ := newTestTable(t, ipSample)
++	l := tb.lookup("k2@x", nil)
++	if l == nil {
++		t.Fatal("setup: no entry for k2@x")
++	}
++
++	a := dial(t, tb, "k2@x", "198.51.100.1")
++	dial(t, tb, "k2@x", "198.51.100.2")
++	// K distinct addresses are now live, so a third is the K+1th.
++	refused(t, tb, "k2@x", "198.51.100.3")
++
++	// Both incumbents keep working, including on new connections.
++	dial(t, tb, "k2@x", "198.51.100.1")
++	dial(t, tb, "k2@x", "198.51.100.2")
++
++	if got := ipCount(l); got != 2 {
++		t.Fatalf("holding %d addresses, want 2", got)
++	}
++
++	// Freeing an incumbent's slot lets the newcomer in.
++	a()
++	waitForIPCount(t, l, 2) // .1 still has its second connection
++	dial(t, tb, "k2@x", "198.51.100.1")
++}
++
++// TestReleaseOnContextDoneFreesTheSlot is the highest-risk detail in the whole
++// feature: if a dispatch context ever outlived its client connection the slot
++// would leak and the account would lock itself out, which from the user's side
++// is exactly the fail2ban bug this replaces.
++func TestReleaseOnContextDoneFreesTheSlot(t *testing.T) {
++	tb, _ := newTestTable(t, ipSample)
++	l := tb.lookup("k1@x", nil)
++
++	cancel := dial(t, tb, "k1@x", "198.51.100.1")
++	refused(t, tb, "k1@x", "198.51.100.2")
++
++	cancel()
++	waitForIPCount(t, l, 0)
++
++	// The freed slot is usable, by a DIFFERENT address.
++	dial(t, tb, "k1@x", "198.51.100.2")
++	if got := refcount(l, "198.51.100.2"); got != 1 {
++		t.Fatalf("refcount = %d, want 1", got)
++	}
++}
++
++// TestRefusedDispatchReleasesNothing pins rule "only release what you
++// allocated": a refusal registers no AfterFunc, so the cancel that follows it
++// must not decrement the incumbent that refused it.
++func TestRefusedDispatchReleasesNothing(t *testing.T) {
++	tb, _ := newTestTable(t, ipSample)
++	l := tb.lookup("k1@x", nil)
++
++	dial(t, tb, "k1@x", "198.51.100.1")
++
++	for i := 0; i < 10; i++ {
++		// refused() cancels the context on the way out, exactly as the inbound proxy
++		// does once the dispatcher hands it an error.
++		refused(t, tb, "k1@x", "198.51.100.2")
++	}
++
++	// Give any (wrongly) registered release a chance to run before asserting.
++	time.Sleep(50 * time.Millisecond)
++	if got := ipCount(l); got != 1 {
++		t.Fatalf("holding %d addresses after 10 refusals, want 1", got)
++	}
++	if got := refcount(l, "198.51.100.1"); got != 1 {
++		t.Fatalf("incumbent refcount = %d, want 1: a refusal decremented it", got)
++	}
++}
++
++// TestAbsentIPLimitAllocatesNothing pins the common case. An account with no IP
++// limit, and an account absent from the sidecar entirely, must both cost nothing
++// beyond the lookup.
++func TestAbsentIPLimitAllocatesNothing(t *testing.T) {
++	tb, _ := newTestTable(t, ipSample)
++
++	for _, c := range []struct {
++		name  string
++		email string
++	}{
++		{"rate limited but no ip limit", "rate@x"},
++		{"absent from the sidecar", "nobody@x"},
++	} {
++		t.Run(c.name, func(t *testing.T) {
++			ctx, cancel := newInboundCtx(c.email, "198.51.100.1")
++			defer cancel()
++			if got := testing.AllocsPerRun(100, func() {
++				if _, err := tb.admit(ctx); err != nil {
++					t.Fatal(err)
++				}
++			}); got != 0 {
++				t.Fatalf("admit allocated %v times, want 0", got)
++			}
++		})
++	}
++
++	if l := tb.lookup("rate@x", nil); l == nil || ipCount(l) != 0 {
++		t.Fatal("an account with no ip limit built a tally")
++	}
++}
++
++// TestOldSidecarWithoutIPLimitStillParses is the backward-compatibility pin: a
++// file written before the ipLimit and strategy fields existed must load and
++// leave its accounts IP-unlimited.
++func TestOldSidecarWithoutIPLimitStillParses(t *testing.T) {
++	tb, _ := newTestTable(t, sample)
++
++	l := tb.lookup("native@x", nil)
++	if l == nil {
++		t.Fatal("an old sidecar failed to load")
++	}
++	if l.ipLimit != 0 {
++		t.Fatalf("ipLimit = %d, want 0 (unlimited) when the field is absent", l.ipLimit)
++	}
++	if l.evictOldest {
++		t.Fatal("an absent strategy must be reject, the stricter reading")
++	}
++	// Many addresses, no limit, no tally.
++	for i := 1; i <= 5; i++ {
++		dial(t, tb, "native@x", fmt.Sprintf("198.51.100.%d", i))
++	}
++	if got := ipCount(l); got != 0 {
++		t.Fatalf("an unlimited account tracked %d addresses, want none", got)
++	}
++}
++
++// TestReloadChangesKInPlace: the *Limits is shared with live connections, so a
++// reload must re-rate K on it rather than swap it, and must not lose the tally.
++func TestReloadChangesKInPlace(t *testing.T) {
++	tb, path := newTestTable(t, ipSample)
++	l := tb.lookup("k2@x", nil)
++
++	dial(t, tb, "k2@x", "198.51.100.1")
++	dial(t, tb, "k2@x", "198.51.100.2")
++	refused(t, tb, "k2@x", "198.51.100.3")
++
++	write(t, path, `{"users":[{"email":"k2@x","ipLimit":3,"ips":["10.0.0.5/32"]}]}`, time.Second)
++	tb.reloadIfChanged()
++
++	if after := tb.lookup("k2@x", nil); after != l {
++		t.Fatal("Limits was replaced; the live refcounts would have been lost")
++	}
++	if got := ipCount(l); got != 2 {
++		t.Fatalf("holding %d addresses after reload, want the 2 that were live", got)
++	}
++	if got := refcount(l, "198.51.100.1"); got != 1 {
++		t.Fatalf("refcount = %d, want the live 1 preserved across reload", got)
++	}
++	// The raised K takes effect immediately.
++	dial(t, tb, "k2@x", "198.51.100.3")
++
++	// Lowering K below what is live evicts nobody: reject refuses at admission and
++	// never kills, and a known IP is always admitted.
++	write(t, path, `{"users":[{"email":"k2@x","ipLimit":1,"ips":["10.0.0.5/32"]}]}`, 2*time.Second)
++	tb.reloadIfChanged()
++	if got := ipCount(l); got != 3 {
++		t.Fatalf("lowering K dropped live addresses: holding %d, want 3", got)
++	}
++	dial(t, tb, "k2@x", "198.51.100.1")
++	refused(t, tb, "k2@x", "198.51.100.4")
++}
++
++// TestReloadRemovingLimitFreesEveryone covers both ways an operator lifts a
++// limit: zeroing the field, and dropping the account from the file.
++func TestReloadRemovingLimitFreesEveryone(t *testing.T) {
++	t.Run("ipLimit zeroed", func(t *testing.T) {
++		tb, path := newTestTable(t, ipSample)
++		l := tb.lookup("k1@x", nil)
++		dial(t, tb, "k1@x", "198.51.100.1")
++		refused(t, tb, "k1@x", "198.51.100.2")
++
++		write(t, path, `{"users":[{"email":"k1@x","downBps":0,"upBps":0,"ipLimit":0,"ips":[]}]}`, time.Second)
++		tb.reloadIfChanged()
++
++		if tb.lookup("k1@x", nil) != l {
++			t.Fatal("Limits was replaced")
++		}
++		for i := 2; i <= 6; i++ {
++			dial(t, tb, "k1@x", fmt.Sprintf("198.51.100.%d", i))
++		}
++	})
++
++	t.Run("account dropped from the file", func(t *testing.T) {
++		tb, path := newTestTable(t, ipSample)
++		dial(t, tb, "k1@x", "198.51.100.1")
++		refused(t, tb, "k1@x", "198.51.100.2")
++
++		write(t, path, `{"users":[]}`, time.Second)
++		tb.reloadIfChanged()
++
++		if tb.lookup("k1@x", nil) != nil {
++			t.Fatal("k1@x should be gone from the index")
++		}
++		for i := 2; i <= 6; i++ {
++			dial(t, tb, "k1@x", fmt.Sprintf("198.51.100.%d", i))
++		}
++	})
++}
++
++// TestIPLimitByResolvedSource covers the tunnel lane: no email on the session,
++// so the account is resolved from the source address through the IP index. The
++// panel does not set ipLimit for those protocols, but the core has no protocol
++// awareness and must behave if it ever does.
++func TestIPLimitBySourceLookup(t *testing.T) {
++	tb, _ := newTestTable(t, ipSample)
++	l := tb.lookup("k2@x", nil)
++
++	// 10.0.0.5 belongs to k2@x, whose ipLimit is 2.
++	dial(t, tb, "", "10.0.0.5")
++	if got := refcount(l, "10.0.0.5"); got != 1 {
++		t.Fatalf("refcount = %d, want the source-resolved account to be charged", got)
++	}
++}
++
++// TestAdmitConcurrent is the race test: many goroutines racing on one account's
++// tally must never over-admit past K.
++func TestAdmitConcurrent(t *testing.T) {
++	tb, _ := newTestTable(t, `{"users":[{"email":"a@x","ipLimit":4,"ips":[]}]}`)
++	l := tb.lookup("a@x", nil)
++
++	const goroutines = 64
++	const distinctIPs = 8
++
++	var wg sync.WaitGroup
++	var admitted atomic.Int64
++	var mu sync.Mutex
++	var cancels []context.CancelFunc
++
++	for i := 0; i < goroutines; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			ctx, cancel := newInboundCtx("a@x", fmt.Sprintf("198.51.100.%d", i%distinctIPs))
++			if _, err := tb.admit(ctx); err != nil {
++				cancel()
++				return
++			}
++			admitted.Add(1)
++			mu.Lock()
++			cancels = append(cancels, cancel)
++			mu.Unlock()
++		}(i)
++	}
++	wg.Wait()
++
++	// Exactly K addresses win, whichever they are, and every connection from a
++	// winning address is admitted.
++	if got := ipCount(l); got != 4 {
++		t.Fatalf("holding %d addresses, want exactly K=4", got)
++	}
++	if got := admitted.Load(); got != goroutines/distinctIPs*4 {
++		t.Fatalf("admitted %d, want the %d connections of the 4 winning addresses", got, goroutines/distinctIPs*4)
++	}
++
++	for _, c := range cancels {
++		c()
++	}
++	waitForIPCount(t, l, 0)
++}
++
++// acceptSample is the strategy matrix. None of these accounts has a rate limit,
++// which is the shape the panel writes for a client that has an IP limit and no
++// speed limit, and the shape in which an eviction has no rate-limiting wrapper
++// to ride on.
++const acceptSample = `{"users":[
++	{"email":"acc@x","ipLimit":2,"strategy":"accept","ips":[]},
++	{"email":"acc1@x","ipLimit":1,"strategy":"accept","ips":[]},
++	{"email":"other@x","ipLimit":2,"strategy":"accept","ips":[]}
++]}`
++
++// killed reports whether the connection admitted on ctx has been evicted, which
++// is what the io wrappers check.
++func killed(ctx context.Context) bool {
++	c := connFromContext(ctx)
++	return c != nil && c.killed.Load()
++}
++
++// idleReader models a client sitting there saying nothing: in production a read
++// that reaches it blocks until the client speaks or connIdle fires. An evicted
++// connection must not reach it, so this records the visit rather than blocking,
++// which would turn a regression into a hung test instead of a failed one.
++type idleReader struct{ reached atomic.Bool }
++
++func (r *idleReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
++	r.reached.Store(true)
++	return nil, nil
++}
++
++// TestAcceptEvictsOldestIP is phase 2's headline: at K, a new address takes the
++// OLDEST address's slot instead of being refused.
++func TestAcceptEvictsOldestIP(t *testing.T) {
++	tb, _ := newTestTable(t, acceptSample)
++	l := tb.lookup("acc@x", nil)
++	if l == nil {
++		t.Fatal("setup: no entry for acc@x")
++	}
++
++	// .9 is dialled first but sorts LAST, so a comparison that fell back on the
++	// address rather than the time would evict .2 and fail this test.
++	oldCtx, _ := dialCtx(t, tb, "acc@x", "198.51.100.9")
++	time.Sleep(2 * time.Millisecond) // separate the first-seen stamps
++	youngCtx, _ := dialCtx(t, tb, "acc@x", "198.51.100.2")
++
++	// At K with a new address: admitted, and the oldest goes.
++	newCtx, _ := dialCtx(t, tb, "acc@x", "198.51.100.3")
++
++	if holdsIP(l, "198.51.100.9") {
++		t.Fatal("the oldest address kept its slot")
++	}
++	if !holdsIP(l, "198.51.100.2") || !holdsIP(l, "198.51.100.3") {
++		t.Fatal("the wrong address was evicted")
++	}
++	if got := ipCount(l); got != 2 {
++		t.Fatalf("holding %d addresses, want K=2", got)
++	}
++	if !killed(oldCtx) {
++		t.Fatal("the evicted connection was not killed")
++	}
++	if killed(youngCtx) || killed(newCtx) {
++		t.Fatal("eviction killed a connection it should not have")
++	}
++}
++
++// TestEvictedConnectionErrsOnNextReadAndWrite is the kill path itself. Setting
++// the flag is nothing on its own: it only becomes an eviction because the io
++// wrappers read it, in both directions, and the proxy's copy loop takes the
++// error and closes the connection.
++//
++// acc@x has NO rate limit, so this also pins the trap: the wrappers must be
++// installed for an account whose only limit is an IP limit, or the kill sets a
++// flag nobody ever reads.
++func TestEvictedConnectionErrsOnNextReadAndWrite(t *testing.T) {
++	tb, _ := newTestTable(t, acceptSample)
++	l := tb.lookup("acc1@x", nil)
++	if l.Up.Limit() != rate.Inf || l.Down.Limit() != rate.Inf {
++		t.Fatal("setup: acc1@x is supposed to have no rate limit")
++	}
++
++	victimCtx, _ := dialCtx(t, tb, "acc1@x", "198.51.100.1")
++
++	// The dispatcher's own wiring: getLink pairs the two directions' writers,
++	// WrapLink a reader and a writer, all built from the dispatch context.
++	inner := &countingWriter{}
++	w := NewWriter(victimCtx, inner, l.Down)
++	idle := &idleReader{}
++	r := NewReader(victimCtx, idle, l.Up)
++
++	// Before the eviction both directions work.
++	if err := w.WriteMultiBuffer(makeMB(t, 128)); err != nil {
++		t.Fatalf("write before eviction: %v", err)
++	}
++	if _, err := r.ReadMultiBuffer(); err != nil {
++		t.Fatalf("read before eviction: %v", err)
++	}
++	if !idle.reached.Load() {
++		t.Fatal("the read never reached the wrapped reader")
++	}
++	idle.reached.Store(false)
++
++	// K is 1, so this newcomer evicts the victim.
++	dial(t, tb, "acc1@x", "198.51.100.2")
++
++	if err := w.WriteMultiBuffer(makeMB(t, 128)); err != errEvicted {
++		t.Fatalf("write after eviction returned %v, want errEvicted", err)
++	}
++	if inner.n != 128 {
++		t.Fatalf("the evicted connection wrote %d bytes, want only the 128 from before it was evicted", inner.n)
++	}
++	if _, err := r.ReadMultiBuffer(); err != errEvicted {
++		t.Fatalf("read after eviction returned %v, want errEvicted", err)
++	}
++	if idle.reached.Load() {
++		t.Fatal("an evicted read went back to waiting on the client instead of failing")
++	}
++}
++
++// waitParked blocks until the writer goroutine has stopped completing writes,
++// which is how the test knows it is blocked INSIDE the pipe rather than merely
++// slow. Without this the eviction below could land between two writes and be
++// caught by the flag, which is the state the whole test exists to avoid.
++func waitParked(t *testing.T, wrote *atomic.Int64) {
++	t.Helper()
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		n := wrote.Load()
++		time.Sleep(50 * time.Millisecond)
++		if n > 0 && wrote.Load() == n {
++			return
++		}
++	}
++	t.Fatal("the writer never filled the pipe, so it never parked")
++}
++
++// TestEvictionUnblocksAWriterParkedInAFullPipe is the regression the flag-only
++// kill shipped, and the reason the test above was not enough to catch it.
++//
++// That test writes into a countingWriter, which returns instantly, so its
++// wrapper always comes back to test the flag between two buffers. The real chain
++// writes into a PIPE, and a pipe whose reader is slower than its writer fills up
++// and parks the writer inside the write itself. The wrapper is then never
++// reached again, so a flag-only kill is deferred by however long the client
++// takes to drain the pipe, and forever for a client that has stopped reading.
++// That is the steady state of exactly the connection an operator evicts, so the
++// strategy measured as "admit everyone, evict nobody" on a live server while
++// every unit test passed.
++func TestEvictionUnblocksAWriterParkedInAFullPipe(t *testing.T) {
++	tb, _ := newTestTable(t, acceptSample)
++	l := tb.lookup("acc1@x", nil)
++	if l == nil {
++		t.Fatal("setup: no entry for acc1@x")
++	}
++
++	victimCtx, _ := dialCtx(t, tb, "acc1@x", "198.51.100.1")
++
++	// getLink's wiring, with the writer it really has. Nothing ever reads pr,
++	// which is what a client that has stopped reading looks like from here.
++	pr, pw := pipe.New(pipe.WithSizeLimit(4096))
++	w := NewWriter(victimCtx, pw, l.Down)
++	// So that a failing run unwinds its goroutine instead of leaking it parked.
++	t.Cleanup(func() { common.Interrupt(pw) })
++
++	var wrote atomic.Int64
++	done := make(chan error, 1)
++	go func() {
++		for {
++			if err := w.WriteMultiBuffer(makeMB(t, 2048)); err != nil {
++				done <- err
++				return
++			}
++			wrote.Add(1)
++		}
++	}()
++
++	waitParked(t, &wrote)
++	select {
++	case err := <-done:
++		t.Fatalf("setup: the writer stopped on %v instead of parking in the pipe", err)
++	default:
++	}
++
++	// K is 1, so this newcomer evicts the victim.
++	dial(t, tb, "acc1@x", "198.51.100.2")
++
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("the evicted writer returned nil, want an error")
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("the evicted writer is STILL parked in its pipe 5s after the eviction: " +
++			"the kill only flags the connection, and a parked write never returns to test the flag")
++	}
++
++	// The other half: a kill that unparks the writer but leaves the pipe holding
++	// its bytes would still hand them to the client being evicted. The read must
++	// fail rather than yield the buffered data.
++	if _, err := pr.ReadMultiBuffer(); err == nil {
++		t.Fatal("the evicted connection's pipe still served its buffered bytes to the client")
++	}
++}
++
++// TestKillWrapperWithoutALimiter pins the wrappers' contract at the extreme: a
++// nil limiter is a pass-through UNLESS the connection is evictable, in which
++// case the wrapper exists only to carry the kill.
++func TestKillWrapperWithoutALimiter(t *testing.T) {
++	tb, _ := newTestTable(t, acceptSample)
++
++	victimCtx, _ := dialCtx(t, tb, "acc1@x", "198.51.100.1")
++	inner := &countingWriter{}
++	w := NewWriter(victimCtx, inner, nil)
++	if w == buf.Writer(inner) {
++		t.Fatal("an evictable connection was left unwrapped; its eviction would do nothing")
++	}
++	if err := w.WriteMultiBuffer(makeMB(t, 64)); err != nil {
++		t.Fatalf("write with no limiter: %v", err)
++	}
++
++	dial(t, tb, "acc1@x", "198.51.100.2") // evicts .1
++
++	if err := w.WriteMultiBuffer(makeMB(t, 64)); err != errEvicted {
++		t.Fatalf("write after eviction returned %v, want errEvicted", err)
++	}
++
++	// And with neither a limiter nor a token there is nothing to enforce, so the
++	// zero-overhead path stands (see also TestNilLimiterIsPassThrough).
++	plain, cancel := newInboundCtx("acc1@x", "198.51.100.3")
++	defer cancel()
++	if got := NewWriter(plain, inner, nil); got != buf.Writer(inner) {
++		t.Fatal("a connection with no limits at all was wrapped")
++	}
++}
++
++// TestEvictionFreesTheSlotAndDoesNotDoubleDecrement is rule "release exactly
++// what you allocated" under eviction. The victim's release is already registered
++// and fires later, when its connection finally closes; by then its entry is gone
++// and the address may even be back with a NEW entry, which the stale release
++// must not touch.
++func TestEvictionFreesTheSlotAndDoesNotDoubleDecrement(t *testing.T) {
++	tb, _ := newTestTable(t, acceptSample)
++	l := tb.lookup("acc@x", nil)
++
++	// Two connections from .1, so eviction takes both and two stale releases are
++	// left pending.
++	victim1 := dial(t, tb, "acc@x", "198.51.100.1")
++	victim2 := dial(t, tb, "acc@x", "198.51.100.1")
++	time.Sleep(2 * time.Millisecond)
++	dial(t, tb, "acc@x", "198.51.100.2")
++	dial(t, tb, "acc@x", "198.51.100.3") // evicts .1
++
++	// The slot frees at eviction, not when the victim notices.
++	if got := ipCount(l); got != 2 {
++		t.Fatalf("holding %d addresses after an eviction, want K=2", got)
++	}
++	if holdsIP(l, "198.51.100.1") {
++		t.Fatal("the evicted address kept its slot")
++	}
++
++	// The victim's address comes straight back, taking .2's slot. It is a new
++	// entry, and the old connections' releases have still not run.
++	dialCtx(t, tb, "acc@x", "198.51.100.1")
++	if !holdsIP(l, "198.51.100.1") || holdsIP(l, "198.51.100.2") {
++		t.Fatal("the returning address did not evict the oldest incumbent")
++	}
++
++	victim1()
++	victim2()
++	time.Sleep(50 * time.Millisecond) // let both stale releases run
++
++	if got := ipCount(l); got != 2 {
++		t.Fatalf("holding %d addresses, want 2: a stale release freed a live slot", got)
++	}
++	if got := refcount(l, "198.51.100.1"); got != 1 {
++		t.Fatalf(".1's new connection has refcount %d, want 1: an evicted connection decremented it", got)
++	}
++	if got := refcount(l, "198.51.100.3"); got != 1 {
++		t.Fatalf(".3 has refcount %d, want 1", got)
++	}
++}
++
++// TestEvictionSparesOthers: the kill is per connection, so it must take exactly
++// one address of one account.
++func TestEvictionSparesOthers(t *testing.T) {
++	tb, _ := newTestTable(t, acceptSample)
++	acc := tb.lookup("acc@x", nil)
++	other := tb.lookup("other@x", nil)
++
++	victimCtx, _ := dialCtx(t, tb, "acc@x", "198.51.100.1")
++	time.Sleep(2 * time.Millisecond)
++	// The same address, on another account, and a second address on this one.
++	otherCtx, _ := dialCtx(t, tb, "other@x", "198.51.100.1")
++	keepCtx, _ := dialCtx(t, tb, "acc@x", "198.51.100.2")
++
++	dialCtx(t, tb, "acc@x", "198.51.100.3") // evicts acc@x's .1 only
++
++	if !killed(victimCtx) {
++		t.Fatal("the victim was not killed")
++	}
++	if killed(otherCtx) {
++		t.Fatal("evicting one account killed another account's connection from the same address")
++	}
++	if killed(keepCtx) {
++		t.Fatal("evicting one address killed the account's other address")
++	}
++	if got := ipCount(other); got != 1 || !holdsIP(other, "198.51.100.1") {
++		t.Fatal("the other account's tally was disturbed")
++	}
++	if got := ipCount(acc); got != 2 {
++		t.Fatalf("holding %d addresses, want K=2", got)
++	}
++}
++
++// TestStrategyRejectIsUnchanged pins that only the exact word "accept" evicts.
++// Anything else is a refusal, which is what every document written before the
++// field existed meant and the stricter of the two readings.
++func TestStrategyRejectIsUnchanged(t *testing.T) {
++	for _, c := range []struct {
++		name string
++		json string
++	}{
++		{"absent", `{"email":"r@x","ipLimit":1,"ips":[]}`},
++		{"empty", `{"email":"r@x","ipLimit":1,"strategy":"","ips":[]}`},
++		{"reject", `{"email":"r@x","ipLimit":1,"strategy":"reject","ips":[]}`},
++		{"unknown word", `{"email":"r@x","ipLimit":1,"strategy":"evict","ips":[]}`},
++		// The panel emits the words in lower case; a near miss is not an accept.
++		{"wrong case", `{"email":"r@x","ipLimit":1,"strategy":"Accept","ips":[]}`},
++	} {
++		t.Run(c.name, func(t *testing.T) {
++			tb, _ := newTestTable(t, `{"users":[`+c.json+`]}`)
++			l := tb.lookup("r@x", nil)
++			if l == nil {
++				t.Fatal("the document failed to load")
++			}
++			if l.evictOldest {
++				t.Fatal("this strategy must be reject")
++			}
++
++			incumbentCtx, _ := dialCtx(t, tb, "r@x", "198.51.100.1")
++			refused(t, tb, "r@x", "198.51.100.2")
++
++			if killed(incumbentCtx) {
++				t.Fatal("reject killed the incumbent")
++			}
++			if got := ipCount(l); got != 1 || !holdsIP(l, "198.51.100.1") {
++				t.Fatal("reject disturbed the incumbent's slot")
++			}
++		})
++	}
++}
++
++// TestStrategyChangesOnReload: the strategy lives on the same object as K, so an
++// operator's edit reaches connections that are already open.
++func TestStrategyChangesOnReload(t *testing.T) {
++	tb, path := newTestTable(t, `{"users":[{"email":"s@x","ipLimit":1,"ips":[]}]}`)
++	l := tb.lookup("s@x", nil)
++
++	dial(t, tb, "s@x", "198.51.100.1")
++	refused(t, tb, "s@x", "198.51.100.2")
++
++	write(t, path, `{"users":[{"email":"s@x","ipLimit":1,"strategy":"accept","ips":[]}]}`, time.Second)
++	tb.reloadIfChanged()
++
++	if tb.lookup("s@x", nil) != l {
++		t.Fatal("Limits was replaced; the live tally would have been lost")
++	}
++	dial(t, tb, "s@x", "198.51.100.2") // now evicts instead of being refused
++	if holdsIP(l, "198.51.100.1") {
++		t.Fatal("the strategy change did not take effect")
++	}
++
++	write(t, path, `{"users":[{"email":"s@x","ipLimit":1,"strategy":"reject","ips":[]}]}`, 2*time.Second)
++	tb.reloadIfChanged()
++	refused(t, tb, "s@x", "198.51.100.3")
++}
++
++// TestConcurrentAdmitAndEvict races admissions, evictions and the io wrappers'
++// reads of the kill flag, which is the one piece of state a foreign goroutine
++// writes while a connection is using it.
++func TestConcurrentAdmitAndEvict(t *testing.T) {
++	tb, _ := newTestTable(t, `{"users":[{"email":"a@x","ipLimit":2,"strategy":"accept","ips":[]}]}`)
++	l := tb.lookup("a@x", nil)
++
++	const goroutines = 32
++	var wg sync.WaitGroup
++	var mu sync.Mutex
++	var cancels []context.CancelFunc
++
++	for i := 0; i < goroutines; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			// Every address is new, so at K every admission evicts somebody: the
++			// worst case, and the one where a kill can race its own admission.
++			ctx, cancel := dialCtx(t, tb, "a@x", fmt.Sprintf("198.51.100.%d", i+1))
++			mu.Lock()
++			cancels = append(cancels, cancel)
++			mu.Unlock()
++
++			// Drive traffic through the wrappers, so the flag is read while other
++			// goroutines are writing it.
++			w := NewWriter(ctx, &countingWriter{}, l.Down)
++			r := NewReader(ctx, &idleReader{}, l.Up)
++			for j := 0; j < 8; j++ {
++				if err := w.WriteMultiBuffer(makeMB(t, 64)); err != nil {
++					break
++				}
++				if _, err := r.ReadMultiBuffer(); err != nil {
++					break
++				}
++			}
++		}(i)
++	}
++	wg.Wait()
++
++	// accept never refuses, so the account never exceeds K.
++	if got := ipCount(l); got != 2 {
++		t.Fatalf("holding %d addresses, want K=2", got)
++	}
++	for _, c := range cancels {
++		c()
++	}
++	// Every connection is gone, including every evicted one, so the tally must
++	// drain to empty. A leak here is the lockout bug.
++	waitForIPCount(t, l, 0)
++}
++
++// TestConcurrentAdmitDuringReload races admission against reloads, which take
++// the table lock and the per-account lock on different goroutines.
++func TestConcurrentAdmitDuringReload(t *testing.T) {
++	tb, path := newTestTable(t, ipSample)
++
++	var wg sync.WaitGroup
++	stop := make(chan struct{})
++
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		for i := 0; ; i++ {
++			select {
++			case <-stop:
++				return
++			default:
++			}
++			body := fmt.Sprintf(`{"users":[{"email":"k2@x","ipLimit":%d,"ips":["10.0.0.5/32"]}]}`, 1+i%4)
++			write(t, path, body, time.Duration(i+1)*time.Second)
++			tb.reloadIfChanged()
++		}
++	}()
++
++	for i := 0; i < 16; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			for j := 0; j < 50; j++ {
++				ctx, cancel := newInboundCtx("k2@x", fmt.Sprintf("198.51.100.%d", i%4))
++				tb.admit(ctx)
++				cancel()
++			}
++		}(i)
++	}
++
++	time.Sleep(100 * time.Millisecond)
++	close(stop)
++	wg.Wait()
++
++	// Whatever the interleaving, every connection is gone, so the tally must drain
++	// to empty. A leak here is the lockout bug.
++	if l := tb.lookup("k2@x", nil); l != nil {
++		waitForIPCount(t, l, 0)
++	}
++}
+diff --git a/common/speedlimit/speedlimit.go b/common/speedlimit/speedlimit.go
+index b452de83..6f04ad3e 100644
+--- a/common/speedlimit/speedlimit.go
++++ b/common/speedlimit/speedlimit.go
+@@ -1,7 +1,13 @@
+-// Package speedlimit implements per-account bandwidth shaping for the dispatcher.
++// Package speedlimit implements per-account bandwidth shaping and per-account
++// concurrent source-IP limiting for the dispatcher.
++//
++// The two features share this package because they share everything that is
++// expensive: the sidecar file, its hot reload, the email resolution, and the
++// per-account object. Only the enforcement differs, so splitting them would
++// duplicate all of that to separate forty lines of admission control.
+ //
+ // This is a fork addition, not part of upstream Xray, so it is built to be cheap
+-// to rebase: one self-contained package plus two small edits in
++// to rebase: one self-contained package plus a handful of lines in
+ // app/dispatcher/default.go.
+ //
+ // Limits arrive out of band, through a JSON sidecar file named by the
+@@ -57,16 +63,32 @@ const (
+ 	maxBurst = 1 << 30
+ )
+ 
+-// Limits holds one account's two independent token buckets.
++// Limits is one account's enforcement state: its two token buckets and its
++// concurrent source-IP tally.
+ //
+ // The directions are separate limiters on purpose: a single shared bucket can
+ // only express a combined up+down ceiling, never "5 Mbit down, 2 Mbit up". Both
+ // fields are non-nil for any account present in the sidecar. An unlimited
+ // direction is rate.Inf rather than a nil limiter, so that a reload can re-rate
+ // it in place for connections already holding a reference.
++//
++// The IP state hangs off the same object for the same reason: a reload reuses
++// the *Limits, so K changes in place and the live refcounts survive it. Its
++// mutex is never held together with the table's, so the two cannot deadlock.
+ type Limits struct {
+ 	Up   *rate.Limiter
+ 	Down *rate.Limiter
++
++	ipMu sync.Mutex
++	// ipLimit is K, the cap on concurrent distinct source IPs. 0 is unlimited.
++	ipLimit int
++	// evictOldest is the "accept" strategy: at K, a new address takes the oldest
++	// address's slot instead of being refused. False is "reject".
++	evictOldest bool
++	// ips holds the LIVE dispatches per source address, so an address frees the
++	// instant its last connection ends. It is nil until the account first admits
++	// something under a limit.
++	ips map[netip.Addr]*ipEntry
+ }
+ 
+ // sidecarFile is the on-disk format. Rates are BYTES per second; 0 means that
+@@ -76,11 +98,23 @@ type sidecarFile struct {
+ 	Users []sidecarUser `json:"users"`
+ }
+ 
++// sidecarUser mirrors one entry of the file. Every field is optional: a document
++// written before ipLimit existed still parses, and its accounts come out
++// IP-unlimited, which is what they were.
++//
++// Strategy is what to do at K: "accept" evicts the account's oldest address,
++// anything else refuses the new one. It is not validated, because there is no
++// safe way to fail here: rejecting the document over one unrecognised word would
++// freeze EVERY account's limits at their last good value, so an unknown strategy
++// falls back to "reject", which is both the stricter reading and what an absent
++// field has always meant.
+ type sidecarUser struct {
+-	Email   string   `json:"email"`
+-	DownBps int64    `json:"downBps"`
+-	UpBps   int64    `json:"upBps"`
+-	IPs     []string `json:"ips"`
++	Email    string   `json:"email"`
++	DownBps  int64    `json:"downBps"`
++	UpBps    int64    `json:"upBps"`
++	IPLimit  int      `json:"ipLimit"`
++	Strategy string   `json:"strategy"`
++	IPs      []string `json:"ips"`
+ }
+ 
+ // index is an immutable snapshot. It is replaced wholesale on reload, but the
+@@ -152,6 +186,10 @@ func LookupSession(user *protocol.MemoryUser, inbound *session.Inbound) *Limits
+ 	if defaultTable == nil {
+ 		return nil
+ 	}
++	return defaultTable.lookupSession(user, inbound)
++}
++
++func (t *table) lookupSession(user *protocol.MemoryUser, inbound *session.Inbound) *Limits {
+ 	var email string
+ 	if user != nil {
+ 		email = user.Email
+@@ -161,7 +199,7 @@ func LookupSession(user *protocol.MemoryUser, inbound *session.Inbound) *Limits
+ 	if email == "" && inbound != nil && inbound.Source.Address != nil && inbound.Source.Address.Family().IsIP() {
+ 		ip = inbound.Source.Address.IP()
+ 	}
+-	return defaultTable.lookup(email, ip)
++	return t.lookup(email, ip)
+ }
+ 
+ func (t *table) lookup(email string, ip net.IP) *Limits {
+@@ -330,6 +368,9 @@ func buildIndex(prev *index, f *sidecarFile) (*index, error) {
+ 			setRate(l.Up, u.UpBps)
+ 			setRate(l.Down, u.DownBps)
+ 		}
++		// Reusing the *Limits is what makes K change in place: the live refcounts
++		// are on it, so lowering K cannot disturb connections already admitted.
++		l.setIPLimit(u.IPLimit, u.Strategy)
+ 		idx.byEmail[u.Email] = l
+ 
+ 		for _, pfx := range p.prefixes {
+@@ -354,6 +395,10 @@ func buildIndex(prev *index, f *sidecarFile) (*index, error) {
+ 			if _, ok := idx.byEmail[email]; !ok {
+ 				setRate(l.Up, 0)
+ 				setRate(l.Down, 0)
++				// The IP tally needs no such rescue. It is only ever reached through
++				// the index, which no longer holds this account, so admission can
++				// never consult it again; the limiters are different because an open
++				// connection captured them in its io wrappers at dispatch time.
+ 			}
+ 		}
+ 	}

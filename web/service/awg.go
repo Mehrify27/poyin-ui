@@ -66,16 +66,26 @@ type awgSettings struct {
 	Dns2 string `json:"dns2"`
 	Mtu  int    `json:"mtu"`
 
-	// AWG 1.0 obfuscation parameters (per-inbound, shared by all this inbound's clients).
+	// Backend selects "auto" (default), "kernel", or "userspace" (amneziawg-go AWG 2.0).
+	Backend string `json:"backend"`
+
+	// AWG 1.0 + 1.5/2.0 obfuscation parameters (per-inbound, shared by all this inbound's clients).
 	Jc   *int   `json:"jc"`
 	Jmin *int   `json:"jmin"`
 	Jmax *int   `json:"jmax"`
 	S1   *int   `json:"s1"`
 	S2   *int   `json:"s2"`
+	S3   *int   `json:"s3"`
+	S4   *int   `json:"s4"`
 	H1   string `json:"h1"`
 	H2   string `json:"h2"`
 	H3   string `json:"h3"`
 	H4   string `json:"h4"`
+	I1   string `json:"i1"`
+	I2   string `json:"i2"`
+	I3   string `json:"i3"`
+	I4   string `json:"i4"`
+	I5   string `json:"i5"`
 
 	ClientToClient    bool               `json:"clientToClient"`
 	CrossInbound      bool               `json:"crossInbound"`
@@ -143,14 +153,8 @@ func (o *awgSettings) mtu() int {
 	return wgDefaultMTU
 }
 
-// awgObfs is the resolved (defaults applied) AWG 1.0 obfuscation parameter set.
-type awgObfs struct {
-	Jc, Jmin, Jmax, S1, S2 int
-	H1, H2, H3, H4         string
-}
-
-// resolveObfs applies recommended defaults for any unset numeric params (magic headers are
-// minted by ReconcileKeys, so they are normally present).
+// resolveObfs applies recommended defaults for any unset numeric params and normalizes
+// optional AWG 1.5/2.0 fields (magic headers are minted by ReconcileKeys, so they are normally present).
 func (o *awgSettings) resolveObfs() awgObfs {
 	pick := func(p *int, def int) int {
 		if p != nil {
@@ -159,27 +163,23 @@ func (o *awgSettings) resolveObfs() awgObfs {
 		return def
 	}
 	return awgObfs{
-		Jc:   pick(o.Jc, 4),
-		Jmin: pick(o.Jmin, 8),
-		Jmax: pick(o.Jmax, 80),
-		S1:   pick(o.S1, 77),
-		S2:   pick(o.S2, 90),
-		H1:   o.H1, H2: o.H2, H3: o.H3, H4: o.H4,
-	}
-}
-
-func (b awgObfs) sig() string {
-	return fmt.Sprintf("%d|%d|%d|%d|%d|%s|%s|%s|%s", b.Jc, b.Jmin, b.Jmax, b.S1, b.S2, b.H1, b.H2, b.H3, b.H4)
-}
-
-// apply writes the obfuscation params into a wgtypes.Config (only when H1-H4 are present).
-func (b awgObfs) apply(cfg *wgtypes.Config) {
-	jc, jmin, jmax, s1, s2 := b.Jc, b.Jmin, b.Jmax, b.S1, b.S2
-	cfg.Jc, cfg.Jmin, cfg.Jmax = &jc, &jmin, &jmax
-	cfg.S1, cfg.S2 = &s1, &s2
-	if b.H1 != "" {
-		h1, h2, h3, h4 := b.H1, b.H2, b.H3, b.H4
-		cfg.H1, cfg.H2, cfg.H3, cfg.H4 = &h1, &h2, &h3, &h4
+		Backend: NormalizeAWGBackend(o.Backend),
+		Jc:      pick(o.Jc, 4),
+		Jmin:    pick(o.Jmin, 8),
+		Jmax:    pick(o.Jmax, 80),
+		S1:      pick(o.S1, 77),
+		S2:      pick(o.S2, 90),
+		S3:      pick(o.S3, 0),
+		S4:      pick(o.S4, 0),
+		H1:      strings.TrimSpace(o.H1),
+		H2:      strings.TrimSpace(o.H2),
+		H3:      strings.TrimSpace(o.H3),
+		H4:      strings.TrimSpace(o.H4),
+		I1:      strings.TrimSpace(o.I1),
+		I2:      strings.TrimSpace(o.I2),
+		I3:      strings.TrimSpace(o.I3),
+		I4:      strings.TrimSpace(o.I4),
+		I5:      strings.TrimSpace(o.I5),
 	}
 }
 
@@ -374,14 +374,32 @@ func (s *AwgService) GenerateAllConfigs() error {
 			}
 			iface := awgIfaceName(inbound.Id)
 			blockNet, prefix := awgBlockFor(inbound, settings)
-			if err := s.ensureLink(iface, settings.mtu(), blockNet, prefix); err != nil {
+			obfs := settings.resolveObfs()
+			backend, _ := DetectAWGBackend(obfs.Backend, obfs)
+			if err := s.ensureLinkForBackend(iface, settings.mtu(), blockNet, prefix, backend, obfs); err != nil {
 				logger.Warning("AmneziaWG: interface setup failed for", iface, err)
 				errs = append(errs, fmt.Sprintf("%s: %v", iface, err))
 				continue
 			}
 			port := inbound.Port
 			desiredPeers := s.buildPeers(inbound, settings, disabled)
-			if err := s.reconcilePeers(cl, iface, &priv, port, settings.resolveObfs(), desiredPeers); err != nil {
+			if err := s.reconcilePeers(cl, iface, &priv, port, obfs, desiredPeers); err != nil {
+				if backend == AwgBackendKernel && NormalizeAWGBackend(obfs.Backend) == AwgBackendAuto &&
+					awgUserspaceAvailable() && isAwgKernelUnsupportedError(err) {
+					logger.Warningf("AmneziaWG: kernel configure failed for %s (%v); falling back to userspace amneziawg-go", iface, err)
+					if l, lerr := netlink.LinkByName(iface); lerr == nil {
+						_ = netlink.LinkDel(l)
+					}
+					if uerr := s.ensureLinkForBackend(iface, settings.mtu(), blockNet, prefix, AwgBackendUserspace, obfs); uerr == nil {
+						if rerr := s.reconcilePeers(cl, iface, &priv, port, obfs, desiredPeers); rerr == nil {
+							continue
+						} else {
+							err = rerr
+						}
+					} else {
+						err = uerr
+					}
+				}
 				logger.Warning("AmneziaWG: configure device failed for", iface, err)
 				errs = append(errs, fmt.Sprintf("%s: %v", iface, err))
 				continue
@@ -482,7 +500,11 @@ func (s *AwgService) reconcilePeers(cl *wgctrl.Client, iface string, priv *wgtyp
 		cfg.ListenPort = &port
 	}
 	if needObfs {
-		obfs.apply(&cfg)
+		if isAwgUserspaceActive(iface) {
+			obfs.applyFull(&cfg)
+		} else {
+			obfs.apply(&cfg)
+		}
 	}
 	if err := cl.ConfigureDevice(iface, cfg); err != nil {
 		return err
@@ -506,12 +528,51 @@ func (s *AwgService) rememberObfs(iface string, obfs awgObfs) {
 	s.lastObfs[iface] = obfs.sig()
 }
 
-// ensureLink makes sure the kernel amneziawg interface exists (created via netlink as a
-// generic link of kind "amneziawg"), has the block gateway address, and is up. A missing
-// module surfaces as EOPNOTSUPP on link add so the caller can Warn (kernel-only, no fallback).
+func (s *AwgService) forgetObfs(iface string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.lastObfs, iface)
+}
+
+// ensureLink ensures an AmneziaWG interface exists using auto backend detection.
 func (s *AwgService) ensureLink(iface string, mtu int, blockNet net.IP, prefix int) error {
+	obfs := awgObfs{Backend: AwgBackendAuto}
+	backend, _ := DetectAWGBackend(AwgBackendAuto, obfs)
+	return s.ensureLinkForBackend(iface, mtu, blockNet, prefix, backend, obfs)
+}
+
+// ensureLinkForBackend ensures the interface exists using either the kernel
+// amneziawg netlink device or the userspace amneziawg-go TUN engine, with
+// automatic fallback to userspace in auto mode when kernel setup fails.
+func (s *AwgService) ensureLinkForBackend(iface string, mtu int, blockNet net.IP, prefix int, backend string, obfs awgObfs) error {
 	link, err := netlink.LinkByName(iface)
-	if err != nil {
+	if err == nil {
+		if ownForbidsDelete(ownIface, iface) {
+			return fmt.Errorf("%s already exists and was not created by vpn-ui; not touching it", iface)
+		}
+		if backend == AwgBackendUserspace && link.Type() == amneziawgLinkKind {
+			_ = netlink.LinkDel(link)
+			s.forgetObfs(iface)
+			link = nil
+		} else if backend == AwgBackendKernel && link.Type() != amneziawgLinkKind {
+			_ = stopAwgUserspaceInterface(iface)
+			_ = netlink.LinkDel(link)
+			s.forgetObfs(iface)
+			link = nil
+		}
+	}
+
+	if backend == AwgBackendUserspace {
+		if link == nil || !isAwgUserspaceActive(iface) {
+			ownIfaceCreated(iface, "awg")
+		}
+		if uerr := ensureAwgUserspaceInterface(iface, mtu); uerr != nil {
+			return fmt.Errorf("amneziawg userspace interface setup failed: %w", uerr)
+		}
+		if link, err = netlink.LinkByName(iface); err != nil {
+			return err
+		}
+	} else if link == nil {
 		// See wg-c's ensureLink: claimed before the LinkAdd so ownership is a record
 		// rather than an inference from the name.
 		ownIfaceCreated(iface, "awg")
@@ -521,16 +582,25 @@ func (s *AwgService) ensureLink(iface string, mtu int, blockNet net.IP, prefix i
 			la.MTU = mtu
 		}
 		if addErr := netlink.LinkAdd(&netlink.GenericLink{LinkAttrs: la, LinkType: amneziawgLinkKind}); addErr != nil {
-			if isNotSupported(addErr) {
-				return fmt.Errorf("amneziawg kernel module unavailable (run Core Settings setup to DKMS-build it): %w", addErr)
+			if (isNotSupported(addErr) || isAwgKernelUnsupportedError(addErr)) &&
+				NormalizeAWGBackend(obfs.Backend) == AwgBackendAuto && awgUserspaceAvailable() {
+				logger.Warningf("AmneziaWG: kernel LinkAdd for %s failed (%v); switching to userspace amneziawg-go", iface, addErr)
+				if uerr := ensureAwgUserspaceInterface(iface, mtu); uerr != nil {
+					return fmt.Errorf("amneziawg kernel unavailable (%v) and userspace fallback failed: %w", addErr, uerr)
+				}
+			} else if isNotSupported(addErr) {
+				return fmt.Errorf("amneziawg kernel module unavailable and no userspace engine available: %w", addErr)
+			} else {
+				return addErr
 			}
-			return addErr
 		}
 		if link, err = netlink.LinkByName(iface); err != nil {
 			return err
 		}
-	} else if ownForbidsDelete(ownIface, iface) {
-		return fmt.Errorf("%s already exists and was not created by vpn-ui; not touching it", iface)
+	}
+
+	if mtu > 0 && link.Attrs().MTU != mtu {
+		_ = netlink.LinkSetMTU(link, mtu)
 	}
 	if blockNet != nil {
 		v4 := blockNet.To4()
@@ -554,22 +624,34 @@ func (s *AwgService) ensureLink(iface string, mtu int, blockNet net.IP, prefix i
 // awgOwnsLink in ifaceown.go for the ownership test that replaced it.
 func (s *AwgService) removeStaleLinks(keep map[string]bool) {
 	links, err := netlink.LinkList()
-	if err != nil {
-		return
-	}
-	for _, l := range links {
-		name := l.Attrs().Name
-		if keep[name] || !awgOwnsLink(l) {
-			continue
-		}
-		if err := netlink.LinkDel(l); err == nil {
+	if err == nil {
+		for _, l := range links {
+			name := l.Attrs().Name
+			if keep[name] || !awgOwnsLink(l) {
+				continue
+			}
+			if isAwgUserspaceActive(name) {
+				_ = stopAwgUserspaceInterface(name)
+			}
+			if latest, gerr := netlink.LinkByName(name); gerr == nil {
+				_ = netlink.LinkDel(latest)
+			}
+			s.forgetObfs(name)
 			ownRemoveEntry(ownIface, name)
 		}
+	}
+	for _, name := range awgActiveUserspaceIfaces() {
+		if keep[name] || !awgOwnedName(name) || ownForbidsDelete(ownIface, name) {
+			continue
+		}
+		_ = stopAwgUserspaceInterface(name)
+		s.forgetObfs(name)
+		ownRemoveEntry(ownIface, name)
 	}
 }
 
 // SetupRouting shares the fwmark policy route + nftables regeneration with the other VPN
-// protocols; best-effort modprobe of the amneziawg module.
+// protocols; best-effort modprobe of the amneziawg module when present.
 func (s *AwgService) SetupRouting() error {
 	s.runCmd("sysctl", "-w", "net.ipv4.ip_forward=1")
 	s.runCmd("modprobe", amneziawgModule)
@@ -587,12 +669,14 @@ func (s *AwgService) RestartServices() error {
 
 func (s *AwgService) StopServices() error {
 	s.removeStaleLinks(map[string]bool{})
+	stopAllAwgUserspaceInterfaces()
 	return nil
 }
 
-// AmneziawgAvailable reports whether the out-of-tree amneziawg module is usable.
+// AmneziawgAvailable reports whether either the kernel module or userspace
+// amneziawg-go engine is usable on this host.
 func (s *AwgService) AmneziawgAvailable() bool {
-	return moduleAvailable(amneziawgModule)
+	return awgKernelModuleLoaded() || awgUserspaceAvailable()
 }
 
 // AnyInterfaceUp reports whether at least one awg interface exists and is up.
@@ -602,7 +686,7 @@ func (s *AwgService) AmneziawgAvailable() bool {
 func (s *AwgService) AnyInterfaceUp() bool {
 	links, err := netlink.LinkList()
 	if err != nil {
-		return false
+		return len(awgActiveUserspaceIfaces()) > 0
 	}
 	for _, l := range links {
 		if awgOwnsLink(l) && l.Attrs().Flags&net.FlagUp != 0 {
@@ -612,16 +696,26 @@ func (s *AwgService) AnyInterfaceUp() bool {
 	return false
 }
 
-// amneziawgModuleVersion reads the running amneziawg module version, or "kernel" when unreadable.
+// amneziawgModuleVersion returns the running AmneziaWG engine/module version.
 func amneziawgModuleVersion() string {
-	b, err := os.ReadFile("/sys/module/amneziawg/version")
-	if err != nil {
-		return "kernel"
+	kLoaded := awgKernelModuleLoaded()
+	userIfaces := awgActiveUserspaceIfaces()
+	if kLoaded {
+		ver := "kernel"
+		if b, err := os.ReadFile("/sys/module/amneziawg/version"); err == nil {
+			if v := strings.TrimSpace(string(b)); v != "" {
+				ver = v
+			}
+		}
+		if len(userIfaces) > 0 {
+			return ver + " + userspace (amneziawg-go AWG 2.0)"
+		}
+		return ver
 	}
-	if v := strings.TrimSpace(string(b)); v != "" {
-		return v
+	if awgUserspaceAvailable() {
+		return "userspace (amneziawg-go AWG 2.0)"
 	}
-	return "kernel"
+	return "unavailable"
 }
 
 // AwgClientConfig is an account's rendered client config (for the panel + QR).
@@ -734,16 +828,29 @@ func (s *AwgService) RenderClientConfigs(inbound *model.Inbound, email, endpoint
 				b.WriteString("Address = " + cidr + "\n")
 				b.WriteString("DNS = " + dnsStr + "\n")
 				b.WriteString(fmt.Sprintf("MTU = %d\n", settings.mtu()))
-				// AWG 1.0 obfuscation (must match the server, except Jc/Jmin/Jmax).
+				// AWG 1.0 + 1.5/2.0 obfuscation (must match the server, except Jc/Jmin/Jmax).
 				b.WriteString(fmt.Sprintf("Jc = %d\n", obfs.Jc))
 				b.WriteString(fmt.Sprintf("Jmin = %d\n", obfs.Jmin))
 				b.WriteString(fmt.Sprintf("Jmax = %d\n", obfs.Jmax))
 				b.WriteString(fmt.Sprintf("S1 = %d\n", obfs.S1))
 				b.WriteString(fmt.Sprintf("S2 = %d\n", obfs.S2))
+				if obfs.S3 > 0 {
+					b.WriteString(fmt.Sprintf("S3 = %d\n", obfs.S3))
+				}
+				if obfs.S4 > 0 {
+					b.WriteString(fmt.Sprintf("S4 = %d\n", obfs.S4))
+				}
 				b.WriteString("H1 = " + obfs.H1 + "\n")
 				b.WriteString("H2 = " + obfs.H2 + "\n")
 				b.WriteString("H3 = " + obfs.H3 + "\n")
 				b.WriteString("H4 = " + obfs.H4 + "\n")
+				for _, kv := range []struct {
+					k, v string
+				}{{"I1", obfs.I1}, {"I2", obfs.I2}, {"I3", obfs.I3}, {"I4", obfs.I4}, {"I5", obfs.I5}} {
+					if kv.v != "" {
+						b.WriteString(kv.k + " = " + kv.v + "\n")
+					}
+				}
 				b.WriteString("\n[Peer]\n")
 				b.WriteString("PublicKey = " + settings.ServerPubKey + "\n")
 				if psk != "" {
@@ -787,8 +894,9 @@ func (s *AwgService) RenderClientConfigs(inbound *model.Inbound, email, endpoint
 // lock-step with RenderClientConfigs.
 type AwgClientParams struct {
 	WgcClientParams
-	Jc, Jmin, Jmax, S1, S2 int
-	H1, H2, H3, H4         string
+	Jc, Jmin, Jmax, S1, S2, S3, S4 int
+	H1, H2, H3, H4                 string
+	I1, I2, I3, I4, I5             string
 }
 
 // RenderClientParams mirrors RenderClientConfigs (same targets/devices loop + obfs)
@@ -870,7 +978,9 @@ func (s *AwgService) RenderClientParams(inbound *model.Inbound, email, endpointH
 						AllowedIPs:   []string{"0.0.0.0/0"},
 					},
 					Jc: obfs.Jc, Jmin: obfs.Jmin, Jmax: obfs.Jmax, S1: obfs.S1, S2: obfs.S2,
+					S3: obfs.S3, S4: obfs.S4,
 					H1: obfs.H1, H2: obfs.H2, H3: obfs.H3, H4: obfs.H4,
+					I1: obfs.I1, I2: obfs.I2, I3: obfs.I3, I4: obfs.I4, I5: obfs.I5,
 				})
 			}
 		}

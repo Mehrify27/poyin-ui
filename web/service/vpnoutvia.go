@@ -762,7 +762,10 @@ var vpnOutAddRule = func(r vpnOutRule) error {
 		}
 		rule.Dst = dst
 	}
-	return netlink.RuleAdd(rule)
+	if err := netlink.RuleAdd(rule); err != nil && !errIsExist(err) {
+		return err
+	}
+	return nil
 }
 
 // vpnOutDelRule removes one, by the object it was enumerated as.

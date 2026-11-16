@@ -45,6 +45,8 @@ func detectPackageManager() *packageManager {
 		}
 	case commandExists("dnf"):
 		return &packageManager{name: "dnf", install: []string{"dnf", "install", "-y"}}
+	case commandExists("dnf5"):
+		return &packageManager{name: "dnf5", install: []string{"dnf5", "install", "-y"}}
 	case commandExists("yum"):
 		return &packageManager{name: "yum", install: []string{"yum", "install", "-y"}}
 	case commandExists("zypper"):
@@ -119,7 +121,7 @@ func (pm *packageManager) packageInstalled(pkg string) bool {
 		// a known one; "install ok installed" is the only state that counts.
 		out, err := exec.Command("dpkg-query", "-W", "-f=${Status}", pkg).Output()
 		return err == nil && strings.Contains(string(out), "install ok installed")
-	case "dnf", "yum":
+	case "dnf", "dnf5", "yum":
 		query = []string{"rpm", "-q", pkg}
 	case "zypper":
 		query = []string{"rpm", "-q", pkg}
@@ -527,10 +529,10 @@ func unblacklistVpnModules() (cleared []string, log string) {
 func nftablesPackage() string { return "nftables" }
 
 // iproutePackage is the package that provides the `ip` CLI — "iproute" on the
-// RHEL family (dnf/yum), "iproute2" everywhere else.
+// RHEL family (dnf/dnf5/yum), "iproute2" everywhere else.
 func iproutePackage() string {
 	switch {
-	case commandExists("dnf"), commandExists("yum"):
+	case commandExists("dnf"), commandExists("dnf5"), commandExists("yum"):
 		return "iproute"
 	default:
 		return "iproute2"
@@ -560,13 +562,79 @@ func osReleaseField(key string) string {
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	return parseOSReleaseField(string(data), key)
+}
+
+func parseOSReleaseField(data, key string) string {
+	for _, line := range strings.Split(data, "\n") {
 		line = strings.TrimSpace(line)
 		if v, ok := strings.CutPrefix(line, key+"="); ok {
 			return strings.Trim(v, "\"'")
 		}
 	}
 	return ""
+}
+
+// HostEnvInfo summarizes the Linux distribution, kernel, package manager, SELinux,
+// and active firewall observed on the host for compatibility and upgrade diagnostics.
+type HostEnvInfo struct {
+	DistroID       string `json:"distroId"`
+	VersionID      string `json:"versionId"`
+	PrettyName     string `json:"prettyName"`
+	Kernel         string `json:"kernel"`
+	PackageManager string `json:"packageManager"`
+	SELinux        string `json:"selinux"`
+	Firewall       string `json:"firewall"`
+}
+
+func detectSELinuxState() string {
+	if commandExists("getenforce") {
+		if out, err := exec.Command("getenforce").Output(); err == nil {
+			if s := strings.TrimSpace(string(out)); s != "" {
+				return s
+			}
+		}
+	}
+	if b, err := os.ReadFile("/sys/fs/selinux/enforce"); err == nil {
+		if strings.TrimSpace(string(b)) == "1" {
+			return "Enforcing"
+		}
+		return "Permissive"
+	}
+	return "Disabled"
+}
+
+func detectActiveFirewall() string {
+	if systemctlActive("firewalld") {
+		return "firewalld"
+	}
+	if commandExists("ufw") {
+		if out, err := exec.Command("ufw", "status").CombinedOutput(); err == nil &&
+			strings.Contains(strings.ToLower(string(out)), "status: active") {
+			return "ufw"
+		}
+	}
+	if systemctlActive("nftables") {
+		return "nftables"
+	}
+	return "none"
+}
+
+// DetectHostEnvironment gathers host OS metadata for install/upgrade diagnostics.
+func DetectHostEnvironment() HostEnvInfo {
+	pmName := ""
+	if pm := detectPackageManager(); pm != nil {
+		pmName = pm.name
+	}
+	return HostEnvInfo{
+		DistroID:       strings.ToLower(strings.TrimSpace(osReleaseField("ID"))),
+		VersionID:      strings.TrimSpace(osReleaseField("VERSION_ID")),
+		PrettyName:     distroPretty(),
+		Kernel:         runningKernel(),
+		PackageManager: pmName,
+		SELinux:        detectSELinuxState(),
+		Firewall:       detectActiveFirewall(),
+	}
 }
 
 // distroPretty is a short human name for the running distro, for the setup log.
@@ -629,7 +697,7 @@ func KernelModulesPackage() string {
 		// Debian (and non-Ubuntu apt distros): the generic flavour ships the
 		// modules the cloud flavour omits.
 		return "linux-image-" + debKernelArch()
-	case commandExists("dnf"), commandExists("yum"):
+	case commandExists("dnf"), commandExists("dnf5"), commandExists("yum"):
 		if r := runningKernel(); r != "" {
 			return "kernel-modules-extra-" + r
 		}

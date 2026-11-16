@@ -115,9 +115,11 @@
                 <a-icon type="question-circle"></a-icon>
               </a-tooltip>
             </template>
-            <a-select v-model="inbound.settings.flow" :dropdown-class-name="themeSwitcher.currentTheme">
+            <a-select v-model="inbound.settings.flow"
+              @change="v => { if (inbound.settings.vlesses && inbound.settings.vlesses.length > 0) inbound.settings.vlesses.forEach(c => { c.flow = v; }); }"
+              :dropdown-class-name="themeSwitcher.currentTheme">
               <a-select-option value="">{{ i18n "none" }}</a-select-option>
-              <a-select-option value="xtls-rprx-vision">xtls-rprx-vision</a-select-option>
+              <a-select-option v-for="key in TLS_FLOW_CONTROL" :key="key" :value="key">[[ key ]]</a-select-option>
             </a-select>
           </a-form-item>
         </a-form>

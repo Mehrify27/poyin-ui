@@ -59,9 +59,10 @@ const (
 	SSLConsumerPanel  = "panel"
 	SSLConsumerSub    = "subscription"
 	SSLConsumerXray   = "xray"
-	SSLConsumerIkev2  = "ikev2"
-	SSLConsumerOcserv = "ocserv"
-	SSLConsumerSstp   = "sstp"
+	SSLConsumerIkev2     = "ikev2"
+	SSLConsumerOcserv    = "ocserv"
+	SSLConsumerSstp      = "sstp"
+	SSLConsumerHysteria2 = "hysteria2"
 )
 
 // ListSSLConsumers finds everything configured to serve the given certificate
@@ -160,6 +161,28 @@ func sslConsumerForInbound(in *model.Inbound, want string) (SSLConsumer, bool) {
 			Kind: SSLConsumerSstp, Label: fmt.Sprintf("SSTP inbound %q", in.Remark),
 			InboundId: in.Id, Protocol: string(in.Protocol), Disruptive: true,
 			Action: "Restart accel-ppp. The bundle ships no accel-cmd, so there is no control socket to reload through, and EVERY connected SSTP user is disconnected.",
+		}, true
+
+	case "hysteria2":
+		var st struct {
+			TlsUseFile      bool   `json:"tlsUseFile"`
+			CertificateFile string `json:"certificateFile"`
+			CertFile        string `json:"certFile"`
+		}
+		if json.Unmarshal([]byte(in.Settings), &st) != nil {
+			return SSLConsumer{}, false
+		}
+		cert := strings.TrimSpace(st.CertificateFile)
+		if cert == "" {
+			cert = strings.TrimSpace(st.CertFile)
+		}
+		if cert == "" || filepath.Clean(cert) != want {
+			return SSLConsumer{}, false
+		}
+		return SSLConsumer{
+			Kind: SSLConsumerHysteria2, Label: fmt.Sprintf("Hysteria 2 inbound %q", in.Remark),
+			InboundId: in.Id, Protocol: string(in.Protocol), Disruptive: true,
+			Action: "Restart sing-box. It reads its TLS certificate at process start, so EVERY connected Hysteria 2 session on that inbound is disconnected.",
 		}, true
 	}
 
@@ -277,6 +300,16 @@ func ApplySSLConsumers(certPath string, opts SSLFanOutOptions, emit func(Provisi
 			var sstp SstpService
 			err := sstp.RestartServices()
 			emit(ProvisionStep{Name: c.Label, OK: err == nil, Msg: sslApplyMsg(err, "Restarted accel-ppp with the new certificate. Connected users were disconnected.")})
+
+		case c.Kind == SSLConsumerHysteria2:
+			if !opts.ApplyDisruptive {
+				deferred = append(deferred, c.Label)
+				emit(ProvisionStep{Name: c.Label, OK: true, Warn: true, Msg: "Skipped: " + c.Action})
+				continue
+			}
+			var hy2 Hysteria2Service
+			err := hy2.RestartServices()
+			emit(ProvisionStep{Name: c.Label, OK: err == nil, Msg: sslApplyMsg(err, "Restarted sing-box with the new certificate. Connected Hysteria 2 users were disconnected.")})
 		}
 	}
 

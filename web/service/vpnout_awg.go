@@ -11,6 +11,7 @@ import (
 
 	wgctrl "github.com/Jipok/wgctrl-go"
 	"github.com/Jipok/wgctrl-go/wgtypes"
+	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/util/vpnsec"
 	"github.com/vishvananda/netlink"
 )
@@ -44,18 +45,26 @@ type awgOutSettings struct {
 	Address       string `json:"address"`
 	Mtu           int    `json:"mtu"`
 	Keepalive     *int   `json:"keepalive"`
+	Backend       string `json:"backend"`
 
-	// AWG 1.0 obfuscation, taken verbatim from the server's issued config. Pointers
-	// so "the operator left it blank" stays distinguishable from an explicit 0.
+	// AWG 1.0 + 1.5/2.0 obfuscation, taken verbatim from the server's issued config.
+	// Pointers so "the operator left it blank" stays distinguishable from an explicit 0.
 	Jc   *int   `json:"jc"`
 	Jmin *int   `json:"jmin"`
 	Jmax *int   `json:"jmax"`
 	S1   *int   `json:"s1"`
 	S2   *int   `json:"s2"`
+	S3   *int   `json:"s3"`
+	S4   *int   `json:"s4"`
 	H1   string `json:"h1"`
 	H2   string `json:"h2"`
 	H3   string `json:"h3"`
 	H4   string `json:"h4"`
+	I1   string `json:"i1"`
+	I2   string `json:"i2"`
+	I3   string `json:"i3"`
+	I4   string `json:"i4"`
+	I5   string `json:"i5"`
 }
 
 func (o *awgOutSettings) mtu() int {
@@ -95,10 +104,14 @@ func (o *awgOutSettings) obfs() awgObfs {
 		return 0
 	}
 	return awgObfs{
-		Jc: pick(o.Jc), Jmin: pick(o.Jmin), Jmax: pick(o.Jmax),
-		S1: pick(o.S1), S2: pick(o.S2),
+		Backend: NormalizeAWGBackend(o.Backend),
+		Jc:      pick(o.Jc), Jmin: pick(o.Jmin), Jmax: pick(o.Jmax),
+		S1: pick(o.S1), S2: pick(o.S2), S3: pick(o.S3), S4: pick(o.S4),
 		H1: strings.TrimSpace(o.H1), H2: strings.TrimSpace(o.H2),
 		H3: strings.TrimSpace(o.H3), H4: strings.TrimSpace(o.H4),
+		I1: strings.TrimSpace(o.I1), I2: strings.TrimSpace(o.I2),
+		I3: strings.TrimSpace(o.I3), I4: strings.TrimSpace(o.I4),
+		I5: strings.TrimSpace(o.I5),
 	}
 }
 
@@ -156,10 +169,10 @@ func (d *awgOutDriver) SecretKeys() []string {
 // that would refuse a working tunnel, whereas an amneziawg module is absent on every
 // host that has not deliberately built one.
 func (d *awgOutDriver) Available() (bool, string) {
-	if moduleAvailable(amneziawgModule) {
+	if awgKernelModuleLoaded() || awgUserspaceAvailable() {
 		return true, ""
 	}
-	return false, "the amneziawg kernel module is not built for this kernel: " + awgOutUnavailableReason()
+	return false, "amneziawg kernel module and userspace TUN engine (/dev/net/tun) are both unavailable: " + awgOutUnavailableReason()
 }
 
 func (d *awgOutDriver) settings(cfg VpnOutboundConfig) (*awgOutSettings, error) {
@@ -206,12 +219,25 @@ func (o *awgOutSettings) validate() error {
 		"preshared key", o.PresharedKey,
 		"endpoint", o.Endpoint,
 		"address", o.Address,
+		"backend", o.Backend,
 		"h1", o.H1,
 		"h2", o.H2,
 		"h3", o.H3,
 		"h4", o.H4,
+		"i1", o.I1,
+		"i2", o.I2,
+		"i3", o.I3,
+		"i4", o.I4,
+		"i5", o.I5,
 	); err != nil {
 		return err
+	}
+	if strings.TrimSpace(o.Backend) != "" {
+		switch NormalizeAWGBackend(o.Backend) {
+		case AwgBackendAuto, AwgBackendKernel, AwgBackendUserspace:
+		default:
+			return fmt.Errorf("unsupported backend %q (expected auto, kernel or userspace)", o.Backend)
+		}
 	}
 	if err := vpnOutCheckKey("private key", o.PrivateKey); err != nil {
 		return err
@@ -236,6 +262,26 @@ func (o *awgOutSettings) validate() error {
 	}
 
 	b := o.obfs()
+	for _, kv := range []struct {
+		k string
+		v int
+	}{{"jc", b.Jc}, {"jmin", b.Jmin}, {"jmax", b.Jmax}, {"s1", b.S1}, {"s2", b.S2}, {"s3", b.S3}, {"s4", b.S4}} {
+		if kv.v < 0 {
+			return fmt.Errorf("%s must not be negative (got %d)", kv.k, kv.v)
+		}
+	}
+	if b.S1+awgMsgInitiationSize > awgMaxMessageSize {
+		return fmt.Errorf("s1 (%d) is too large", b.S1)
+	}
+	if b.S2+awgMsgResponseSize > awgMaxMessageSize {
+		return fmt.Errorf("s2 (%d) is too large", b.S2)
+	}
+	if b.S3+awgMsgCookieReplySize > awgMaxMessageSize {
+		return fmt.Errorf("s3 (%d) is too large", b.S3)
+	}
+	if b.S4+awgMsgTransportMin > awgMaxMessageSize {
+		return fmt.Errorf("s4 (%d) is too large", b.S4)
+	}
 	// Junk packets are only emitted when Jc > 0, and then their size is drawn from
 	// [Jmin, Jmax]. An inverted or empty range is a config the module cannot honour.
 	if b.Jc > 0 && (b.Jmax <= 0 || b.Jmin > b.Jmax) {
@@ -253,6 +299,19 @@ func (o *awgOutSettings) validate() error {
 	}
 	if set != 0 && set != 4 {
 		return errors.New("h1, h2, h3 and h4 must all be set or all be empty (they replace the four packet types together)")
+	}
+	if err := ValidateAwgHeaders(b.H1, b.H2, b.H3, b.H4); err != nil {
+		return err
+	}
+	for _, spec := range []struct {
+		k, v string
+	}{{"i1", b.I1}, {"i2", b.I2}, {"i3", b.I3}, {"i4", b.I4}, {"i5", b.I5}} {
+		if spec.v == "" {
+			continue
+		}
+		if err := ValidateAwgCPSSpec(spec.k, spec.v); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -293,15 +352,10 @@ func (d *awgOutDriver) Up(cfg VpnOutboundConfig) (string, error) {
 	}
 
 	iface := d.iface(cfg)
-	// Device only. Egress routing is the framework's (vpnOutBindEgress); see the same
-	// note in vpnout_wireguard.go.
-	err = vpnOutEnsureLink(iface, st.mtu(), addrs, func(la netlink.LinkAttrs) netlink.Link {
-		return &netlink.GenericLink{LinkAttrs: la, LinkType: amneziawgLinkKind}
-	})
-	if err != nil {
-		if isNotSupported(err) {
-			return "", fmt.Errorf("amneziawg kernel module unavailable: %s (%w)", awgOutUnavailableReason(), err)
-		}
+	obfs := st.obfs()
+	backend, _ := DetectAWGBackend(obfs.Backend, obfs)
+
+	if err := d.ensureOutLink(iface, st.mtu(), addrs, backend, obfs); err != nil {
 		return "", err
 	}
 
@@ -312,14 +366,84 @@ func (d *awgOutDriver) Up(cfg VpnOutboundConfig) (string, error) {
 	defer cl.Close()
 
 	if err := d.configure(cl, iface, priv, peerPub, psk, endpoint, st.keepalive(),
-		st.obfs(), vpnOutHasV6(addrs)); err != nil {
+		obfs, vpnOutHasV6(addrs)); err != nil {
+		if backend == AwgBackendKernel && NormalizeAWGBackend(obfs.Backend) == AwgBackendAuto &&
+			awgUserspaceAvailable() && isAwgKernelUnsupportedError(err) {
+			logger.Warningf("vpn outbound: kernel amneziawg configure failed on %s (%v); falling back to userspace amneziawg-go", iface, err)
+			if l, lerr := netlink.LinkByName(iface); lerr == nil {
+				_ = netlink.LinkDel(l)
+			}
+			d.forgetApplied(iface)
+			if uerr := d.ensureOutLink(iface, st.mtu(), addrs, AwgBackendUserspace, obfs); uerr == nil {
+				if rerr := d.configure(cl, iface, priv, peerPub, psk, endpoint, st.keepalive(),
+					obfs, vpnOutHasV6(addrs)); rerr == nil {
+					return iface, nil
+				} else {
+					err = rerr
+				}
+			} else {
+				err = uerr
+			}
+		}
 		return "", fmt.Errorf("configuring %s: %w", iface, err)
 	}
 	return iface, nil
 }
 
+func (d *awgOutDriver) ensureOutLink(iface string, mtu int, addrs []*netlink.Addr, backend string, obfs awgObfs) error {
+	if existing, err := netlink.LinkByName(iface); err == nil {
+		if backend == AwgBackendUserspace && existing.Type() == amneziawgLinkKind {
+			_ = netlink.LinkDel(existing)
+			d.forgetApplied(iface)
+		} else if backend == AwgBackendKernel && existing.Type() != amneziawgLinkKind {
+			_ = stopAwgUserspaceInterface(iface)
+			_ = netlink.LinkDel(existing)
+			d.forgetApplied(iface)
+		}
+	}
+
+	bringUpUserspace := func() error {
+		if err := ensureAwgUserspaceInterface(iface, mtu); err != nil {
+			return fmt.Errorf("amneziawg userspace interface setup failed: %w", err)
+		}
+		link, err := netlink.LinkByName(iface)
+		if err != nil {
+			return err
+		}
+		if mtu > 0 && link.Attrs().MTU != mtu {
+			_ = netlink.LinkSetMTU(link, mtu)
+		}
+		if err := vpnOutSyncAddrs(link, addrs); err != nil {
+			return err
+		}
+		return netlink.LinkSetUp(link)
+	}
+
+	if backend == AwgBackendUserspace {
+		return bringUpUserspace()
+	}
+
+	// Device only. Egress routing is the framework's (vpnOutBindEgress); see the same
+	// note in vpnout_wireguard.go.
+	err := vpnOutEnsureLink(iface, mtu, addrs, func(la netlink.LinkAttrs) netlink.Link {
+		return &netlink.GenericLink{LinkAttrs: la, LinkType: amneziawgLinkKind}
+	})
+	if err != nil {
+		if (isNotSupported(err) || isAwgKernelUnsupportedError(err)) &&
+			NormalizeAWGBackend(obfs.Backend) == AwgBackendAuto && awgUserspaceAvailable() {
+			logger.Warningf("vpn outbound: kernel amneziawg unavailable for %s (%v); using userspace amneziawg-go", iface, err)
+			return bringUpUserspace()
+		}
+		if isNotSupported(err) {
+			return fmt.Errorf("amneziawg kernel module unavailable: %s (%w)", awgOutUnavailableReason(), err)
+		}
+		return err
+	}
+	return nil
+}
+
 // configure reconciles the device to exactly one peer (the remote server) plus the
-// obfuscation set, touching the kernel only when something differs. Mirrors
+// obfuscation set, touching the device only when something differs. Mirrors
 // wgOutDriver.configure; the obfuscation is folded into the same write because the
 // module takes it as device-level config alongside the private key.
 func (d *awgOutDriver) configure(cl *wgctrl.Client, iface string, priv, peerPub wgtypes.Key,
@@ -390,7 +514,11 @@ func (d *awgOutDriver) configure(cl *wgctrl.Client, iface string, priv, peerPub 
 		wcfg.PrivateKey = &priv
 	}
 	if needObfs {
-		obfs.apply(&wcfg)
+		if isAwgUserspaceActive(iface) {
+			obfs.applyFull(&wcfg)
+		} else {
+			obfs.apply(&wcfg)
+		}
 	}
 	if err := cl.ConfigureDevice(iface, wcfg); err != nil {
 		return err
@@ -402,8 +530,10 @@ func (d *awgOutDriver) configure(cl *wgctrl.Client, iface string, priv, peerPub 
 // Down removes the tunnel, tolerating an already-absent link.
 func (d *awgOutDriver) Down(cfg VpnOutboundConfig) error {
 	iface := d.iface(cfg)
+	_ = stopAwgUserspaceInterface(iface)
 	err := vpnOutDeleteLink(iface, vpnOutAwgIfacePrefix)
 	if prev := strings.TrimSpace(cfg.Iface); prev != "" && prev != iface {
+		_ = stopAwgUserspaceInterface(prev)
 		if perr := vpnOutDeleteLink(prev, vpnOutAwgIfacePrefix); err == nil {
 			err = perr
 		}
@@ -413,9 +543,7 @@ func (d *awgOutDriver) Down(cfg VpnOutboundConfig) error {
 }
 
 // Status reports liveness from the last handshake, the only honest signal here (see
-// wgOutDriver.Status). A missing interface is reported against module availability,
-// because on this protocol "not built for the running kernel" is the likeliest
-// reason the tunnel is not there at all.
+// wgOutDriver.Status).
 func (d *awgOutDriver) Status(cfg VpnOutboundConfig) (bool, string) {
 	st, err := d.settings(cfg)
 	if err != nil {
@@ -423,8 +551,8 @@ func (d *awgOutDriver) Status(cfg VpnOutboundConfig) (bool, string) {
 	}
 	iface := d.iface(cfg)
 	if _, err := netlink.LinkByName(iface); err != nil {
-		if !moduleAvailable(amneziawgModule) {
-			return false, "amneziawg kernel module unavailable: " + awgOutUnavailableReason()
+		if !awgKernelModuleLoaded() && !awgUserspaceAvailable() {
+			return false, "amneziawg kernel module and userspace engine unavailable: " + awgOutUnavailableReason()
 		}
 		return false, "interface " + iface + " does not exist"
 	}

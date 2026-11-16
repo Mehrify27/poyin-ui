@@ -218,7 +218,7 @@
             </div>
             <div class="ai-kv">
               <span class="k">{{ i18n "pages.clients.summaryUsed" }}</span>
-              <span class="v">[[ m.used ]]</span>
+              <span class="v">[[ m.used ]] (&uarr; [[ m.usedUp ]] / &darr; [[ m.usedDown ]])<span v-if="m.shared"> &middot; {{ i18n "pages.clients.sharedUsage" }}</span></span>
             </div>
           </a-spin>
         </div>
@@ -303,14 +303,25 @@
       memberships() {
         if (!this.app || !this.row) return [];
         const out = [];
+        const mvById = {};
+        (this.row.memberships || []).forEach(mv => { mvById[mv.inboundId] = mv; });
         (this.app.accountInbounds(this.row) || []).forEach(record => {
+          const mv = mvById[record.id];
           (this.app.accountClientIn(this.row, record) || []).forEach(client => {
+            const statsUp = this.app.getInboundUpStats(record, client.email) || 0;
+            const statsDown = this.app.getInboundDownStats(record, client.email) || 0;
+            const up = (statsUp || statsDown || !mv) ? statsUp : (mv.up || 0);
+            const down = (statsUp || statsDown || !mv) ? statsDown : (mv.down || 0);
+            const shared = !!(this.app.isSharedStats(record, client.email) || (mv && mv.shared));
             out.push({
               record: record,
               client: client,
               enabled: this.app.membershipEnabled(this.row, record),
               lamp: this.app.membershipLampClass(record, client.email),
-              used: SizeFormatter.sizeFormat(this.app.getInboundSumStats(record, client.email) || 0),
+              used: SizeFormatter.sizeFormat(up + down),
+              usedUp: SizeFormatter.sizeFormat(up),
+              usedDown: SizeFormatter.sizeFormat(down),
+              shared: shared,
             });
           });
         });

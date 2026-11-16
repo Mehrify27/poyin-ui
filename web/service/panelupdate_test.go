@@ -1,12 +1,22 @@
 package service
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mhsanaei/3x-ui/v2/config"
 )
 
 // resetUpdateStateForTest clears the package-level update state between cases.
@@ -140,4 +150,140 @@ func TestCancelPanelUpdateGating(t *testing.T) {
 			t.Error("cancelling during install should be refused")
 		}
 	})
+}
+
+func testSyntheticELFBytes(goarch string) []byte {
+	mach, ok := elfMachineFor(goarch)
+	if !ok {
+		mach = 0x3E
+	}
+	var hdr [64]byte
+	hdr[0], hdr[1], hdr[2], hdr[3] = 0x7f, 'E', 'L', 'F'
+	hdr[4] = 2 // 64-bit
+	hdr[5] = 1 // little-endian
+	hdr[6] = 1 // EV_CURRENT
+	hdr[18] = byte(mach)
+	hdr[19] = byte(mach >> 8)
+	return append(hdr[:], []byte("synthetic-panel-payload")...)
+}
+
+func TestVersionNewerAndRepoConfig(t *testing.T) {
+	if !versionNewer("2.0.0", "1.9.4") {
+		t.Error("expected 2.0.0 to be newer than 1.9.4")
+	}
+	if !versionNewer("v2.0.0", "2.0.0-rc.1") {
+		t.Error("expected v2.0.0 to be newer than 2.0.0-rc.1")
+	}
+	if !versionNewer("v2.1.0", "v2.0.9") {
+		t.Error("expected v2.1.0 to be newer than v2.0.9")
+	}
+	if versionNewer("1.9.4", "2.0.0") {
+		t.Error("did not expect 1.9.4 to be newer than 2.0.0")
+	}
+
+	t.Cleanup(func() {
+		config.SetRepoOverride("")
+		config.SetGHProxyOverride("")
+	})
+	config.SetRepoOverride("acme/custom-vpn")
+	config.SetGHProxyOverride("https://mirror.local")
+
+	if got := PanelLatestAPIURL(); !strings.Contains(got, "https://mirror.local/https://api.github.com/repos/acme/custom-vpn/releases/latest") {
+		t.Errorf("unexpected PanelLatestAPIURL: %q", got)
+	}
+	if got := PanelDownloadURLForArch("arm64"); !strings.Contains(got, "https://mirror.local/https://github.com/acme/custom-vpn/releases/latest/download/vpn-ui-arm64") {
+		t.Errorf("unexpected PanelDownloadURLForArch(arm64): %q", got)
+	}
+}
+
+func TestStageLocalPanelAssetRawAndTarGz(t *testing.T) {
+	dir := t.TempDir()
+	exeDir := filepath.Join(dir, "opt")
+	if err := os.MkdirAll(exeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	elfData := testSyntheticELFBytes(runtime.GOARCH)
+	rawSum := sha256.Sum256(elfData)
+	rawHex := hex.EncodeToString(rawSum[:])
+
+	assetName := PanelAssetForArch(runtime.GOARCH)
+	binPath := filepath.Join(dir, assetName)
+	if err := os.WriteFile(binPath, elfData, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(binPath+".sha256", []byte(rawHex+"  "+assetName+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staged, _, err := StageLocalPanelAsset(binPath, exeDir)
+	if err != nil {
+		t.Fatalf("StageLocalPanelAsset(raw): %v", err)
+	}
+	_ = os.Remove(staged)
+
+	// Corrupt .sha256 sidecar must reject staging.
+	if err := os.WriteFile(binPath+".sha256", []byte(strings.Repeat("0", 64)+"  "+assetName+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := StageLocalPanelAsset(binPath, exeDir); err == nil || !strings.Contains(err.Error(), "SHA-256 mismatch") {
+		t.Fatalf("expected SHA-256 mismatch error, got: %v", err)
+	}
+
+	// Build a valid .tar.gz release bundle with VERSION + SHA256SUMS + binary.
+	bundlePath := filepath.Join(dir, "vpn-ui-2.0.0-linux-"+runtime.GOARCH+".tar.gz")
+	writeTarBundle := func(path string, checksumOverride string) {
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		gz := gzip.NewWriter(f)
+		defer gz.Close()
+		tw := tar.NewWriter(gz)
+		defer tw.Close()
+
+		sumHex := rawHex
+		if checksumOverride != "" {
+			sumHex = checksumOverride
+		}
+		entries := []struct {
+			name string
+			body []byte
+			mode int64
+		}{
+			{"VERSION", []byte("2.0.0\n"), 0o644},
+			{"SHA256SUMS", []byte(fmt.Sprintf("%s  %s\n", sumHex, assetName)), 0o644},
+			{assetName, elfData, 0o755},
+		}
+		for _, e := range entries {
+			hdr := &tar.Header{
+				Name: e.name,
+				Mode: e.mode,
+				Size: int64(len(e.body)),
+			}
+			if err := tw.WriteHeader(hdr); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tw.Write(e.body); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	writeTarBundle(bundlePath, "")
+	stagedTar, ver, err := StageLocalPanelAsset(bundlePath, exeDir)
+	if err != nil {
+		t.Fatalf("StageLocalPanelAsset(tar.gz): %v", err)
+	}
+	_ = os.Remove(stagedTar)
+	if ver != "2.0.0" {
+		t.Errorf("extracted bundle version = %q; want 2.0.0", ver)
+	}
+
+	badBundle := filepath.Join(dir, "bad.tar.gz")
+	writeTarBundle(badBundle, strings.Repeat("a", 64))
+	if _, _, err := StageLocalPanelAsset(badBundle, exeDir); err == nil || !strings.Contains(err.Error(), "SHA-256 mismatch") {
+		t.Fatalf("expected SHA-256 mismatch for corrupted tar.gz, got: %v", err)
+	}
 }

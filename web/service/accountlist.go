@@ -47,6 +47,15 @@ type AccountMembershipView struct {
 	// Clients page sent the email and every edit came back "empty client ID" for
 	// all but one protocol.
 	ClientId string `json:"clientId"`
+	Up       int64  `json:"up"`
+	Down     int64  `json:"down"`
+	Total    int64  `json:"total"`
+	AllTime  int64  `json:"allTime"`
+	Shared   bool   `json:"shared,omitempty"`
+	Flow     string `json:"flow,omitempty"`
+	// CanEnableTlsFlow reports whether this inbound accepts VLESS XTLS Vision flow
+	// (protocol == vless on tcp with tls or reality security).
+	CanEnableTlsFlow bool `json:"canEnableTlsFlow,omitempty"`
 }
 
 // AccountCredentials is the account's own credential columns, reported ONLY for an
@@ -220,6 +229,8 @@ func (s *AccountService) ListAccounts(user *model.User, page, size int, search, 
 		if needle != "" && !accountMatches(account, mine, needle) {
 			continue
 		}
+		rowMemberships := make([]AccountMembershipView, len(mine))
+		copy(rowMemberships, mine)
 		row := AccountRow{
 			Id: account.Id, Email: account.Email, Enable: account.Enable,
 			SubID: account.SubID, Comment: account.Comment,
@@ -227,9 +238,9 @@ func (s *AccountService) ListAccounts(user *model.User, page, size int, search, 
 			Reset: account.Reset, LimitIP: account.LimitIP, TgID: account.TgID,
 			SpeedLimitDown: account.SpeedLimitDown, SpeedLimitUp: account.SpeedLimitUp,
 			UserLimitOverride: account.UserLimitOverride,
-			Memberships:       mine, OwnedByReseller: owner[key],
+			Memberships:       rowMemberships, OwnedByReseller: owner[key],
 		}
-		if len(mine) == 0 {
+		if len(rowMemberships) == 0 {
 			// Nothing serves it, so no settings blob carries its credentials and this
 			// row is the only place the edit form can read them from.
 			row.Credentials = &AccountCredentials{
@@ -253,6 +264,7 @@ func (s *AccountService) ListAccounts(user *model.User, page, size int, search, 
 			row.Enable = t.Enable
 			row.TotalGB = t.Total
 			row.ExpiryTime = t.ExpiryTime
+			applyPooledBreakdownToMemberships(row.Memberships, t)
 		}
 		createdAt[account.Id] = account.CreatedAt
 		rows = append(rows, row)
@@ -373,11 +385,13 @@ func (s *AccountService) membershipViews() (map[int][]AccountMembershipView, err
 	// The settings blob of each inbound, so the protocol-correct identity can be
 	// read off the stored entry rather than guessed.
 	var full []model.Inbound
-	if err := db.Model(&model.Inbound{}).Select("id", "protocol", "settings").Find(&full).Error; err != nil {
+	if err := db.Model(&model.Inbound{}).Select("id", "protocol", "settings", "stream_settings").Find(&full).Error; err != nil {
 		return nil, err
 	}
+	fullById := make(map[int]*model.Inbound, len(full))
 	identityByInbound := make(map[int]map[string]string, len(full))
 	for i := range full {
+		fullById[full[i].Id] = &full[i]
 		clients, ok := parseSettingsClients(full[i].Settings)
 		if !ok {
 			continue
@@ -421,6 +435,11 @@ func (s *AccountService) membershipViews() (map[int][]AccountMembershipView, err
 			InboundId: inbound.Id, Protocol: string(inbound.Protocol),
 			Remark: inbound.Remark, Port: inbound.Port, Enable: inbound.Enable,
 			Slot: m.Slot,
+			Up: m.Up, Down: m.Down, Total: m.Up + m.Down, AllTime: m.AllTime,
+		}
+		if fullIn := fullById[inbound.Id]; fullIn != nil && inbound.Protocol == model.VLESS {
+			view.Flow = resolveVlessFlow(fullIn, m)
+			view.CanEnableTlsFlow = vlessFlowFitsStream(fullIn.StreamSettings)
 		}
 		if ids := identityByInbound[inbound.Id]; ids != nil {
 			view.ClientId = ids[accountKey(emailById[m.AccountId])]
@@ -428,6 +447,37 @@ func (s *AccountService) membershipViews() (map[int][]AccountMembershipView, err
 		out[m.AccountId] = append(out[m.AccountId], view)
 	}
 	return out, nil
+}
+
+// applyPooledBreakdownToMemberships folds any unattributed core remainder into
+// memberships whose protocol may carry core-counted traffic, mirroring
+// InboundService.attachClientStats so /panel/api/clients/list and
+// /panel/api/inbounds/list always show identical per-inbound numbers.
+func applyPooledBreakdownToMemberships(memberships []AccountMembershipView, traffic *xray.ClientTraffic) {
+	if len(memberships) == 0 || traffic == nil {
+		return
+	}
+	var sumUp, sumDown, sumAll int64
+	for i := range memberships {
+		sumUp += memberships[i].Up
+		sumDown += memberships[i].Down
+		sumAll += memberships[i].AllTime
+	}
+	pooledUp := max64(traffic.Up-sumUp, 0)
+	pooledDown := max64(traffic.Down-sumDown, 0)
+	pooledAll := max64(traffic.AllTime-sumAll, 0)
+	hasPooled := pooledUp+pooledDown+pooledAll > 0
+
+	for i := range memberships {
+		m := &memberships[i]
+		if hasPooled && mayHoldCoreTraffic(model.Protocol(m.Protocol)) {
+			m.Up += pooledUp
+			m.Down += pooledDown
+			m.AllTime += pooledAll
+			m.Shared = true
+		}
+		m.Total = m.Up + m.Down
+	}
 }
 
 // visibilityFilter returns the predicate deciding whether one account is the
@@ -530,7 +580,7 @@ func (s *AccountService) AssignableInboundsFor(user *model.User) ([]AccountMembe
 	db := database.GetDB()
 	var inbounds []model.Inbound
 	if err := db.Model(&model.Inbound{}).
-		Select("id", "protocol", "remark", "port", "enable", "settings").
+		Select("id", "protocol", "remark", "port", "enable", "settings", "stream_settings").
 		Order("id ASC").Find(&inbounds).Error; err != nil {
 		return nil, err
 	}
@@ -564,7 +614,9 @@ func (s *AccountService) AssignableInboundsFor(user *model.User) ([]AccountMembe
 		out = append(out, AccountMembershipView{
 			InboundId: in.Id, Protocol: string(in.Protocol),
 			Remark: in.Remark, Port: in.Port, Enable: in.Enable,
-			Method: inboundMethod(in.Settings),
+			Method:           inboundMethod(in.Settings),
+			Flow:             inboundVlessFlow(in),
+			CanEnableTlsFlow: in.Protocol == model.VLESS && vlessFlowFitsStream(in.StreamSettings),
 		})
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].InboundId < out[j].InboundId })

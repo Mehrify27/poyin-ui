@@ -177,6 +177,7 @@ func (s *SshOutboundService) Save(cfg SshOutboundConfig) (SshOutboundConfig, err
 		sshOutMgr.stop(cfg.Tag)
 		return cfg, err
 	}
+	syncSshOutboundToTemplate(cfg, false)
 	// The socks outbound fronting this tunnel is derived from the stored list at
 	// config-build time (XrayService.applySshOutbounds), so the core has to be
 	// rebuilt for the change to reach it.
@@ -230,6 +231,7 @@ func (s *SshOutboundService) Delete(tag string) error {
 	if err := s.persist(out); err != nil {
 		return err
 	}
+	syncSshOutboundToTemplate(SshOutboundConfig{Tag: tag}, true)
 	sshOutMgr.stop(tag)
 	// Drops the synthesized outbound too; see Save.
 	(&XrayService{}).SetToNeedRestart()

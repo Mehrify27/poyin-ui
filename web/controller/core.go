@@ -48,6 +48,9 @@ func (a *CoreController) initRouter(g *gin.RouterGroup) {
 	// Core Settings bit, since the same operator can already read the same text
 	// through the logs endpoint.
 	g.POST("/config/:core", requireSuperAdmin(), a.saveCoreConfig)
+	g.GET("/versions", a.versions)
+	g.POST("/update/:core", requireSuperAdmin(), a.updateCore)
+	g.POST("/rollback/:core", requireSuperAdmin(), a.rollbackCore)
 }
 
 // status returns the status of all cores plus the host/kernel system status and
@@ -253,4 +256,48 @@ func (a *CoreController) saveCoreConfig(c *gin.Context) {
 		// actually produced rather than against what it had before the save.
 		"targets": a.coreService.CoreConfigTargets(core),
 	}, nil)
+}
+
+type coreBinaryUpdateForm struct {
+	Version string `form:"version" json:"version"`
+	URL     string `form:"url" json:"url"`
+	File    string `form:"file" json:"file"`
+	SHA256  string `form:"sha256" json:"sha256"`
+}
+
+// versions returns active paths, sources (custom-override vs bundled), versions,
+// SHA-256 checksums, and backup availability for all managed sidecar binaries.
+func (a *CoreController) versions(c *gin.Context) {
+	jsonObj(c, gin.H{
+		"binaries": a.coreService.GetCoreBinaryInventory(),
+	}, nil)
+}
+
+// updateCore installs an independent core/sidecar binary update into the custom
+// override directory, verifies ELF arch and SHA-256, keeps a .bak backup, restarts
+// only the affected core, and automatically rolls back on health failure.
+func (a *CoreController) updateCore(c *gin.Context) {
+	var form coreBinaryUpdateForm
+	_ = c.ShouldBind(&form)
+	results, err := a.coreService.UpdateCore(service.CoreUpdateOptions{
+		Target:  c.Param("core"),
+		Version: form.Version,
+		URL:     form.URL,
+		File:    form.File,
+		SHA256:  form.SHA256,
+	})
+	jsonMsgObj(c, "Core binary update", gin.H{
+		"results":  results,
+		"binaries": a.coreService.GetCoreBinaryInventory(),
+	}, err)
+}
+
+// rollbackCore restores a sidecar binary from its .bak snapshot (or removes the
+// custom override to fall back to the bundled binary) and restarts only that core.
+func (a *CoreController) rollbackCore(c *gin.Context) {
+	res, err := a.coreService.RollbackCore(c.Param("core"), nil)
+	jsonMsgObj(c, "Core binary rollback", gin.H{
+		"result":   res,
+		"binaries": a.coreService.GetCoreBinaryInventory(),
+	}, err)
 }

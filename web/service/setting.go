@@ -131,6 +131,8 @@ var defaultValueMap = map[string]string{
 	"overviewAccessBackfilled": "false",
 	// Operator-configured SSH egress tunnels (JSON array); see web/service/sshoutbound.go.
 	"sshOutbounds": "",
+	// Operator-configured Hysteria 2 client egress tunnels (JSON array); see web/service/hysteria2_outbound.go.
+	"hy2Outbounds": "",
 	// Operator-configured VPN client tunnels used as egress (JSON array); see
 	// web/service/vpnoutbound.go. Declared here because getString treats a key absent
 	// from this map as an ERROR rather than as "unset": until the first save writes a

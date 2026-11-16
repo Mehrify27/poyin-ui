@@ -4,7 +4,9 @@ import (
 	_ "embed"
 	"encoding/json"
 	"strings"
+	"sync"
 
+	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/util/common"
 	"github.com/mhsanaei/3x-ui/v2/xray"
@@ -161,4 +163,217 @@ func UnwrapXrayTemplateConfig(raw string) string {
 		raw = unwrapped
 	}
 	return raw
+}
+
+var templateOutboundSyncMu sync.Mutex
+
+func buildVpnTemplateOutboundRow(t VpnOutboundConfig, existing map[string]any) map[string]any {
+	row := make(map[string]any, len(existing)+4)
+	for k, v := range existing {
+		row[k] = v
+	}
+	delete(row, "mux")
+	row["tag"] = t.Tag
+	row["protocol"] = "freedom"
+	row["settings"] = map[string]any{"domainStrategy": "UseIP"}
+	stream := vpnOutStreamSettings(t.Tag, t.Via, row["streamSettings"], t.Iface)
+	if via := strings.TrimSpace(t.Via); via != "" {
+		if sockopt, ok := stream["sockopt"].(map[string]any); ok {
+			sockopt["dialerProxy"] = via
+		}
+	}
+	row["streamSettings"] = stream
+	return row
+}
+
+func buildLoopbackSocksTemplateRow(tag string, socksPort int) map[string]any {
+	return map[string]any{
+		"tag":      tag,
+		"protocol": "socks",
+		"settings": map[string]any{
+			"servers": []any{map[string]any{"address": "127.0.0.1", "port": socksPort}},
+		},
+	}
+}
+
+func buildSshTemplateOutboundRow(t SshOutboundConfig) map[string]any {
+	return buildLoopbackSocksTemplateRow(t.Tag, t.SocksPort)
+}
+
+func buildHy2TemplateOutboundRow(t Hysteria2OutboundConfig) map[string]any {
+	return buildLoopbackSocksTemplateRow(t.Tag, t.SocksPort)
+}
+
+func upsertTemplateOutbound(obs []map[string]any, tag string, build func(existing map[string]any) map[string]any) ([]map[string]any, bool) {
+	for i, existing := range obs {
+		if t, _ := existing["tag"].(string); t == tag {
+			obs[i] = build(existing)
+			return obs, true
+		}
+	}
+	return append(obs, build(nil)), true
+}
+
+func removeTemplateOutbound(obs []map[string]any, tag string) ([]map[string]any, bool) {
+	filtered := make([]map[string]any, 0, len(obs))
+	removed := false
+	for _, ob := range obs {
+		if t, _ := ob["tag"].(string); t == tag {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, ob)
+	}
+	if !removed {
+		return obs, false
+	}
+	return filtered, true
+}
+
+// ReconcileXrayTemplateOutbounds ensures stored VPN, SSH, and Hysteria 2 outbounds appear in
+// the Xray template outbounds slice so the UI and runtime config never diverge.
+func ReconcileXrayTemplateOutbounds(raw string) string {
+	if database.GetDB() == nil {
+		return raw
+	}
+	return reconcileXrayTemplateOutboundsFull(raw, (&VpnOutboundService{}).List(), (&SshOutboundService{}).List(), (&Hysteria2OutboundService{}).List())
+}
+
+func reconcileXrayTemplateOutboundsWith(raw string, vpnTunnels []VpnOutboundConfig, sshTunnels []SshOutboundConfig) string {
+	return reconcileXrayTemplateOutboundsFull(raw, vpnTunnels, sshTunnels, nil)
+}
+
+func reconcileXrayTemplateOutboundsFull(raw string, vpnTunnels []VpnOutboundConfig, sshTunnels []SshOutboundConfig, hy2Tunnels []Hysteria2OutboundConfig) string {
+	if strings.TrimSpace(raw) == "" || (len(vpnTunnels) == 0 && len(sshTunnels) == 0 && len(hy2Tunnels) == 0) {
+		return raw
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &top); err != nil || top == nil {
+		return raw
+	}
+	var obs []map[string]any
+	if obRaw, ok := top["outbounds"]; ok && len(obRaw) > 0 && string(obRaw) != "null" {
+		if err := json.Unmarshal(obRaw, &obs); err != nil {
+			return raw
+		}
+	}
+	beforeBytes, _ := json.Marshal(obs)
+	for _, t := range sshTunnels {
+		if t.Tag == "" || t.SocksPort <= 0 {
+			continue
+		}
+		obs, _ = upsertTemplateOutbound(obs, t.Tag, func(_ map[string]any) map[string]any {
+			return buildSshTemplateOutboundRow(t)
+		})
+	}
+	for _, t := range hy2Tunnels {
+		if t.Tag == "" || t.SocksPort <= 0 {
+			continue
+		}
+		obs, _ = upsertTemplateOutbound(obs, t.Tag, func(_ map[string]any) map[string]any {
+			return buildHy2TemplateOutboundRow(t)
+		})
+	}
+	for _, t := range vpnTunnels {
+		if t.Tag == "" || !t.Enable || t.Iface == "" {
+			continue
+		}
+		obs, _ = upsertTemplateOutbound(obs, t.Tag, func(existing map[string]any) map[string]any {
+			return buildVpnTemplateOutboundRow(t, existing)
+		})
+	}
+	afterBytes, err := json.Marshal(obs)
+	if err != nil || string(beforeBytes) == string(afterBytes) {
+		return raw
+	}
+	top["outbounds"] = afterBytes
+	out, err := json.MarshalIndent(top, "", "  ")
+	if err != nil {
+		return raw
+	}
+	return string(out)
+}
+
+func syncXrayTemplateOutbound(tag string, remove bool, build func(existing map[string]any) (map[string]any, bool)) {
+	if strings.TrimSpace(tag) == "" || database.GetDB() == nil {
+		return
+	}
+	templateOutboundSyncMu.Lock()
+	defer templateOutboundSyncMu.Unlock()
+
+	var settingService SettingService
+	raw, err := settingService.GetXrayConfigTemplate()
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return
+	}
+	raw = UnwrapXrayTemplateConfig(raw)
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &top); err != nil || top == nil {
+		return
+	}
+	var obs []map[string]any
+	if obRaw, ok := top["outbounds"]; ok && len(obRaw) > 0 && string(obRaw) != "null" {
+		if err := json.Unmarshal(obRaw, &obs); err != nil {
+			return
+		}
+	}
+	changed := false
+	if remove {
+		obs, changed = removeTemplateOutbound(obs, tag)
+	} else if build != nil {
+		var existing map[string]any
+		for _, ob := range obs {
+			if t, _ := ob["tag"].(string); t == tag {
+				existing = ob
+				break
+			}
+		}
+		if row, ok := build(existing); ok {
+			obs, changed = upsertTemplateOutbound(obs, tag, func(_ map[string]any) map[string]any {
+				return row
+			})
+		}
+	}
+	if !changed {
+		return
+	}
+	obBytes, err := json.Marshal(obs)
+	if err != nil {
+		return
+	}
+	top["outbounds"] = obBytes
+	updated, err := json.MarshalIndent(top, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := settingService.saveSetting("xrayTemplateConfig", string(updated)); err != nil {
+		logger.Warning("failed to sync outbound", tag, "into xrayTemplateConfig:", err)
+	}
+}
+
+func syncVpnOutboundToTemplate(cfg VpnOutboundConfig, remove bool) {
+	if !remove && (!cfg.Enable || cfg.Iface == "") {
+		return
+	}
+	syncXrayTemplateOutbound(cfg.Tag, remove, func(existing map[string]any) (map[string]any, bool) {
+		return buildVpnTemplateOutboundRow(cfg, existing), true
+	})
+}
+
+func syncSshOutboundToTemplate(cfg SshOutboundConfig, remove bool) {
+	if !remove && cfg.SocksPort <= 0 {
+		return
+	}
+	syncXrayTemplateOutbound(cfg.Tag, remove, func(_ map[string]any) (map[string]any, bool) {
+		return buildSshTemplateOutboundRow(cfg), true
+	})
+}
+
+func syncHy2OutboundToTemplate(cfg Hysteria2OutboundConfig, remove bool) {
+	if !remove && cfg.SocksPort <= 0 {
+		return
+	}
+	syncXrayTemplateOutbound(cfg.Tag, remove, func(_ map[string]any) (map[string]any, bool) {
+		return buildHy2TemplateOutboundRow(cfg), true
+	})
 }

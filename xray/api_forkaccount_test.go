@@ -74,7 +74,21 @@ func TestForkAccountMatchesProtobufEncoding(t *testing.T) {
 func TestNaiveAccountFieldNumbersMatchTheCore(t *testing.T) {
 	src, err := os.ReadFile(filepath.Join("..", "third_party", "Xray-core", "proxy", "naive", "config.pb.go"))
 	if err != nil {
-		t.Skip("core submodule not checked out:", err)
+		// Upstream Xray-core does not carry proxy/naive directly; read it from our patch bundle.
+		src, err = os.ReadFile(filepath.Join("..", "patches", "xray", "05-anytls-tuic-naive.patch"))
+		if err != nil {
+			t.Skip("neither core submodule nor naive patch is available:", err)
+		}
+		marker := "+++ b/proxy/naive/config.pb.go"
+		idx := strings.Index(string(src), marker)
+		if idx < 0 {
+			t.Fatal("05-anytls-tuic-naive.patch missing proxy/naive/config.pb.go")
+		}
+		tail := string(src)[idx:]
+		if next := strings.Index(tail[len(marker):], "\ndiff --git "); next >= 0 {
+			tail = tail[:len(marker)+next]
+		}
+		src = []byte(tail)
 	}
 
 	// `protobuf:"bytes,2,opt,name=username,proto3"`

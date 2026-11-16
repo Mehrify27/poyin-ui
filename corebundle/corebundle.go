@@ -30,6 +30,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/mhsanaei/3x-ui/v2/logger"
+	"github.com/mhsanaei/3x-ui/v2/util/binutil"
 )
 
 // bundleFS holds the pinned core binary + base geo files. The `all:` prefix
@@ -85,6 +88,22 @@ func HasXray() bool {
 	}
 	_ = f.Close()
 	return true
+}
+
+// ResolveXrayBinaryPath returns the effective Xray binary path: any valid ELF
+// override under binutil.CustomBinDir() ("xray-<goos>-<goarch>" or "xray")
+// wins over the bundled/extracted copy inside binDir, falling back safely if
+// an override file is missing, non-executable, or invalid.
+func ResolveXrayBinaryPath(binDir string) string {
+	if p, warnErr := binutil.ResolveCustomBinary(XrayBinaryName(), "xray"); warnErr != nil || p != "" {
+		if warnErr != nil {
+			logger.Warning(warnErr)
+		}
+		if p != "" {
+			return p
+		}
+	}
+	return filepath.Join(binDir, XrayBinaryName())
 }
 
 // ExtractXray writes the bundled core binary into binDir as XrayBinaryName(),

@@ -5,6 +5,7 @@ const Protocols = {
     SHADOWSOCKS: 'shadowsocks',
     WIREGUARD: 'wireguard',
     HYSTERIA: 'hysteria',
+    HYSTERIA2: 'hysteria2',
     ANYTLS: 'anytls',
     TUIC: 'tuic',
     NAIVE: 'naive',
@@ -67,12 +68,7 @@ function getClientIdentity(protocol, client) {
         case Protocols.SHADOWSOCKS:
             return client.email;
         case Protocols.HYSTERIA:
-        // 'hysteria2' has no Protocols constant because the inbound form cannot
-        // create one, but the server knows it (model.Hysteria2) and an inbound
-        // made through the API shows up on every page that lists them. Left to the
-        // default it would be keyed on `id`, which a hysteria account does not
-        // have, and every write against it would answer "empty client ID".
-        case 'hysteria2':
+        case Protocols.HYSTERIA2:
             return client.auth;
         // Spelled out rather than left to the default below: a TUIC account carries
         // BOTH a uuid and a password, so which of the two addresses it has to be a
@@ -95,7 +91,8 @@ const ProtocolLabels = {
     trojan: 'Trojan',
     shadowsocks: 'Shadowsocks',
     wireguard: 'WireGuard (Xray)',
-    hysteria: 'Hysteria',
+    hysteria: 'Hysteria (Xray)',
+    hysteria2: 'Hysteria 2',
     anytls: 'AnyTLS',
     tuic: 'TUIC',
     naive: 'NaiveProxy',
@@ -2204,6 +2201,7 @@ class Inbound extends XrayCommonClass {
             case Protocols.TROJAN: return this.settings.trojans;
             case Protocols.SHADOWSOCKS: return this.isSSMultiUser ? this.settings.shadowsockses : null;
             case Protocols.HYSTERIA: return this.settings.hysterias;
+            case Protocols.HYSTERIA2: return this.settings.hysteria2s;
             case Protocols.ANYTLS: return this.settings.anytlses;
             case Protocols.TUIC: return this.settings.tuics;
             case Protocols.NAIVE: return this.settings.naives;
@@ -2517,6 +2515,9 @@ class Inbound extends XrayCommonClass {
 
     genVLESSLink(address = '', port = this.port, forceTls, remark = '', clientId, flow) {
         const uuid = clientId;
+        const effectiveFlow = !ObjectUtil.isEmpty(flow)
+            ? flow
+            : (this.canEnableTlsFlow() && this.settings ? this.settings.flow : '');
         const type = this.stream.network;
         const security = forceTls == 'same' ? this.stream.security : forceTls;
         const params = new Map();
@@ -2581,8 +2582,8 @@ class Inbound extends XrayCommonClass {
                 if (this.stream.tls.settings.echConfigList?.length > 0) {
                     params.set("ech", this.stream.tls.settings.echConfigList);
                 }
-                if (type == "tcp" && !ObjectUtil.isEmpty(flow)) {
-                    params.set("flow", flow);
+                if (type == "tcp" && !ObjectUtil.isEmpty(effectiveFlow)) {
+                    params.set("flow", effectiveFlow);
                 }
             }
         }
@@ -2603,8 +2604,8 @@ class Inbound extends XrayCommonClass {
             if (!ObjectUtil.isEmpty(this.stream.reality.settings.mldsa65Verify)) {
                 params.set("pqv", this.stream.reality.settings.mldsa65Verify);
             }
-            if (type == 'tcp' && !ObjectUtil.isEmpty(flow)) {
-                params.set("flow", flow);
+            if (type == 'tcp' && !ObjectUtil.isEmpty(effectiveFlow)) {
+                params.set("flow", effectiveFlow);
             }
         }
 
@@ -2845,6 +2846,29 @@ class Inbound extends XrayCommonClass {
         return url.toString();
     }
 
+    genHysteria2Link(address = '', port = this.port, remark = '', clientAuth = '') {
+        const s = this.settings || {};
+        const host = address.includes(':') && !address.startsWith('[') ? `[${address}]` : address;
+        const link = `hysteria2://${Inbound.encodeUserinfo(clientAuth)}@${host}:${port}`;
+        const params = new Map();
+        const alpnList = Array.isArray(s.alpn) ? s.alpn.filter(Boolean) : [];
+        if (alpnList.length > 0) params.set('alpn', alpnList.join(','));
+        if (s.fingerprint) params.set('fp', s.fingerprint);
+        if (s.allowInsecure) params.set('insecure', '1');
+        if (s.hopPorts) params.set('mport', s.hopPorts);
+        if (String(s.obfsType || '').toLowerCase() === 'salamander' && s.obfsPassword) {
+            params.set('obfs', 'salamander');
+            params.set('obfs-password', s.obfsPassword);
+        }
+        if (s.pinSHA256) params.set('pinSHA256', s.pinSHA256);
+        if (s.serverName) params.set('sni', s.serverName);
+        const url = new URL(link);
+        for (const [key, value] of [...params].sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)) {
+            url.searchParams.set(key, value);
+        }
+        url.hash = encodeURIComponent(remark);
+        return url.toString();
+    }
     // The three generators below are each written a SECOND time in Go, for the
     // subscription endpoint (sub/subService.go genAnytlsLink / genTuicLink /
     // genNaiveLink). The goal is that an account gets the same bytes from the panel's
@@ -3043,6 +3067,8 @@ class Inbound extends XrayCommonClass {
                 return this.genTrojanLink(address, port, forceTls, remark, client.password);
             case Protocols.HYSTERIA:
                 return this.genHysteriaLink(address, port, remark, client.auth.length > 0 ? client.auth : this.stream.hysteria.auth);
+            case Protocols.HYSTERIA2:
+                return this.genHysteria2Link(address, port, remark, client.auth || client.password || '');
             case Protocols.ANYTLS:
                 return this.genAnytlsLink(address, port, forceTls, remark, client.password);
             case Protocols.TUIC:
@@ -3082,19 +3108,26 @@ class Inbound extends XrayCommonClass {
             'e': email,
             'o': '',
         };
-        if (ObjectUtil.isArrEmpty(this.stream.externalProxy)) {
-            let r = orderChars.split('').map(char => orders[char]).filter(x => x.length > 0).join(separationChar);
+        const extProxies = !ObjectUtil.isArrEmpty(this.stream?.externalProxy)
+            ? this.stream.externalProxy
+            : (!ObjectUtil.isArrEmpty(this.settings?.externalProxy) ? this.settings.externalProxy : []);
+        if (extProxies.length === 0) {
+            let r = orderChars.split('').map(char => orders[char]).filter(x => x && x.length > 0).join(separationChar);
             result.push({
                 remark: r,
                 link: this.genLink(addr, port, 'same', r, client)
             });
         } else {
-            this.stream.externalProxy.forEach((ep) => {
-                orders['o'] = ep.remark;
-                let r = orderChars.split('').map(char => orders[char]).filter(x => x.length > 0).join(separationChar);
+            extProxies.forEach((ep) => {
+                const epDest = (ep && ep.dest && String(ep.dest).trim()) ? String(ep.dest).trim() : addr;
+                const epPortNum = Number(ep && ep.port);
+                const epPort = (Number.isFinite(epPortNum) && epPortNum > 0) ? epPortNum : port;
+                const epForceTls = (ep && ep.forceTls) ? ep.forceTls : 'same';
+                orders['o'] = (ep && ep.remark) ? String(ep.remark) : '';
+                let r = orderChars.split('').map(char => orders[char]).filter(x => x && x.length > 0).join(separationChar);
                 result.push({
                     remark: r,
-                    link: this.genLink(ep.dest, ep.port, ep.forceTls, r, client)
+                    link: this.genLink(epDest, epPort, epForceTls, r, client)
                 });
             });
         }
@@ -3168,6 +3201,9 @@ class Inbound extends XrayCommonClass {
         // cannot carry it was never doing anything.
         if (json.protocol === Protocols.VLESS && inbound.settings && !inbound.canEnableTlsFlow()) {
             inbound.settings.flow = '';
+            if (Array.isArray(inbound.settings.vlesses)) {
+                inbound.settings.vlesses.forEach(c => { c.flow = ''; });
+            }
         }
         return inbound;
     }
@@ -3208,6 +3244,7 @@ Inbound.Settings = class extends XrayCommonClass {
             case Protocols.WIREGUARD: return new Inbound.WireguardSettings(protocol);
             case Protocols.TUN: return new Inbound.TunSettings(protocol);
             case Protocols.HYSTERIA: return new Inbound.HysteriaSettings(protocol);
+            case Protocols.HYSTERIA2: return new Inbound.Hysteria2Settings(protocol);
             case Protocols.ANYTLS: return new Inbound.AnytlsSettings(protocol);
             case Protocols.TUIC: return new Inbound.TuicSettings(protocol);
             case Protocols.NAIVE: return new Inbound.NaiveSettings(protocol);
@@ -3238,6 +3275,7 @@ Inbound.Settings = class extends XrayCommonClass {
             case Protocols.WIREGUARD: return Inbound.WireguardSettings.fromJson(json);
             case Protocols.TUN: return Inbound.TunSettings.fromJson(json);
             case Protocols.HYSTERIA: return Inbound.HysteriaSettings.fromJson(json);
+            case Protocols.HYSTERIA2: return Inbound.Hysteria2Settings.fromJson(json);
             case Protocols.ANYTLS: return Inbound.AnytlsSettings.fromJson(json);
             case Protocols.TUIC: return Inbound.TuicSettings.fromJson(json);
             case Protocols.NAIVE: return Inbound.NaiveSettings.fromJson(json);
@@ -3499,6 +3537,9 @@ Inbound.VLESSSettings = class extends Inbound.Settings {
 
 
     toJson() {
+        if (!this.flow && this.vlesses && this.vlesses.length === 1 && this.vlesses[0].flow) {
+            this.flow = this.vlesses[0].flow;
+        }
         const json = {
             clients: Inbound.VLESSSettings.toJsonArray(this.vlesses),
         };
@@ -3532,7 +3573,7 @@ Inbound.VLESSSettings = class extends Inbound.Settings {
             json.flow = this.flow;
         }
         json.clients.forEach(client => {
-            client.flow = this.flow || '';
+            client.flow = client.flow || this.flow || '';
         });
 
         // Only include testseed when the inbound is actually using a flow. Asking the
@@ -3815,6 +3856,141 @@ Inbound.HysteriaSettings.Hysteria = class extends Inbound.ClientBase {
     static fromJson(json = {}) {
         return new Inbound.HysteriaSettings.Hysteria(
             json.auth,
+            ...Inbound.ClientBase.commonArgsFromJson(json),
+        );
+    }
+};
+
+Inbound.Hysteria2Settings = class extends Inbound.Settings {
+    constructor(
+        protocol = Protocols.HYSTERIA2,
+        upMbps = 0,
+        downMbps = 0,
+        ignoreClientBandwidth = false,
+        obfsType = '',
+        obfsPassword = '',
+        masquerade = '',
+        routeThroughXray = true,
+        userLimit = 1,
+        userLimitStrategy = 'accept',
+        serverName = '',
+        alpn = ['h3'],
+        tlsUseFile = false,
+        certificateFile = '',
+        keyFile = '',
+        certificate = '',
+        key = '',
+        allowInsecure = false,
+        fingerprint = '',
+        pinSHA256 = '',
+        hopPorts = '',
+        hopInterval = '',
+        externalProxy = [],
+        hysteria2s = [new Inbound.Hysteria2Settings.Hysteria2Client()],
+    ) {
+        super(protocol);
+        this.upMbps = upMbps;
+        this.downMbps = downMbps;
+        this.ignoreClientBandwidth = ignoreClientBandwidth;
+        this.obfsType = obfsType;
+        this.obfsPassword = obfsPassword;
+        this.masquerade = masquerade;
+        this.routeThroughXray = routeThroughXray;
+        this.userLimit = userLimit;
+        this.userLimitStrategy = userLimitStrategy;
+        this.serverName = serverName;
+        this.alpn = Array.isArray(alpn) && alpn.length ? alpn : ['h3'];
+        this.tlsUseFile = tlsUseFile;
+        this.certificateFile = certificateFile;
+        this.keyFile = keyFile;
+        this.certificate = certificate;
+        this.key = key;
+        this.allowInsecure = allowInsecure;
+        this.fingerprint = fingerprint;
+        this.pinSHA256 = pinSHA256;
+        this.hopPorts = hopPorts;
+        this.hopInterval = hopInterval;
+        this.externalProxy = Array.isArray(externalProxy) ? externalProxy : [];
+        this.hysteria2s = hysteria2s;
+    }
+
+    static fromJson(json = {}) {
+        return new Inbound.Hysteria2Settings(
+            Protocols.HYSTERIA2,
+            json.upMbps ?? 0,
+            json.downMbps ?? 0,
+            !!json.ignoreClientBandwidth,
+            json.obfsType ?? '',
+            json.obfsPassword ?? '',
+            json.masquerade ?? '',
+            json.routeThroughXray ?? true,
+            json.userLimit ?? 1,
+            json.userLimitStrategy ?? 'accept',
+            json.serverName ?? '',
+            Array.isArray(json.alpn) && json.alpn.length ? json.alpn : ['h3'],
+            json.tlsUseFile ?? !!(json.certificateFile || json.certFile),
+            json.certificateFile ?? json.certFile ?? '',
+            json.keyFile ?? '',
+            json.certificate ?? '',
+            json.key ?? '',
+            !!json.allowInsecure,
+            json.fingerprint ?? '',
+            json.pinSHA256 ?? '',
+            json.hopPorts ?? '',
+            json.hopInterval ?? '',
+            Array.isArray(json.externalProxy) ? json.externalProxy : [],
+            (json.clients || []).map(client => Inbound.Hysteria2Settings.Hysteria2Client.fromJson(client)),
+        );
+    }
+
+    toJson() {
+        return {
+            upMbps: Number(this.upMbps) || 0,
+            downMbps: Number(this.downMbps) || 0,
+            ignoreClientBandwidth: !!this.ignoreClientBandwidth,
+            obfsType: this.obfsType || '',
+            obfsPassword: this.obfsPassword || '',
+            masquerade: this.masquerade || '',
+            routeThroughXray: this.routeThroughXray !== false,
+            userLimit: this.userLimit ?? 1,
+            userLimitStrategy: this.userLimitStrategy || 'accept',
+            serverName: this.serverName || '',
+            alpn: Array.isArray(this.alpn) && this.alpn.length ? this.alpn : ['h3'],
+            tlsUseFile: !!this.tlsUseFile,
+            certificateFile: this.certificateFile || '',
+            keyFile: this.keyFile || '',
+            certificate: this.certificate || '',
+            key: this.key || '',
+            allowInsecure: !!this.allowInsecure,
+            fingerprint: this.fingerprint || '',
+            pinSHA256: this.pinSHA256 || '',
+            hopPorts: this.hopPorts || '',
+            hopInterval: this.hopInterval || '',
+            externalProxy: Array.isArray(this.externalProxy) ? this.externalProxy : [],
+            clients: Inbound.Hysteria2Settings.toJsonArray(this.hysteria2s),
+        };
+    }
+};
+
+Inbound.Hysteria2Settings.Hysteria2Client = class extends Inbound.ClientBase {
+    constructor(
+        auth = RandomUtil.randomSeq(10),
+        email, limitIp, totalGB, expiryTime, enable, tgId, subId, comment, reset, created_at, updated_at,
+    ) {
+        super(email, limitIp, totalGB, expiryTime, enable, tgId, subId, comment, reset, created_at, updated_at);
+        this.auth = auth;
+    }
+
+    toJson() {
+        return {
+            auth: this.auth,
+            ...this._clientBaseToJson(),
+        };
+    }
+
+    static fromJson(json = {}) {
+        return new Inbound.Hysteria2Settings.Hysteria2Client(
+            json.auth ?? json.password ?? '',
             ...Inbound.ClientBase.commonArgsFromJson(json),
         );
     }
@@ -4519,6 +4695,7 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
     tlsCryptFile = "",
     tlsCryptEnable = true,
     friendlyName = "",
+    customConfig = "",
   ) {
     super(protocol);
     this.udpEnable = udpEnable;
@@ -4543,6 +4720,7 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
     // Profile name written into the exported .ovpn as `setenv FRIENDLY_NAME`,
     // which is what OpenVPN Connect lists the imported profile under.
     this.friendlyName = friendlyName;
+    this.customConfig = customConfig;
     this.dns1 = dns1;
     this.dns2 = dns2;
     this.mtu = mtu;
@@ -4601,6 +4779,7 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
       json.tlsCryptFile ?? "",
       json.tlsCryptEnable ?? true,
       json.friendlyName ?? "",
+      json.customConfig ?? "",
     );
   }
 
@@ -4617,6 +4796,7 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
       tlsCryptFile: this.tlsCryptFile,
       tlsCryptEnable: this.tlsCryptEnable,
       friendlyName: this.friendlyName,
+      customConfig: this.customConfig,
       dns1: this.dns1,
       dns2: this.dns2,
       mtu: this.mtu,
@@ -4839,6 +5019,7 @@ Inbound.OcservSettings = class extends Inbound.Settings {
     ipRanges = [],
     userLimit = 10,
     userLimitStrategy = "accept",
+    customConfig = "",
   ) {
     super(protocol);
     this.dns1 = dns1;
@@ -4861,6 +5042,7 @@ Inbound.OcservSettings = class extends Inbound.Settings {
     this.ipRanges = ipRanges;
     this.userLimit = userLimit;
     this.userLimitStrategy = userLimitStrategy;
+    this.customConfig = customConfig;
   }
 
   static fromJson(json = {}) {
@@ -4882,6 +5064,7 @@ Inbound.OcservSettings = class extends Inbound.Settings {
       Array.isArray(json.ipRanges) ? json.ipRanges.slice() : [],
       json.userLimit ?? 1,
       json.userLimitStrategy ?? "accept",
+      json.customConfig ?? "",
     );
   }
 
@@ -4903,6 +5086,7 @@ Inbound.OcservSettings = class extends Inbound.Settings {
       ipRanges: this.ipRanges || [],
       userLimit: this.userLimit,
       userLimitStrategy: this.userLimitStrategy,
+      customConfig: this.customConfig,
     };
   }
 };
@@ -5695,15 +5879,23 @@ Inbound.AwgSettings = class extends Inbound.Settings {
     dns1 = "1.1.1.1",
     dns2 = "1.0.0.1",
     mtu = 1420,
+    backend = "auto",
     jc = 4,
     jmin = 8,
     jmax = 80,
     s1 = 77,
     s2 = 90,
+    s3 = 0,
+    s4 = 0,
     h1 = "",
     h2 = "",
     h3 = "",
     h4 = "",
+    i1 = "",
+    i2 = "",
+    i3 = "",
+    i4 = "",
+    i5 = "",
     serverPrivKey = "",
     serverPubKey = "",
     pskEnable = false,
@@ -5724,17 +5916,26 @@ Inbound.AwgSettings = class extends Inbound.Settings {
     this.dns1 = dns1;
     this.dns2 = dns2;
     this.mtu = mtu;
-    // AWG 1.0 obfuscation. Junk/size params (numbers) are editable; magic headers
-    // H1-H4 (strings) are backend-minted and shown read-only, like serverPubKey.
+    this.backend = backend;
+    // AWG 1.0/1.5/2.0 obfuscation. Junk/size params (numbers) are editable; magic
+    // headers H1-H4 may be scalar integers (minted automatically if empty) or
+    // AWG 2.0 "min-max" non-overlapping ranges; I1-I5 are optional CPS packets.
     this.jc = jc;
     this.jmin = jmin;
     this.jmax = jmax;
     this.s1 = s1;
     this.s2 = s2;
+    this.s3 = s3;
+    this.s4 = s4;
     this.h1 = h1;
     this.h2 = h2;
     this.h3 = h3;
     this.h4 = h4;
+    this.i1 = i1;
+    this.i2 = i2;
+    this.i3 = i3;
+    this.i4 = i4;
+    this.i5 = i5;
     // Backend-generated server keypair. Read-only in the UI (never minted client-side).
     this.serverPrivKey = serverPrivKey;
     this.serverPubKey = serverPubKey;
@@ -5758,15 +5959,23 @@ Inbound.AwgSettings = class extends Inbound.Settings {
       json.dns1 ?? "1.1.1.1",
       json.dns2 ?? "1.0.0.1",
       json.mtu ?? 1420,
+      json.backend ?? "auto",
       json.jc ?? 4,
       json.jmin ?? 8,
       json.jmax ?? 80,
       json.s1 ?? 77,
       json.s2 ?? 90,
+      json.s3 ?? 0,
+      json.s4 ?? 0,
       json.h1 ?? "",
       json.h2 ?? "",
       json.h3 ?? "",
       json.h4 ?? "",
+      json.i1 ?? "",
+      json.i2 ?? "",
+      json.i3 ?? "",
+      json.i4 ?? "",
+      json.i5 ?? "",
       json.serverPrivKey ?? "",
       json.serverPubKey ?? "",
       json.pskEnable ?? false,
@@ -5785,15 +5994,23 @@ Inbound.AwgSettings = class extends Inbound.Settings {
       dns1: this.dns1,
       dns2: this.dns2,
       mtu: this.mtu,
+      backend: this.backend,
       jc: this.jc,
       jmin: this.jmin,
       jmax: this.jmax,
       s1: this.s1,
       s2: this.s2,
+      s3: this.s3,
+      s4: this.s4,
       h1: this.h1,
       h2: this.h2,
       h3: this.h3,
       h4: this.h4,
+      i1: this.i1,
+      i2: this.i2,
+      i3: this.i3,
+      i4: this.i4,
+      i5: this.i5,
       serverPrivKey: this.serverPrivKey,
       serverPubKey: this.serverPubKey,
       pskEnable: this.pskEnable,

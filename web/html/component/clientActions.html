@@ -796,11 +796,14 @@
             dbInbound._clientStatsMap = new Map();
             if (dbInbound.clientStats && Array.isArray(dbInbound.clientStats)) {
                 for (const stats of dbInbound.clientStats) {
-                    dbInbound._clientStatsMap.set(stats.email, stats);
+                    const key = String(stats.email || '').trim().toLowerCase();
+                    if (key) dbInbound._clientStatsMap.set(key, stats);
                 }
             }
         }
-        return dbInbound._clientStatsMap.get(email);
+        const lookup = String(email || '').trim().toLowerCase();
+        if (!lookup) return null;
+        return dbInbound._clientStatsMap.get(lookup) || dbInbound._clientStatsMap.get(email) || null;
       },
       getUpStats(dbInbound, email) {
         if (!email || email.length == 0) return 0;

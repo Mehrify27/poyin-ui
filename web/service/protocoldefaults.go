@@ -287,22 +287,32 @@ func protocolSettingDefaults(protocol model.Protocol) []settingDefault {
 		}
 
 	case model.AWG:
-		// Inbound.AwgSettings: WgcSettings plus the AWG 1.0 obfuscation parameters.
-		// Jc/Jmin/Jmax/S1/S2 are the AmneziaWG defaults; the magic headers H1-H4 are
-		// minted by AwgService (like serverPubKey) and start empty.
+		// Inbound.AwgSettings: WgcSettings plus the AWG 1.0/1.5/2.0 obfuscation parameters.
+		// Backend defaults to "auto" (prefers kernel module unless absent or AWG 1.5/2.0
+		// features require userspace amneziawg-go). Jc/Jmin/Jmax/S1..S4 are the junk and
+		// padding knobs; H1-H4 are scalar or min-max ranges minted/configured on the
+		// server; I1-I5 are optional CPS signature packets.
 		return []settingDefault{
 			def("dns1", "1.1.1.1"),
 			def("dns2", "1.0.0.1"),
 			def("mtu", 1420),
+			def("backend", AwgBackendAuto),
 			def("jc", 4),
 			def("jmin", 8),
 			def("jmax", 80),
 			def("s1", 77),
 			def("s2", 90),
+			def("s3", 0),
+			def("s4", 0),
 			def("h1", ""),
 			def("h2", ""),
 			def("h3", ""),
 			def("h4", ""),
+			def("i1", ""),
+			def("i2", ""),
+			def("i3", ""),
+			def("i4", ""),
+			def("i5", ""),
 			def("serverPrivKey", ""),
 			def("serverPubKey", ""),
 			def("pskEnable", false),
@@ -428,6 +438,33 @@ func protocolSettingDefaults(protocol model.Protocol) []settingDefault {
 				"url":    "",
 				"string": "",
 			}),
+		}
+
+	case model.Hysteria2:
+		return []settingDefault{
+			def("clients", noClients()),
+			def("upMbps", 0),
+			def("downMbps", 0),
+			def("ignoreClientBandwidth", false),
+			def("obfsType", ""),
+			def("obfsPassword", ""),
+			def("masquerade", ""),
+			def("routeThroughXray", true),
+			def("userLimit", 0),
+			def("userLimitStrategy", "accept"),
+			def("serverName", ""),
+			def("alpn", []string{"h3"}),
+			def("tlsUseFile", false),
+			def("certificateFile", ""),
+			def("keyFile", ""),
+			def("certificate", ""),
+			def("key", ""),
+			def("allowInsecure", false),
+			def("fingerprint", ""),
+			def("pinSHA256", ""),
+			def("hopPorts", ""),
+			def("hopInterval", ""),
+			def("externalProxy", emptyList()),
 		}
 	}
 	return nil

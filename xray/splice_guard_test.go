@@ -54,8 +54,8 @@ func TestXraySpeedLimitEnvWiring(t *testing.T) {
 }
 
 // TestXrayBuildScriptForkAndSpliceGuard ensures the core build pipeline points
-// at the patched fork/submodule and refuses to compile Xray-core without the
-// speedlimit.DisableSplice (CanSpliceCopy = 3) patch.
+// at upstream Xray-core with our reproducible patches and refuses to compile
+// without the speedlimit.DisableSplice (CanSpliceCopy = 3) patch.
 func TestXrayBuildScriptForkAndSpliceGuard(t *testing.T) {
 	scriptPath := filepath.Join("..", "build", "core", "build.sh")
 	raw, err := os.ReadFile(scriptPath)
@@ -64,8 +64,11 @@ func TestXrayBuildScriptForkAndSpliceGuard(t *testing.T) {
 	}
 	script := string(raw)
 	required := []string{
-		"https://github.com/Sir-MmD/Xray-core",
+		"https://github.com/XTLS/Xray-core",
 		"third_party/Xray-core/go.mod",
+		"patches/xray",
+		"stage_patched_src",
+		"verify_xray_patches",
 		"verify_speedlimit_splice_patch",
 		"common/speedlimit/speedlimit.go",
 		"app/dispatcher/default.go",
@@ -79,16 +82,30 @@ func TestXrayBuildScriptForkAndSpliceGuard(t *testing.T) {
 	}
 }
 
-// TestXrayCoreSubmoduleSpliceDisableGuard inspects the vendored third_party/Xray-core
-// submodule AST directly when initialized, failing immediately if a rebase drops
-// CanSpliceCopy = 3 or either dispatcher call site (getLink / WrapLink).
+// TestXrayCoreSubmoduleSpliceDisableGuard verifies that either a pre-patched
+// third_party/Xray-core checkout or the reproducible patch bundle in patches/xray
+// defines speedlimit.DisableSplice (CanSpliceCopy = 3) and invokes it from both
+// dispatcher seams (getLink and WrapLink).
 func TestXrayCoreSubmoduleSpliceDisableGuard(t *testing.T) {
 	coreRoot := filepath.Join("..", "third_party", "Xray-core")
 	speedlimitGo := filepath.Join(coreRoot, "common", "speedlimit", "speedlimit.go")
 	dispatcherGo := filepath.Join(coreRoot, "app", "dispatcher", "default.go")
 
 	if _, err := os.Stat(speedlimitGo); err != nil {
-		t.Skip("core submodule not checked out:", err)
+		// Upstream clean submodule layout: verify the staged patch defines DisableSplice
+		// and TestXrayPatchesApplyCleanly validates the full AST after applying patches.
+		patchRaw, pErr := os.ReadFile(filepath.Join("..", "patches", "xray", "04-speedlimit-disable-splice.patch"))
+		if pErr != nil {
+			t.Fatalf("speedlimit.go absent in %s and patch missing: %v", speedlimitGo, pErr)
+		}
+		p := string(patchRaw)
+		if !strings.Contains(p, "func DisableSplice(") || !strings.Contains(p, "CanSpliceCopy = 3") {
+			t.Fatalf("04-speedlimit-disable-splice.patch must define DisableSplice setting CanSpliceCopy = 3")
+		}
+		if strings.Count(p, "speedlimit.DisableSplice(sessionInbound)") < 2 {
+			t.Fatalf("04-speedlimit-disable-splice.patch must call speedlimit.DisableSplice in both dispatcher seams")
+		}
+		return
 	}
 	if _, err := os.Stat(dispatcherGo); err != nil {
 		t.Skip("core submodule not checked out:", err)

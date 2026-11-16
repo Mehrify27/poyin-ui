@@ -1,0 +1,27 @@
+diff --git a/infra/conf/shadowsocks.go b/infra/conf/shadowsocks.go
+index 13862dd8..1a9ced5f 100644
+--- a/infra/conf/shadowsocks.go
++++ b/infra/conf/shadowsocks.go
+@@ -65,16 +65,20 @@ func (v *ShadowsocksServerConfig) Build() (proto.Message, error) {
+ 			config.Users = make([]*protocol.User, len(v.Users))
+ 			processUser := func(idx int) error {
+ 				user := v.Users[idx]
++				cipher := user.Cipher
++				if cipher == "" {
++					cipher = v.Cipher
++				}
+ 				account := &shadowsocks.Account{
+ 					Password:   user.Password,
+-					CipherType: cipherFromString(user.Cipher),
++					CipherType: cipherFromString(cipher),
+ 				}
+ 				if account.Password == "" {
+ 					return errors.New("Shadowsocks password is not specified.")
+ 				}
+ 				if account.CipherType < shadowsocks.CipherType_AES_128_GCM ||
+ 					account.CipherType > shadowsocks.CipherType_XCHACHA20_POLY1305 {
+-					return errors.New("unsupported cipher method: ", user.Cipher)
++					return errors.New("unsupported cipher method: ", cipher)
+ 				}
+ 				config.Users[idx] = &protocol.User{
+ 					Email:   user.Email,

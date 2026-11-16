@@ -319,6 +319,7 @@
       <template v-if="inbound.protocol === Protocols.MTPROTO">{{template "form/mtproto"}}</template>
       <template v-if="inbound.protocol === Protocols.SSH">{{template "form/ssh"}}</template>
       <template v-if="inbound.protocol === Protocols.HYSTERIA">{{template "form/hysteria"}}</template>
+      <template v-if="inbound.protocol === Protocols.HYSTERIA2">{{template "form/hysteria2"}}</template>
       <template v-if="inbound.protocol === Protocols.ANYTLS">{{template "form/anytls"}}</template>
       <template v-if="inbound.protocol === Protocols.TUIC">{{template "form/tuic"}}</template>
       <template v-if="inbound.protocol === Protocols.NAIVE">{{template "form/naive"}}</template>
@@ -347,6 +348,7 @@
            protocol's own settings because they only exist under TLS or REALITY on
            a TCP transport, which is the decision made directly above them. -->
       <template v-if="inbound.protocol === Protocols.VLESS">{{template "form/vless/security"}}</template>
+      <template v-if="inbound.protocol === Protocols.HYSTERIA2">{{template "form/hysteria2/security"}}</template>
       <template v-if="inbound.protocol === Protocols.OPENVPN">{{template "form/openvpn/security"}}</template>
       <template v-if="inbound.protocol === Protocols.OPENCONNECT">{{template "form/openconnect/security"}}</template>
       <template v-if="inbound.protocol === Protocols.SSTP">{{template "form/sstp/security"}}</template>
@@ -467,6 +469,7 @@
       <template v-if="inbound.protocol === Protocols.GRE">{{template "form/gre/access"}}</template>
       <template v-if="inbound.protocol === Protocols.MTPROTO">{{template "form/mtproto/access"}}</template>
       <template v-if="inbound.protocol === Protocols.SSH">{{template "form/ssh/access"}}</template>
+      <template v-if="inbound.protocol === Protocols.HYSTERIA2">{{template "form/hysteria2/access"}}</template>
     </div>
 
     <!-- ============================= Quota ============================== -->
@@ -752,6 +755,7 @@
       <template v-if="inbound.protocol === Protocols.AWG">{{template "form/awg/reach"}}</template>
       <template v-if="inbound.protocol === Protocols.MTPROTO">{{template "form/mtproto/reach"}}</template>
       <template v-if="inbound.protocol === Protocols.SSH">{{template "form/ssh/reach"}}</template>
+      <template v-if="inbound.protocol === Protocols.HYSTERIA2">{{template "form/hysteria2/reach"}}</template>
     </div>
 
     <!-- ============================ Sniffing ============================ -->

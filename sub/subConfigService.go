@@ -1,6 +1,7 @@
 package sub
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -55,7 +56,7 @@ func (s *SubService) ConfigFiles(subId string, host string) []SubConfigFile {
 	seen := map[string]bool{}
 	for _, inbound := range inbounds {
 		switch inbound.Protocol {
-		case model.OPENVPN, model.WGC, model.AWG, model.GRE:
+		case model.OPENVPN, model.WGC, model.AWG, model.GRE, model.Hysteria2:
 		default:
 			continue
 		}
@@ -208,8 +209,172 @@ func (s *SubService) inboundConfigFiles(inbound *model.Inbound, email, host stri
 			}
 		}
 		return out
+
+	case model.Hysteria2:
+		return s.renderHysteria2ConfigFiles(inbound, email, host)
 	}
 	return nil
+}
+
+func (s *SubService) renderHysteria2ConfigFiles(inbound *model.Inbound, email, host string) []SubConfigFile {
+	var settings map[string]any
+	_ = json.Unmarshal([]byte(inbound.Settings), &settings)
+	clients, err := s.inboundService.GetClients(inbound)
+	if err != nil {
+		return nil
+	}
+	idx := findClientIndex(clients, email)
+	if idx < 0 {
+		return nil
+	}
+	auth := clients[idx].Auth
+	if auth == "" {
+		auth = clients[idx].Password
+	}
+	if auth == "" {
+		return nil
+	}
+	specs := extractExternalProxies(nil, settings, s.resolveInboundAddress(inbound), inbound.Port)
+	if len(specs) == 0 {
+		addr := host
+		if strings.TrimSpace(addr) == "" {
+			addr = s.resolveInboundAddress(inbound)
+		}
+		specs = []externalProxySpec{{Dest: addr, Port: inbound.Port}}
+	}
+	userSlug := slugForFilename(email)
+	if userSlug == "" {
+		userSlug = strconv.Itoa(idx)
+	}
+	out := make([]SubConfigFile, 0, len(specs))
+	for i, ep := range specs {
+		content, err := buildHysteria2ClientConfigJSON(settings, auth, ep.Dest, ep.Port)
+		if err != nil {
+			continue
+		}
+		label := "Hysteria 2 sing-box"
+		if r := strings.TrimSpace(ep.Remark); r != "" {
+			label += " " + r
+		}
+		label += labelSuffix(inbound.Remark)
+		variant := "hy2"
+		if ep.Remark != "" {
+			variant += "-" + ep.Remark
+		} else if len(specs) > 1 {
+			variant += "-" + strconv.Itoa(i+1)
+		}
+		out = append(out, SubConfigFile{
+			Key:         fmt.Sprintf("hy2-%d-%s-%d", inbound.Id, userSlug, i),
+			Protocol:    string(model.Hysteria2),
+			Label:       label,
+			Filename:    configFilename(inbound.Remark, "hysteria2", variant, "json"),
+			ContentType: "application/json",
+			Content:     content,
+		})
+	}
+	return out
+}
+
+func buildHysteria2ClientConfigJSON(settings map[string]any, auth, host string, port int) (string, error) {
+	if strings.TrimSpace(host) == "" {
+		return "", fmt.Errorf("missing server host")
+	}
+	alpn := []string{"h3"}
+	if rawAlpn, ok := settings["alpn"].([]any); ok {
+		var parsed []string
+		for _, a := range rawAlpn {
+			if as, ok := a.(string); ok && strings.TrimSpace(as) != "" {
+				parsed = append(parsed, strings.TrimSpace(as))
+			}
+		}
+		if len(parsed) > 0 {
+			alpn = parsed
+		}
+	}
+	tlsCfg := map[string]any{
+		"enabled": true,
+		"alpn":    alpn,
+	}
+	if sni, _ := settings["serverName"].(string); strings.TrimSpace(sni) != "" {
+		tlsCfg["server_name"] = strings.TrimSpace(sni)
+	}
+	if allowInsecure, _ := settings["allowInsecure"].(bool); allowInsecure {
+		tlsCfg["insecure"] = true
+	}
+
+	hy2Out := map[string]any{
+		"type":     "hysteria2",
+		"tag":      "proxy",
+		"server":   host,
+		"password": auth,
+		"tls":      tlsCfg,
+	}
+	if hop, _ := settings["hopPorts"].(string); strings.TrimSpace(hop) != "" {
+		var ports []string
+		for _, tok := range strings.Split(hop, ",") {
+			tok = strings.TrimSpace(tok)
+			if tok == "" {
+				continue
+			}
+			ports = append(ports, strings.ReplaceAll(tok, "-", ":"))
+		}
+		if len(ports) > 0 {
+			hy2Out["server_ports"] = ports
+			if hopInt, _ := settings["hopInterval"].(string); strings.TrimSpace(hopInt) != "" {
+				hy2Out["hop_interval"] = strings.TrimSpace(hopInt)
+			}
+		}
+	}
+	if _, hasPorts := hy2Out["server_ports"]; !hasPorts {
+		if port <= 0 {
+			port = 443
+		}
+		hy2Out["server_port"] = port
+	}
+	if up, ok := settings["upMbps"].(float64); ok && int(up) > 0 {
+		hy2Out["up_mbps"] = int(up)
+	}
+	if down, ok := settings["downMbps"].(float64); ok && int(down) > 0 {
+		hy2Out["down_mbps"] = int(down)
+	}
+	obfsType, _ := settings["obfsType"].(string)
+	obfsPass, _ := settings["obfsPassword"].(string)
+	if strings.EqualFold(strings.TrimSpace(obfsType), "salamander") && obfsPass != "" {
+		hy2Out["obfs"] = map[string]any{
+			"type":     "salamander",
+			"password": obfsPass,
+		}
+	}
+
+	doc := map[string]any{
+		"log": map[string]any{
+			"level":     "info",
+			"timestamp": true,
+		},
+		"inbounds": []map[string]any{
+			{
+				"type":        "mixed",
+				"tag":         "mixed-in",
+				"listen":      "127.0.0.1",
+				"listen_port": 2080,
+			},
+		},
+		"outbounds": []map[string]any{
+			hy2Out,
+			{
+				"type": "direct",
+				"tag":  "direct",
+			},
+		},
+		"route": map[string]any{
+			"final": "proxy",
+		},
+	}
+	b, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(b) + "\n", nil
 }
 
 // wgLabel names a WireGuard config. The renderer's own Remark already reads "Device 2 -

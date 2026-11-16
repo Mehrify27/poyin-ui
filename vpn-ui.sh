@@ -41,8 +41,16 @@ die()  { printf '%serror:%s %s\n'   "$B$RED" "$R" "$*" >&2; exit 1; }
 hr()   { printf '%s%s%s\n' "$D" "$(printf '%.0s-' {1..60})" "$R"; }
 
 # The panel binary this menu drives. VPNUI_BIN overrides it for a non-default
-# install; deploy.sh exports it so the menu follows deploy.sh's own DEST.
-BIN="${VPNUI_BIN:-/opt/vpn-ui/vpn-ui-amd64}"
+# install; otherwise auto-select based on host architecture when available.
+_detect_default_bin() {
+    case "$(uname -m 2>/dev/null || echo x86_64)" in
+        aarch64|arm64)
+            [[ -x "/opt/vpn-ui/vpn-ui-arm64" ]] && { printf '/opt/vpn-ui/vpn-ui-arm64'; return; }
+            ;;
+    esac
+    printf '/opt/vpn-ui/vpn-ui-amd64'
+}
+BIN="${VPNUI_BIN:-$(_detect_default_bin)}"
 # Every value below is preserved when already set, because deploy.sh sources this
 # file with its own: sourcing must add the shared function, never quietly redefine
 # the caller's configuration.
@@ -726,7 +734,31 @@ obtain_letsencrypt_cert() {
 
 # 1) Update. The binary owns the whole flow (version check, DB backup, swap,
 #    restart), including refreshing THIS script from the release it installs.
-item_update() { "$BIN" update || warn "update did not complete."; }
+#    When GitHub is unreachable (offline / restricted network), offers mirror or --local.
+item_update() {
+    if "$BIN" update "$@"; then
+        return 0
+    fi
+    warn "standard update did not complete."
+    if have_tty; then
+        printf '\n' > /dev/tty
+        printf '  %sRetry via%s: 1) Local binary / .tar.gz bundle   2) GitHub mirror URL   0) Cancel [0]: ' "$BLUE" "$R" > /dev/tty
+        local ans="" val=""
+        read -r ans < /dev/tty || ans=""
+        case "$ans" in
+            1)
+                printf '  %sPath to binary or .tar.gz%s: ' "$BLUE" "$R" > /dev/tty
+                read -r val < /dev/tty || val=""
+                [[ -n "$val" ]] && "$BIN" update --local "$val" || warn "local update did not complete."
+                ;;
+            2)
+                printf '  %sGitHub mirror prefix (e.g. https://ghproxy.example.com/)%s: ' "$BLUE" "$R" > /dev/tty
+                read -r val < /dev/tty || val=""
+                [[ -n "$val" ]] && "$BIN" update --mirror "$val" || warn "mirrored update did not complete."
+                ;;
+        esac
+    fi
+}
 
 # 2) Un-Install. The binary prompts for confirmation and removes /usr/bin/vpn-ui
 #    (this file) among everything else, so there is no menu to return to.
@@ -948,6 +980,7 @@ menu_loop() {
 usage() {
     cat <<EOF
 usage: ${0##*/}            open the management menu
+       ${0##*/} update     update panel (supports --local <path>, --mirror <url>, --repo <o/r>, --force)
        ${0##*/} ssl        issue/install a Let's Encrypt certificate (non-interactive
                            with DEPLOY_DOMAIN=... DEPLOY_EMAIL=...)
        ${0##*/} --help     this message
@@ -990,6 +1023,13 @@ require_bin() {
 main() {
     case "${1:-}" in
         -h|--help|help) usage; return 0 ;;
+        update)
+            shift
+            require_root update "$@"
+            require_bin
+            "$BIN" update "$@"
+            return $?
+            ;;
         ssl)
             require_root "$@"
             require_bin

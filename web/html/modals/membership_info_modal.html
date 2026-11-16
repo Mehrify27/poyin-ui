@@ -116,7 +116,11 @@
       </div>
       <div class="ai-kv">
         <span class="k">{{ i18n "pages.clients.summaryUsed" }}</span>
-        <span class="v">[[ used ]]</span>
+        <span class="v">[[ used ]] (&uarr; [[ usedUp ]] / &darr; [[ usedDown ]])<span v-if="isShared"> &middot; {{ i18n "pages.clients.sharedUsage" }}</span></span>
+      </div>
+      <div class="ai-kv" v-if="accountTotalUsed">
+        <span class="k">{{ i18n "pages.inbounds.total" }}</span>
+        <span class="v">[[ accountTotalUsed ]] (&uarr; [[ accountUpUsed ]] / &darr; [[ accountDownUsed ]])</span>
       </div>
       <div class="ai-kv" v-if="first && first.expiry">
         <span class="k">{{ i18n "pages.clients.summaryExpires" }}</span>
@@ -173,6 +177,31 @@
       used() {
         if (!this.app || !this.record || !this.client) return '';
         return SizeFormatter.sizeFormat(this.app.getInboundSumStats(this.record, this.client.email) || 0);
+      },
+      usedUp() {
+        if (!this.app || !this.record || !this.client) return '';
+        return SizeFormatter.sizeFormat(this.app.getInboundUpStats(this.record, this.client.email) || 0);
+      },
+      usedDown() {
+        if (!this.app || !this.record || !this.client) return '';
+        return SizeFormatter.sizeFormat(this.app.getInboundDownStats(this.record, this.client.email) || 0);
+      },
+      isShared() {
+        return !!(this.app && this.record && this.client && this.app.isSharedStats(this.record, this.client.email));
+      },
+      accountTotalUsed() {
+        if (!this.app || !this.record || !this.client) return '';
+        const st = this.app.getClientStats(this.record, this.client.email);
+        if (!st || !Array.isArray(st.inboundTraffics) || st.inboundTraffics.length <= 1) return '';
+        return SizeFormatter.sizeFormat((st.up || 0) + (st.down || 0));
+      },
+      accountUpUsed() {
+        if (!this.app || !this.record || !this.client) return '';
+        return SizeFormatter.sizeFormat(this.app.getUpStats(this.record, this.client.email) || 0);
+      },
+      accountDownUsed() {
+        if (!this.app || !this.record || !this.client) return '';
+        return SizeFormatter.sizeFormat(this.app.getDownStats(this.record, this.client.email) || 0);
       },
     },
     methods: {

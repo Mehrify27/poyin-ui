@@ -258,6 +258,67 @@
             </a-card>
           </a-col>
 
+          <!-- Sidecar / Core Binaries (decoupled overrides & independent updates) -->
+          <a-col :span="24" v-if="loaded && binaryInventory.length">
+            <a-card hoverable :loading="binaryLoading">
+              <template #title>
+                <a-icon type="cloud-download"></a-icon>
+                <span :style="{ marginLeft: '8px' }">Sidecar &amp; Core Binaries</span>
+              </template>
+              <template #extra>
+                <a-space>
+                  <a-button size="small" @click="loadBinaries">
+                    <a-icon type="reload"></a-icon>{{ i18n "pages.core.refresh" }}
+                  </a-button>
+                  <a-popconfirm title="Update all upstream-tracked binaries sequentially?"
+                    ok-text="{{ i18n "confirm" }}" cancel-text="{{ i18n "cancel" }}"
+                    @confirm="updateAllCores">
+                    <a-button size="small" type="primary" :loading="coreUpdateModal.submitting">
+                      <a-icon type="sync"></a-icon>Update All
+                    </a-button>
+                  </a-popconfirm>
+                </a-space>
+              </template>
+              <a-row :gutter="[12, 12]">
+                <a-col :xs="24" :md="12" :xl="8" v-for="bin in binaryInventory" :key="bin.core">
+                  <div :style="{ border: '1px solid rgba(128,128,128,0.2)', borderRadius: '8px', padding: '12px' }">
+                    <div :style="{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }">
+                      <strong>[[ bin.core ]]</strong>
+                      <a-tag :color="binarySourceColor(bin.source)">[[ bin.source ]]</a-tag>
+                    </div>
+                    <div class="core-kv">
+                      <span class="core-kv-label">{{ i18n "pages.core.version" }}</span>
+                      <span class="core-kv-value" :style="{ maxWidth: '65%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }"
+                        :title="bin.version || ''">[[ bin.version || '—' ]]</span>
+                    </div>
+                    <div class="core-kv">
+                      <span class="core-kv-label">Service</span>
+                      <span class="core-kv-value">[[ coreTitle(bin.serviceCore) ]]</span>
+                    </div>
+                    <div class="core-kv">
+                      <span class="core-kv-label">Path</span>
+                      <span class="core-kv-value" :style="{ fontSize: '12px', fontFamily: 'monospace', maxWidth: '72%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }"
+                        :title="bin.activePath || bin.customPath">[[ bin.activePath || 'not found' ]]</span>
+                    </div>
+                    <div :style="{ marginTop: '10px', display: 'flex', gap: '8px', flexWrap: 'wrap' }">
+                      <a-button size="small" type="primary" @click="openCoreUpdateModal(bin)">
+                        <a-icon type="download"></a-icon>Update
+                      </a-button>
+                      <a-popconfirm v-if="bin.hasBackup || bin.source === 'custom-override'"
+                        title="Roll back this binary to its previous snapshot / bundled fallback?"
+                        ok-text="{{ i18n "confirm" }}" cancel-text="{{ i18n "cancel" }}"
+                        @confirm="rollbackCoreBinary(bin.core)">
+                        <a-button size="small" type="danger" ghost>
+                          <a-icon type="rollback"></a-icon>Rollback
+                        </a-button>
+                      </a-popconfirm>
+                    </div>
+                  </div>
+                </a-col>
+              </a-row>
+            </a-card>
+          </a-col>
+
         </a-row>
         </transition>
       </a-spin>
@@ -579,6 +640,25 @@
       </div>
     </a-spin>
   </a-modal>
+
+  <a-modal v-model="coreUpdateModal.visible" :title="'Update Binary: ' + coreUpdateModal.core"
+    :class="themeSwitcher.currentTheme" :width="isMobile ? '95%' : '520px'"
+    ok-text="Update" cancel-text='{{ i18n "cancel" }}'
+    :confirm-loading="coreUpdateModal.submitting" @ok="submitCoreUpdate">
+    <a-alert type="info" show-icon :style="{ marginBottom: '12px' }"
+      message="Installs to custom override directory without overwriting panel bundle; keeps .bak, restarts only the affected core, and rolls back automatically if unhealthy."></a-alert>
+    <a-form :label-col="{ span: 7 }" :wrapper-col="{ span: 17 }">
+      <a-form-item label="Release Tag">
+        <a-input v-model="coreUpdateModal.version" placeholder="Leave empty for latest release (e.g. v1.14.4)"></a-input>
+      </a-form-item>
+      <a-form-item label="Custom URL">
+        <a-input v-model="coreUpdateModal.url" placeholder="Optional direct ELF / .tar.gz / .zip URL"></a-input>
+      </a-form-item>
+      <a-form-item label="SHA-256">
+        <a-input v-model="coreUpdateModal.sha256" placeholder="Optional 64-char hex checksum"></a-input>
+      </a-form-item>
+    </a-form>
+  </a-modal>
 {{template "page/shell_end" . }}
 
 {{template "page/body_scripts" .}}
@@ -659,6 +739,16 @@
       // the modal remounts its body and a leaked instance stacks a second editor
       // on top of the first.
       cfgCm: null,
+      binaryInventory: [],
+      binaryLoading: false,
+      coreUpdateModal: {
+        visible: false,
+        submitting: false,
+        core: '',
+        version: '',
+        url: '',
+        sha256: '',
+      },
     },
     methods: {
       async loadStatus(showSpin) {
@@ -775,11 +865,11 @@
         this.$nextTick(() => this.mountCfgEditor());
       },
       cfgCmMode(format) {
-        // Outside Xray's JSON the panel writes exactly two syntaxes: mtproto's
-        // TOML, and key/value with # comments (ini, pppd options, openvpn,
-        // swanctl) which the vendored properties mode covers, [section] headers
-        // included.
-        return format === 'toml' ? 'text/x-toml' : 'text/x-properties';
+        // Outside Xray's JSON the panel writes TOML (mtproto), key/value with # comments
+        // (ini, pppd options, openvpn, swanctl), and sing-box JSON (hysteria2).
+        if (format === 'toml') return 'text/x-toml';
+        if (format === 'json') return null;
+        return 'text/x-properties';
       },
       cfgCmOptions(mode) {
         return {
@@ -1215,11 +1305,11 @@
         this.reconnectTimer = setTimeout(probe, 20000);
       },
       coreTitle(name) {
-        return ({ xray: 'Xray', l2tp: 'L2TP', ipsec: 'IPsec', pptp: 'PPTP', openvpn: 'OpenVPN', openconnect: 'OpenConnect (cisco)', sstp: 'SSTP', ikev2: 'IKEv2', wgc: 'WireGuard (C)', awg: 'AmneziaWG', gre: 'GRE', mtproto: 'MTProto Proxy', ssh: 'SSH', radius: 'RADIUS' })[name] || name;
+        return ({ xray: 'Xray', hysteria2: 'Hysteria 2', l2tp: 'L2TP', ipsec: 'IPsec', pptp: 'PPTP', openvpn: 'OpenVPN', openconnect: 'OpenConnect (cisco)', sstp: 'SSTP', ikev2: 'IKEv2', wgc: 'WireGuard (C)', awg: 'AmneziaWG', gre: 'GRE', mtproto: 'MTProto Proxy', ssh: 'SSH', radius: 'RADIUS' })[name] || name;
       },
       coreBackend(name) {
         // The actual software powering each core (shown in the Backend row).
-        return ({ xray: 'Xray-core', l2tp: 'xl2tpd', ipsec: 'strongSwan (charon)', pptp: 'pptpd', openvpn: 'OpenVPN', openconnect: 'ocserv', sstp: 'accel-ppp', ikev2: 'strongSwan (charon)', wgc: 'WireGuard (kernel)', awg: 'AmneziaWG (kernel)', gre: 'GRE (kernel)', mtproto: 'telemt', ssh: 'Built-in (vpn-ui)', radius: 'Built-in (vpn-ui)' })[name] || '-';
+        return ({ xray: 'Xray-core', hysteria2: 'sing-box', l2tp: 'xl2tpd', ipsec: 'strongSwan (charon)', pptp: 'pptpd', openvpn: 'OpenVPN', openconnect: 'ocserv', sstp: 'accel-ppp', ikev2: 'strongSwan (charon)', wgc: 'WireGuard (kernel)', awg: 'AmneziaWG (kernel)', gre: 'GRE (kernel)', mtproto: 'telemt', ssh: 'Built-in (vpn-ui)', radius: 'Built-in (vpn-ui)' })[name] || '-';
       },
       coreIcon(name) {
         // A single lock icon represents every core (Xray + all VPN daemons).
@@ -1240,6 +1330,55 @@
       // offering to restart a daemon that is not on disk only produces an error.
       canStop(core) { return core.state !== 'not_installed'; },
       canRestart(core) { return core.state !== 'not_installed'; },
+      async loadBinaries() {
+        this.binaryLoading = true;
+        const msg = await HttpUtil.get('/panel/core/versions');
+        this.binaryLoading = false;
+        if (msg && msg.success && msg.obj && msg.obj.binaries) {
+          this.binaryInventory = msg.obj.binaries;
+        }
+      },
+      binarySourceColor(src) {
+        return ({ 'custom-override': 'blue', bundled: 'green', 'host-path': 'cyan', missing: 'default' })[src] || 'default';
+      },
+      openCoreUpdateModal(bin) {
+        this.coreUpdateModal = {
+          visible: true,
+          submitting: false,
+          core: bin.core,
+          version: '',
+          url: '',
+          sha256: '',
+        };
+      },
+      async submitCoreUpdate() {
+        this.coreUpdateModal.submitting = true;
+        const msg = await HttpUtil.post('/panel/core/update/' + this.coreUpdateModal.core, {
+          version: this.coreUpdateModal.version.trim(),
+          url: this.coreUpdateModal.url.trim(),
+          sha256: this.coreUpdateModal.sha256.trim(),
+        });
+        this.coreUpdateModal.submitting = false;
+        if (msg && msg.obj && msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
+        if (msg && msg.success) {
+          this.coreUpdateModal.visible = false;
+        }
+        await this.loadStatus(false);
+      },
+      async updateAllCores() {
+        this.coreUpdateModal.submitting = true;
+        const msg = await HttpUtil.post('/panel/core/update/all', {});
+        this.coreUpdateModal.submitting = false;
+        if (msg && msg.obj && msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
+        await this.loadStatus(false);
+      },
+      async rollbackCoreBinary(core) {
+        this.binaryLoading = true;
+        const msg = await HttpUtil.post('/panel/core/rollback/' + core, {});
+        this.binaryLoading = false;
+        if (msg && msg.obj && msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
+        await this.loadStatus(false);
+      },
     },
     computed: {
       // The core's log, coloured by severity through the shared LogFormatter.
@@ -1287,6 +1426,7 @@
     mounted() {
       this.loadStatus(true);
       this.loadCatalog();
+      this.loadBinaries();
       this.pollTimer = setInterval(() => this.loadStatus(false), 5000);
     },
     beforeDestroy() {

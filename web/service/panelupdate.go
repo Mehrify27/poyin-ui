@@ -1,7 +1,13 @@
 package service
 
 import (
+	"archive/tar"
+	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +17,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,13 +57,45 @@ var (
 // syscall.Exec's os.Args back into itself. That is harmless for the panel, but from
 // a CLI process it would re-exec the CLI with its own `update` arguments, in a loop.
 const (
-	panelRepo      = "Mehrify27/poyin-ui"
-	PanelAsset     = "vpn-ui-amd64"
-	panelLatestAPI = "https://api.github.com/repos/" + panelRepo + "/releases/latest"
-	// PanelDownloadURL is the release asset both the in-panel updater and the CLI
-	// `update` subcommand download.
-	PanelDownloadURL = "https://github.com/" + panelRepo + "/releases/latest/download/" + PanelAsset
+	// PanelAsset is the default amd64 release asset filename kept for compatibility.
+	PanelAsset              = "vpn-ui-amd64"
+	defaultPanelDownloadURL = "https://github.com/" + config.DefaultRepo + "/releases/latest/download/" + PanelAsset
 )
+
+// PanelDownloadURL is kept exported for backward compatibility with callers inspecting
+// or overriding the default download target; runtime lookups prefer PanelDownloadURLForArch.
+var PanelDownloadURL = defaultPanelDownloadURL
+
+// PanelRepo returns the configured GitHub owner/repository slug (via config.GetRepo).
+func PanelRepo() string {
+	return config.GetRepo()
+}
+
+// PanelAssetForArch returns the GitHub release asset filename for arch (or runtime.GOARCH if empty).
+func PanelAssetForArch(arch string) string {
+	norm := strings.ToLower(strings.TrimSpace(arch))
+	if norm == "" {
+		norm = runtime.GOARCH
+	}
+	switch norm {
+	case "amd64", "x86_64":
+		return "vpn-ui-amd64"
+	case "arm64", "aarch64":
+		return "vpn-ui-arm64"
+	default:
+		return "vpn-ui-" + norm
+	}
+}
+
+// PanelLatestAPIURL returns the GitHub Releases API URL for the configured repo and proxy.
+func PanelLatestAPIURL() string {
+	return config.ApplyGHProxy("https://api.github.com/repos/" + PanelRepo() + "/releases/latest")
+}
+
+// PanelDownloadURLForArch returns the release asset URL for the requested architecture and proxy.
+func PanelDownloadURLForArch(arch string) string {
+	return config.ApplyGHProxy("https://github.com/" + PanelRepo() + "/releases/latest/download/" + PanelAssetForArch(arch))
+}
 
 // PanelUpdateInfo reports the running version vs. the latest published release,
 // plus the release notes the overview shows before an operator commits to
@@ -90,7 +127,8 @@ func (s *ServerService) CheckPanelUpdate() (*PanelUpdateInfo, error) {
 	info := &PanelUpdateInfo{Current: cur, Latest: cur}
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, panelLatestAPI, nil)
+	apiURL := PanelLatestAPIURL()
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
 	if err != nil {
 		return info, err
 	}
@@ -340,8 +378,13 @@ func (s *ServerService) UpdatePanel() error {
 	}
 
 	tmp := exe + ".new"
-	logger.Infof("panel update: downloading %s", PanelDownloadURL)
-	if err := DownloadPanelBinary(ctx, tmp, PanelDownloadURL); err != nil {
+	dlURL := PanelDownloadURLForArch(runtime.GOARCH)
+	if PanelDownloadURL != defaultPanelDownloadURL {
+		dlURL = config.ApplyGHProxy(PanelDownloadURL)
+	}
+	assetName := PanelAssetForArch(runtime.GOARCH)
+	logger.Infof("panel update: downloading %s", dlURL)
+	if err := DownloadPanelBinary(ctx, tmp, dlURL); err != nil {
 		_ = os.Remove(tmp)
 		// A cancelled download surfaces as a transport error; ctx is what says the
 		// user asked for it rather than the network failing.
@@ -357,7 +400,7 @@ func (s *ServerService) UpdatePanel() error {
 	// and brick the panel (the restart would fail with exec-format-error).
 	if !IsCompatibleBinary(tmp) {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("downloaded file is not a %s Linux binary (no valid '%s' asset?)", runtime.GOARCH, PanelAsset)
+		return fmt.Errorf("downloaded file is not a %s Linux binary (no valid '%s' asset?)", runtime.GOARCH, assetName)
 	}
 	if err := os.Chmod(tmp, 0o755); err != nil {
 		_ = os.Remove(tmp)
@@ -409,26 +452,8 @@ func installPanelBinary(staged, exe string) error {
 		return fmt.Errorf("pre-update DB backup failed: %w", err)
 	}
 
-	// Keep a verified copy of the current binary next to it for automatic or
-	// manual rollback before overwriting exe.
-	bakPath := exe + ".bak"
-	if err := CopyFile(exe, bakPath); err != nil {
-		_ = os.Remove(staged)
-		return fmt.Errorf("binary backup failed (aborting swap): %w", err)
-	}
-	if err := os.Chmod(bakPath, 0o755); err != nil {
-		_ = os.Remove(staged)
-		return fmt.Errorf("chmod binary backup failed: %w", err)
-	}
-
-	if err := renamePanelBinary(staged, exe); err != nil {
-		_ = os.Remove(staged)
-		if _, statErr := os.Stat(exe); os.IsNotExist(statErr) {
-			if rbErr := CopyFile(bakPath, exe); rbErr == nil {
-				_ = os.Chmod(exe, 0o755)
-			}
-		}
-		return fmt.Errorf("replacing binary failed: %w", err)
+	if _, err := SwapPanelBinaryWithBackup(staged, exe); err != nil {
+		return err
 	}
 	logger.Infof("panel update: installed new binary at %s, restarting", exe)
 	setUpdateProgress(updatePhaseRestarting, 100)
@@ -450,6 +475,82 @@ func installPanelBinary(staged, exe string) error {
 
 	// Restart detached so our own termination can't abort the restart.
 	go restartPanel(exe)
+	return nil
+}
+
+// SwapPanelBinaryWithBackup saves exe to exe+".bak" (0755) and atomically replaces
+// exe with staged, restoring exe from exe+".bak" if the rename fails and leaves exe missing.
+func SwapPanelBinaryWithBackup(staged, exe string) (string, error) {
+	bakPath := exe + ".bak"
+	if err := CopyFile(exe, bakPath); err != nil {
+		_ = os.Remove(staged)
+		return "", fmt.Errorf("binary backup failed (aborting swap): %w", err)
+	}
+	if err := os.Chmod(bakPath, 0o755); err != nil {
+		_ = os.Remove(staged)
+		return "", fmt.Errorf("chmod binary backup failed: %w", err)
+	}
+
+	if err := renamePanelBinary(staged, exe); err != nil {
+		_ = os.Remove(staged)
+		if _, statErr := os.Stat(exe); os.IsNotExist(statErr) {
+			if rbErr := CopyFile(bakPath, exe); rbErr == nil {
+				_ = os.Chmod(exe, 0o755)
+			}
+		}
+		return "", fmt.Errorf("replacing binary failed: %w", err)
+	}
+	return bakPath, nil
+}
+
+// RollbackPanelUpdate restores the previous binary (backupBinPath -> exe) and, when
+// provided, restores the backed-up SQLite database (backupDBPath -> config.GetDBPath()).
+func RollbackPanelUpdate(exe, backupBinPath, backupDBPath string) error {
+	var errs []string
+	if backupBinPath != "" {
+		if _, statErr := os.Stat(backupBinPath); statErr != nil {
+			errs = append(errs, fmt.Sprintf("binary backup %s missing: %v", backupBinPath, statErr))
+		} else {
+			tmpBak := exe + ".rollback.tmp"
+			if err := CopyFile(backupBinPath, tmpBak); err != nil {
+				errs = append(errs, fmt.Sprintf("restore binary copy failed: %v", err))
+			} else {
+				_ = os.Chmod(tmpBak, 0o755)
+				if err := renamePanelBinary(tmpBak, exe); err != nil {
+					_ = os.Remove(tmpBak)
+					errs = append(errs, fmt.Sprintf("restore binary rename failed: %v", err))
+				}
+			}
+		}
+	}
+
+	if backupDBPath != "" {
+		if err := database.ValidateSQLiteDB(backupDBPath); err != nil {
+			errs = append(errs, fmt.Sprintf("DB backup %s invalid: %v", backupDBPath, err))
+		} else {
+			_ = database.CloseDB()
+			dbPath := config.GetDBPath()
+			_ = os.Remove(dbPath + "-wal")
+			_ = os.Remove(dbPath + "-shm")
+			tmpDB := dbPath + ".rollback.tmp"
+			if err := CopyFile(backupDBPath, tmpDB); err != nil {
+				errs = append(errs, fmt.Sprintf("restore DB copy failed: %v", err))
+			} else if err := os.Rename(tmpDB, dbPath); err != nil {
+				_ = os.Remove(tmpDB)
+				errs = append(errs, fmt.Sprintf("restore DB rename failed: %v", err))
+			} else {
+				for _, side := range []string{"-wal", "-shm"} {
+					if _, err := os.Stat(backupDBPath + side); err == nil {
+						_ = CopyFile(backupDBPath+side, dbPath+side)
+					}
+				}
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
 	return nil
 }
 
@@ -672,32 +773,227 @@ func restartPanel(exe string) {
 	}
 }
 
-// versionNewer reports whether dotted version a is strictly newer than b (both
-// may carry a leading "v"). Non-numeric or unparseable tags yield false, so a
-// malformed release never spuriously advertises an update.
+// StageLocalPanelAsset validates a local vpn-ui binary or release .tar.gz bundle,
+// verifies any adjacent/embedded SHA256SUMS/.sha256 digest, checks ELF architecture
+// compatibility, and stages an executable copy inside exeDir ready for atomic rename.
+func StageLocalPanelAsset(localPath, exeDir string) (stagedPath, assetVersion string, err error) {
+	localPath = strings.TrimSpace(localPath)
+	if localPath == "" {
+		return "", "", errors.New("local asset path is empty")
+	}
+	st, statErr := os.Stat(localPath)
+	if statErr != nil {
+		return "", "", fmt.Errorf("cannot access local asset %s: %w", localPath, statErr)
+	}
+	if st.IsDir() {
+		return "", "", fmt.Errorf("local asset path %s is a directory, expected a binary or .tar.gz archive", localPath)
+	}
+
+	if expected, ok := lookupSidecarSHA256(localPath); ok {
+		if err := verifyFileSHA256(localPath, expected); err != nil {
+			return "", "", err
+		}
+	}
+
+	lower := strings.ToLower(localPath)
+	if strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz") {
+		stagedPath, assetVersion, err = extractBinaryFromTarGz(localPath, exeDir, runtime.GOARCH)
+		if err != nil {
+			return "", "", err
+		}
+	} else {
+		f, err := os.CreateTemp(exeDir, ".vpn-ui-local-*")
+		if err != nil {
+			return "", "", fmt.Errorf("create temp staged binary: %w", err)
+		}
+		stagedPath = f.Name()
+		src, openErr := os.Open(localPath)
+		if openErr != nil {
+			_ = f.Close()
+			_ = os.Remove(stagedPath)
+			return "", "", openErr
+		}
+		_, copyErr := io.Copy(f, src)
+		_ = src.Close()
+		closeErr := f.Close()
+		if copyErr != nil || closeErr != nil {
+			_ = os.Remove(stagedPath)
+			if copyErr != nil {
+				return "", "", copyErr
+			}
+			return "", "", closeErr
+		}
+		if err := os.Chmod(stagedPath, 0o755); err != nil {
+			_ = os.Remove(stagedPath)
+			return "", "", err
+		}
+		if !IsCompatibleBinary(stagedPath) {
+			_ = os.Remove(stagedPath)
+			return "", "", fmt.Errorf("%s is not a compatible %s Linux ELF binary", localPath, runtime.GOARCH)
+		}
+	}
+
+	if assetVersion == "" && isGoBinary(stagedPath) {
+		if v, vErr := panelBinaryVersion(stagedPath); vErr == nil {
+			assetVersion = v
+		}
+	}
+	return stagedPath, assetVersion, nil
+}
+
+func extractBinaryFromTarGz(archivePath, exeDir, targetArch string) (stagedPath, detectedVersion string, err error) {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return "", "", err
+	}
+	defer f.Close()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid gzip archive %s: %w", archivePath, err)
+	}
+	defer gz.Close()
+
+	wantAsset := PanelAssetForArch(targetArch)
+	tr := tar.NewReader(gz)
+
+	var (
+		sumsData   []byte
+		stagedName string
+		stagedSum  string
+	)
+
+	for {
+		hdr, nextErr := tr.Next()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			if stagedPath != "" {
+				_ = os.Remove(stagedPath)
+			}
+			return "", "", fmt.Errorf("read archive %s: %w", archivePath, nextErr)
+		}
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			continue
+		}
+		base := filepath.Base(hdr.Name)
+		switch {
+		case base == "VERSION":
+			data, rErr := io.ReadAll(io.LimitReader(tr, 256))
+			if rErr == nil {
+				detectedVersion = strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(string(data)), "v"), "V")
+			}
+		case base == "SHA256SUMS" || base == wantAsset+".sha256":
+			data, rErr := io.ReadAll(io.LimitReader(tr, 64<<10))
+			if rErr == nil {
+				sumsData = append(sumsData, data...)
+				sumsData = append(sumsData, '\n')
+			}
+		case base == wantAsset && stagedPath == "":
+			tmp, tErr := os.CreateTemp(exeDir, ".vpn-ui-local-*")
+			if tErr != nil {
+				return "", "", fmt.Errorf("create staged file in %s: %w", exeDir, tErr)
+			}
+			stagedPath = tmp.Name()
+			stagedName = base
+			h := sha256.New()
+			_, cErr := io.Copy(io.MultiWriter(tmp, h), tr)
+			clErr := tmp.Close()
+			if cErr != nil || clErr != nil {
+				_ = os.Remove(stagedPath)
+				if cErr != nil {
+					return "", "", fmt.Errorf("extract %s: %w", base, cErr)
+				}
+				return "", "", fmt.Errorf("close staged %s: %w", base, clErr)
+			}
+			stagedSum = hex.EncodeToString(h.Sum(nil))
+		}
+	}
+
+	if stagedPath == "" {
+		return "", "", fmt.Errorf("archive %s does not contain %s", archivePath, wantAsset)
+	}
+	if len(sumsData) > 0 {
+		if wantSum, ok := parseChecksumForName(sumsData, stagedName); ok && !strings.EqualFold(wantSum, stagedSum) {
+			_ = os.Remove(stagedPath)
+			return "", "", fmt.Errorf("SHA-256 mismatch for %s in %s: got %s want %s", stagedName, archivePath, stagedSum, wantSum)
+		}
+	}
+	if err := os.Chmod(stagedPath, 0o755); err != nil {
+		_ = os.Remove(stagedPath)
+		return "", "", err
+	}
+	if !IsCompatibleBinary(stagedPath) {
+		_ = os.Remove(stagedPath)
+		return "", "", fmt.Errorf("extracted %s is not a compatible %s Linux ELF binary", stagedName, targetArch)
+	}
+	return stagedPath, detectedVersion, nil
+}
+
+func lookupSidecarSHA256(filePath string) (string, bool) {
+	base := filepath.Base(filePath)
+	for _, candidate := range []string{
+		filePath + ".sha256",
+		filepath.Join(filepath.Dir(filePath), "SHA256SUMS"),
+	} {
+		data, err := os.ReadFile(candidate)
+		if err != nil {
+			continue
+		}
+		if sum, ok := parseChecksumForName(data, base); ok {
+			return sum, true
+		}
+		// Plain single-line .sha256 digest without filename
+		if candidate == filePath+".sha256" {
+			fields := strings.Fields(string(data))
+			if len(fields) == 1 && len(fields[0]) == 64 {
+				return fields[0], true
+			}
+		}
+	}
+	return "", false
+}
+
+func parseChecksumForName(data []byte, filename string) (string, bool) {
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		sum := fields[0]
+		target := strings.TrimPrefix(fields[1], "*")
+		if filepath.Base(target) == filename && len(sum) == 64 {
+			return sum, true
+		}
+	}
+	return "", false
+}
+
+func verifyFileSHA256(path, expectedHex string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(got, expectedHex) {
+		return fmt.Errorf("SHA-256 mismatch for %s: got %s want %s", filepath.Base(path), got, expectedHex)
+	}
+	return nil
+}
+
+// versionNewer reports whether SemVer version a is strictly newer than b (both may
+// carry a leading "v"). Non-numeric or unparseable tags yield false.
 func versionNewer(a, b string) bool {
-	a = strings.TrimPrefix(strings.TrimSpace(a), "v")
-	b = strings.TrimPrefix(strings.TrimSpace(b), "v")
-	if a == "" {
-		return false
-	}
-	pa := strings.Split(a, ".")
-	pb := strings.Split(b, ".")
-	n := len(pa)
-	if len(pb) > n {
-		n = len(pb)
-	}
-	for i := 0; i < n; i++ {
-		var x, y int
-		if i < len(pa) {
-			x, _ = strconv.Atoi(pa[i])
-		}
-		if i < len(pb) {
-			y, _ = strconv.Atoi(pb[i])
-		}
-		if x != y {
-			return x > y
-		}
-	}
-	return false
+	return config.IsNewerSemVer(a, b)
 }

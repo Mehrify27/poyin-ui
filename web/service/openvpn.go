@@ -80,6 +80,7 @@ type openvpnSettings struct {
 	UserLimit         *int                `json:"userLimit"`         // nil = absent (legacy => 1); 0 = no limit; else devices/account (1..64)
 	UserLimitStrategy string              `json:"userLimitStrategy"` // at the cap: "accept" (default, evict oldest) or "reject" (deny new device)
 	IpRanges          []string            `json:"ipRanges"`          // UDP-side /24 ranges; TCP mirrors into 10.3.x. Panel-managed.
+	CustomConfig      string              `json:"customConfig,omitempty"`
 	Clients           []openvpnClient     `json:"clients"`
 }
 
@@ -500,8 +501,13 @@ func (s *OpenVpnService) generateServerConfigs(inbound *model.Inbound, preserveL
 			continue
 		}
 		confPath := fmt.Sprintf("%s/server-%s.conf", dir, proto)
-		conf := applyCoreConfigOverride("openvpn", inbound.Id, "server-"+proto+".conf",
-			s.buildServerConfig(inbound, settings, proto, ports[proto], binaryPath))
+		existingBytes, _ := os.ReadFile(confPath)
+		rendered := s.buildServerConfig(inbound, settings, proto, ports[proto], binaryPath)
+		merged, recoveredOnDisk := mergeOpenVpnCustomConfig(rendered, settings.CustomConfig, string(existingBytes))
+		if strings.TrimSpace(settings.CustomConfig) == "" && strings.TrimSpace(recoveredOnDisk) != "" {
+			syncInboundCustomConfig(inbound.Id, recoveredOnDisk, false)
+		}
+		conf := applyCoreConfigOverride("openvpn", inbound.Id, "server-"+proto+".conf", merged)
 		if err := s.writeFile(confPath, conf); err != nil {
 			return err
 		}
@@ -773,6 +779,337 @@ func (s *OpenVpnService) buildServerConfig(inbound *model.Inbound, settings *ope
 	return b.String()
 }
 
+const (
+	userCustomBeginMarker   = "# BEGIN_USER_CUSTOM"
+	userCustomEndMarker     = "# END_USER_CUSTOM"
+	clientCustomBeginMarker = "# BEGIN_CLIENT_CUSTOM"
+	clientCustomEndMarker   = "# END_CLIENT_CUSTOM"
+)
+
+func stripCoreConfigBanner(content string) string {
+	if idx := strings.Index(content, coreConfigBanner); idx >= 0 {
+		return content[:idx]
+	}
+	return content
+}
+
+func extractDelimitedCustomBlock(content, beginMarker, endMarker string) []string {
+	var out []string
+	inBlock := false
+	for _, raw := range strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n") {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == beginMarker {
+			inBlock = true
+			continue
+		}
+		if trimmed == endMarker {
+			inBlock = false
+			continue
+		}
+		if inBlock {
+			if trimmed != "" {
+				out = append(out, strings.TrimRight(raw, " \t"))
+			}
+		}
+	}
+	return out
+}
+
+func splitOpenVpnCustomSections(settingsCustom string) (serverLines []string, clientLines []string) {
+	inClient := false
+	for _, raw := range strings.Split(strings.ReplaceAll(settingsCustom, "\r\n", "\n"), "\n") {
+		trimmed := strings.TrimSpace(raw)
+		switch trimmed {
+		case userCustomBeginMarker, userCustomEndMarker:
+			continue
+		case clientCustomBeginMarker:
+			inClient = true
+			continue
+		case clientCustomEndMarker:
+			inClient = false
+			continue
+		}
+		if trimmed == "" {
+			continue
+		}
+		if inClient {
+			clientLines = append(clientLines, trimmed)
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "client-custom:") {
+			val := strings.TrimSpace(trimmed[len("client-custom:"):])
+			if val != "" {
+				clientLines = append(clientLines, val)
+			}
+			continue
+		}
+		if strings.HasPrefix(lower, "#client:") {
+			val := strings.TrimSpace(trimmed[len("#client:"):])
+			if val != "" {
+				clientLines = append(clientLines, val)
+			}
+			continue
+		}
+		serverLines = append(serverLines, trimmed)
+	}
+	return serverLines, clientLines
+}
+
+func openVpnDirectiveKey(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+		return ""
+	}
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToLower(fields[0])
+}
+
+func dedupeCustomLines(groups ...[]string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, g := range groups {
+		for _, line := range g {
+			trimmed := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+			if trimmed == "" || trimmed == userCustomBeginMarker || trimmed == userCustomEndMarker {
+				continue
+			}
+			if seen[trimmed] {
+				continue
+			}
+			seen[trimmed] = true
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+var (
+	ovpnMandatoryDirectives = map[string]bool{
+		"port":                  true,
+		"proto":                 true,
+		"dev":                   true,
+		"dev-type":              true,
+		"topology":              true,
+		"server":                true,
+		"client-config-dir":     true,
+		"ca":                    true,
+		"cert":                  true,
+		"key":                   true,
+		"tls-crypt":             true,
+		"script-security":       true,
+		"auth-user-pass-verify": true,
+		"client-connect":        true,
+		"client-disconnect":     true,
+		"status":                true,
+		"status-version":        true,
+		"management":            true,
+		"verify-client-cert":    true,
+		"username-as-common-name": true,
+	}
+	ovpnUiControlledDirectives = map[string]bool{
+		"port":                    true,
+		"proto":                   true,
+		"dev":                     true,
+		"dev-type":                true,
+		"topology":                true,
+		"server":                  true,
+		"client-config-dir":       true,
+		"ca":                      true,
+		"cert":                    true,
+		"key":                     true,
+		"tls-crypt":               true,
+		"dh":                      true,
+		"providers":               true,
+		"duplicate-cn":            true,
+		"client-to-client":        true,
+		"disable-dco":             true,
+		"tun-mtu":                 true,
+		"mssfix":                  true,
+		"data-ciphers":            true,
+		"data-ciphers-fallback":   true,
+		"cipher":                  true,
+		"persist-key":             true,
+		"persist-tun":             true,
+		"auth-user-pass-verify":   true,
+		"client-connect":          true,
+		"client-disconnect":       true,
+		"script-security":         true,
+		"status":                  true,
+		"status-version":          true,
+		"management":              true,
+		"verify-client-cert":      true,
+		"username-as-common-name": true,
+	}
+	ovpnOverridableSingleDirectives = map[string]bool{
+		"keepalive":             true,
+		"cipher":                true,
+		"data-ciphers":          true,
+		"data-ciphers-fallback": true,
+		"ncp-ciphers":           true,
+		"tun-mtu":               true,
+		"mssfix":                true,
+		"sndbuf":                true,
+		"rcvbuf":                true,
+		"verb":                  true,
+		"reneg-sec":             true,
+		"max-clients":           true,
+		"ping":                  true,
+		"ping-restart":          true,
+		"explicit-exit-notify":  true,
+		"auth":                  true,
+		"dh":                    true,
+	}
+)
+
+// mergeOpenVpnCustomConfig merges user-supplied settingsCustom and any manual
+// operator directives / # BEGIN_USER_CUSTOM ... # END_USER_CUSTOM block from
+// existing on-disk config into rendered server config, suppressing overridden
+// single-value panel defaults while protecting mandatory panel directives.
+func mergeOpenVpnCustomConfig(rendered, settingsCustom, onDiskContent string) (merged string, recoveredOnDisk string) {
+	settingsServerLines, _ := splitOpenVpnCustomSections(settingsCustom)
+
+	onDiskClean := stripCoreConfigBanner(onDiskContent)
+	renderedLinesSet := make(map[string]bool)
+	for _, l := range strings.Split(strings.ReplaceAll(rendered, "\r\n", "\n"), "\n") {
+		if t := strings.TrimSpace(l); t != "" {
+			renderedLinesSet[t] = true
+		}
+	}
+
+	explicitDiskLines := extractDelimitedCustomBlock(onDiskClean, userCustomBeginMarker, userCustomEndMarker)
+	var looseDiskLines []string
+	inBlock := false
+	for _, raw := range strings.Split(strings.ReplaceAll(onDiskClean, "\r\n", "\n"), "\n") {
+		t := strings.TrimSpace(raw)
+		if t == userCustomBeginMarker {
+			inBlock = true
+			continue
+		}
+		if t == userCustomEndMarker {
+			inBlock = false
+			continue
+		}
+		if inBlock || t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, ";") {
+			continue
+		}
+		if renderedLinesSet[t] {
+			continue
+		}
+		key := openVpnDirectiveKey(t)
+		if key == "" || ovpnUiControlledDirectives[key] {
+			continue
+		}
+		looseDiskLines = append(looseDiskLines, t)
+	}
+
+	onDiskAll := dedupeCustomLines(explicitDiskLines, looseDiskLines)
+	// Filter unsafe panel-mandatory directives from both sources.
+	filterSafe := func(lines []string) []string {
+		var safe []string
+		for _, line := range lines {
+			key := openVpnDirectiveKey(line)
+			if key != "" && ovpnMandatoryDirectives[key] {
+				continue
+			}
+			safe = append(safe, line)
+		}
+		return safe
+	}
+	onDiskSafe := filterSafe(onDiskAll)
+	recoveredOnDisk = strings.Join(onDiskSafe, "\n")
+
+	combined := filterSafe(dedupeCustomLines(settingsServerLines, onDiskSafe))
+	if len(combined) == 0 {
+		return rendered, ""
+	}
+
+	overridden := make(map[string]bool)
+	for _, line := range combined {
+		key := openVpnDirectiveKey(line)
+		if key != "" && ovpnOverridableSingleDirectives[key] {
+			overridden[key] = true
+		}
+	}
+
+	var out strings.Builder
+	for _, line := range strings.Split(strings.TrimRight(strings.ReplaceAll(rendered, "\r\n", "\n"), "\n"), "\n") {
+		key := openVpnDirectiveKey(line)
+		if key != "" && overridden[key] {
+			continue
+		}
+		out.WriteString(line)
+		out.WriteByte('\n')
+	}
+	out.WriteString("\n" + userCustomBeginMarker + "\n")
+	for _, line := range combined {
+		out.WriteString(line)
+		out.WriteByte('\n')
+	}
+	out.WriteString(userCustomEndMarker + "\n")
+	return out.String(), recoveredOnDisk
+}
+
+func extractOpenVpnClientCustom(settingsCustom string) []string {
+	_, clientLines := splitOpenVpnCustomSections(settingsCustom)
+	blocked := map[string]bool{
+		"script-security":       true,
+		"up":                    true,
+		"down":                  true,
+		"route-up":              true,
+		"auth-user-pass-verify": true,
+		"ca":                    true,
+		"cert":                  true,
+		"key":                   true,
+		"tls-crypt":             true,
+	}
+	var out []string
+	for _, line := range dedupeCustomLines(clientLines) {
+		if k := openVpnDirectiveKey(line); k != "" && blocked[k] {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+func syncInboundCustomConfig(inboundId int, custom string, overwrite bool) {
+	custom = strings.TrimSpace(custom)
+	if inboundId <= 0 || (custom == "" && !overwrite) {
+		return
+	}
+	db := database.GetDB()
+	if db == nil {
+		return
+	}
+	var inbound model.Inbound
+	if err := db.Where("id = ?", inboundId).First(&inbound).Error; err != nil {
+		return
+	}
+	var settings map[string]any
+	if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil || settings == nil {
+		return
+	}
+	existing, _ := settings["customConfig"].(string)
+	if !overwrite && strings.TrimSpace(existing) != "" {
+		return
+	}
+	if strings.TrimSpace(existing) == custom {
+		return
+	}
+	if custom == "" {
+		delete(settings, "customConfig")
+	} else {
+		settings["customConfig"] = custom
+	}
+	if blob, err := json.MarshalIndent(settings, "", "  "); err == nil {
+		_ = db.Model(&model.Inbound{}).Where("id = ?", inboundId).Update("settings", string(blob)).Error
+	}
+}
+
 // clientCertContent returns the CA cert + tls-crypt key PEM to embed in a client
 // .ovpn, read from the operator's files in path mode or the inline fields.
 func (s *OpenVpnService) clientCertContent(settings *openvpnSettings) (ca, tlsCrypt string) {
@@ -1031,6 +1368,13 @@ func (s *OpenVpnService) GenerateClientConfig(inbound *model.Inbound, proto stri
 	}
 	b.WriteString("auth SHA256\n")
 	b.WriteString("verb 3\n")
+	if clientCustom := extractOpenVpnClientCustom(settings.CustomConfig); len(clientCustom) > 0 {
+		b.WriteString(userCustomBeginMarker + "\n")
+		for _, line := range clientCustom {
+			b.WriteString(line + "\n")
+		}
+		b.WriteString(userCustomEndMarker + "\n")
+	}
 	b.WriteString("<ca>\n")
 	b.WriteString(strings.TrimSpace(caContent))
 	b.WriteString("\n</ca>\n")

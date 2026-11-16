@@ -137,6 +137,10 @@
         sshStatusLog: '',
         sshStatusUp: false,
         sshStatusLoading: false,
+        hy2StatusText: '',
+        hy2StatusLog: '',
+        hy2StatusUp: false,
+        hy2StatusLoading: false,
         ok() {
             ObjectUtil.execute(outModal.confirm, outModal.outbound.toJson());
         },
@@ -164,9 +168,13 @@
             this.sshStatusText = '';
             this.sshStatusLog = '';
             this.sshStatusUp = false;
+            this.hy2StatusText = '';
+            this.hy2StatusLog = '';
+            this.hy2StatusUp = false;
             this.check()
             if (isEdit && isVpnProtocol(this.outbound.protocol)) this.refreshVpnStatus();
             if (isEdit && this.outbound.protocol === Protocols.SSH) this.refreshSshStatus();
+            if (isEdit && this.outbound.protocol === Protocols.Hysteria2) this.refreshHy2Status();
         },
         // Asks the panel whether this tunnel is carrying traffic. Kept on the modal
         // object rather than in Vue methods so show() can call it too.
@@ -201,6 +209,19 @@
                 ? '{{ i18n "pages.xray.outbound.sshOutUp" }}'
                 : '{{ i18n "pages.xray.outbound.sshOutDown" }}';
             this.sshStatusLog = msg.obj.log || '';
+        },
+        async refreshHy2Status() {
+            const tag = this.outbound?.tag;
+            if (!tag) return;
+            this.hy2StatusLoading = true;
+            const msg = await HttpUtil.post('/panel/xray/hy2outbound/status', { tag: tag });
+            this.hy2StatusLoading = false;
+            if (!msg || !msg.obj) return;
+            this.hy2StatusUp = !!msg.obj.running;
+            this.hy2StatusText = this.hy2StatusUp
+                ? '{{ i18n "pages.xray.outbound.vpnOutUp" }}'
+                : '{{ i18n "pages.xray.outbound.vpnOutDown" }}';
+            this.hy2StatusLog = msg.obj.log || '';
         },
         close() {
             outModal.visible = false;
@@ -237,7 +258,7 @@
                         // server, credentials and keys the operator just typed. The
                         // JSON stays a read-only view of what Xray will get; the
                         // tunnel form above remains the source of truth.
-                        if (this.outbound.protocol === Protocols.SSH) return;
+                        if (this.outbound.protocol === Protocols.SSH || this.outbound.protocol === Protocols.Hysteria2) return;
                         if (isVpnProtocol(this.outbound.protocol)) return;
                         this.outbound = Outbound.fromJson(JSON.parse(value));
                         this.check();

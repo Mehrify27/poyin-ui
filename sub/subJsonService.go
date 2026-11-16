@@ -172,27 +172,31 @@ func (s *SubJsonService) getConfig(inbound *model.Inbound, client model.Client, 
 	}
 	var newJsonArray []json_util.RawMessage
 	stream := s.streamData(inbound.StreamSettings)
+	var settingsMap map[string]any
+	if inbound.Protocol == model.Hysteria2 {
+		_ = json.Unmarshal([]byte(inbound.Settings), &settingsMap)
+	}
 
-	externalProxies, ok := stream["externalProxy"].([]any)
-	if !ok || len(externalProxies) == 0 {
-		externalProxies = []any{
-			map[string]any{
-				"forceTls": "same",
-				"dest":     host,
-				"port":     float64(inbound.Port),
-				"remark":   "",
+	specs := extractExternalProxies(stream, settingsMap, host, inbound.Port)
+	if len(specs) == 0 {
+		specs = []externalProxySpec{
+			{
+				ForceTls: "same",
+				Dest:     host,
+				Port:     inbound.Port,
+				Remark:   "",
 			},
 		}
 	}
 
 	delete(stream, "externalProxy")
 
-	for _, ep := range externalProxies {
-		extPrxy := ep.(map[string]any)
-		inbound.Listen = extPrxy["dest"].(string)
-		inbound.Port = int(extPrxy["port"].(float64))
-		newStream := stream
-		switch extPrxy["forceTls"].(string) {
+	for _, spec := range specs {
+		workingInbound := *inbound
+		workingInbound.Listen = spec.Dest
+		workingInbound.Port = spec.Port
+		newStream := cloneMap(stream)
+		switch spec.ForceTls {
 		case "tls":
 			if newStream["security"] != "tls" {
 				newStream["security"] = "tls"
@@ -202,26 +206,27 @@ func (s *SubJsonService) getConfig(inbound *model.Inbound, client model.Client, 
 			if newStream["security"] != "none" {
 				newStream["security"] = "none"
 				delete(newStream, "tlsSettings")
+				delete(newStream, "realitySettings")
 			}
 		}
 		streamSettings, _ := json.MarshalIndent(newStream, "", "  ")
 
 		var newOutbounds []json_util.RawMessage
 
-		switch inbound.Protocol {
+		switch workingInbound.Protocol {
 		case "vmess":
-			newOutbounds = append(newOutbounds, s.genVnext(inbound, streamSettings, client))
+			newOutbounds = append(newOutbounds, s.genVnext(&workingInbound, streamSettings, client))
 		case "vless":
-			newOutbounds = append(newOutbounds, s.genVless(inbound, streamSettings, client))
+			newOutbounds = append(newOutbounds, s.genVless(&workingInbound, streamSettings, client))
 		// anytls joins trojan/shadowsocks: its account is a bare password and its
 		// outbound reads the same `servers` array, so genServer already emits it
 		// correctly. (The core's infra/conf must accept that shape.)
 		case "trojan", "shadowsocks", "anytls":
-			newOutbounds = append(newOutbounds, s.genServer(inbound, streamSettings, client))
+			newOutbounds = append(newOutbounds, s.genServer(&workingInbound, streamSettings, client))
 		case "hysteria", "hysteria2":
-			newOutbounds = append(newOutbounds, s.genHy(inbound, newStream, client))
+			newOutbounds = append(newOutbounds, s.genHy(&workingInbound, newStream, client))
 		case "tuic":
-			newOutbounds = append(newOutbounds, s.genTuic(inbound, newStream, client))
+			newOutbounds = append(newOutbounds, s.genTuic(&workingInbound, newStream, client))
 		}
 
 		newOutbounds = append(newOutbounds, s.defaultOutbounds...)
@@ -229,7 +234,7 @@ func (s *SubJsonService) getConfig(inbound *model.Inbound, client model.Client, 
 		maps.Copy(newConfigJson, s.configJson)
 
 		newConfigJson["outbounds"] = newOutbounds
-		newConfigJson["remarks"] = s.SubService.genRemark(inbound, client.Email, extPrxy["remark"].(string))
+		newConfigJson["remarks"] = s.SubService.genRemark(&workingInbound, client.Email, spec.Remark)
 
 		newConfig, _ := json.MarshalIndent(newConfigJson, "", "  ")
 		newJsonArray = append(newJsonArray, newConfig)
@@ -356,13 +361,25 @@ func (s *SubJsonService) genVless(inbound *model.Inbound, streamSettings json_ut
 	json.Unmarshal([]byte(inbound.Settings), &inboundSettings)
 	encryption, _ := inboundSettings["encryption"].(string)
 
+	var stream map[string]any
+	_ = json.Unmarshal(streamSettings, &stream)
+	network, _ := stream["network"].(string)
+	security, _ := stream["security"].(string)
+
+	flow := client.Flow
+	if flow == "" && network == "tcp" && (security == "tls" || security == "reality") {
+		if inboundFlow, ok := inboundSettings["flow"].(string); ok {
+			flow = inboundFlow
+		}
+	}
+
 	user := map[string]any{
 		"id":         client.ID,
 		"level":      8,
 		"encryption": encryption,
 	}
-	if client.Flow != "" {
-		user["flow"] = client.Flow
+	if flow != "" {
+		user["flow"] = flow
 	}
 
 	vnext := map[string]any{
@@ -461,8 +478,6 @@ func (s *SubJsonService) genTuic(inbound *model.Inbound, newStream map[string]an
 
 func (s *SubJsonService) genHy(inbound *model.Inbound, newStream map[string]any, client model.Client) json_util.RawMessage {
 	outbound := Outbound{}
-
-	outbound.Protocol = string(inbound.Protocol)
 	outbound.Tag = "proxy"
 
 	if s.mux != "" {
@@ -470,7 +485,77 @@ func (s *SubJsonService) genHy(inbound *model.Inbound, newStream map[string]any,
 	}
 
 	var settings, stream map[string]any
-	json.Unmarshal([]byte(inbound.Settings), &settings)
+	_ = json.Unmarshal([]byte(inbound.Settings), &settings)
+	_ = json.Unmarshal([]byte(inbound.StreamSettings), &stream)
+
+	auth := client.Auth
+	if auth == "" {
+		auth = client.Password
+	}
+
+	if inbound.Protocol == model.Hysteria2 {
+		outbound.Protocol = "hysteria"
+		outbound.Settings = map[string]any{
+			"version": 2,
+			"address": inbound.Listen,
+			"port":    inbound.Port,
+		}
+		newStream["hysteriaSettings"] = map[string]any{
+			"version": 2,
+			"auth":    auth,
+		}
+		tlsCfg := map[string]any{
+			"alpn": []string{"h3"},
+		}
+		if alpns, ok := settings["alpn"].([]any); ok {
+			var parsed []string
+			for _, a := range alpns {
+				if as, ok := a.(string); ok && strings.TrimSpace(as) != "" {
+					parsed = append(parsed, strings.TrimSpace(as))
+				}
+			}
+			if len(parsed) > 0 {
+				tlsCfg["alpn"] = parsed
+			}
+		}
+		if sni, _ := settings["serverName"].(string); strings.TrimSpace(sni) != "" {
+			tlsCfg["serverName"] = strings.TrimSpace(sni)
+		}
+		innerTls := map[string]any{}
+		if allowInsecure, _ := settings["allowInsecure"].(bool); allowInsecure {
+			innerTls["allowInsecure"] = true
+		}
+		if fp, _ := settings["fingerprint"].(string); strings.TrimSpace(fp) != "" {
+			innerTls["fingerprint"] = strings.TrimSpace(fp)
+		}
+		if len(innerTls) > 0 {
+			tlsCfg["settings"] = innerTls
+		}
+		newStream["tlsSettings"] = tlsCfg
+
+		obfsType, _ := settings["obfsType"].(string)
+		obfsPass, _ := settings["obfsPassword"].(string)
+		if strings.EqualFold(strings.TrimSpace(obfsType), "salamander") && obfsPass != "" {
+			newStream["finalmask"] = map[string]any{
+				"udp": []map[string]any{
+					{
+						"type": "salamander",
+						"settings": map[string]any{
+							"password": obfsPass,
+						},
+					},
+				},
+			}
+		}
+
+		newStream["network"] = "hysteria"
+		newStream["security"] = "tls"
+		outbound.StreamSettings, _ = json.MarshalIndent(newStream, "", "  ")
+		result, _ := json.MarshalIndent(outbound, "", "  ")
+		return result
+	}
+
+	outbound.Protocol = string(inbound.Protocol)
 	version, _ := settings["version"].(float64)
 	outbound.Settings = map[string]any{
 		"version": int(version),
@@ -478,11 +563,10 @@ func (s *SubJsonService) genHy(inbound *model.Inbound, newStream map[string]any,
 		"port":    inbound.Port,
 	}
 
-	json.Unmarshal([]byte(inbound.StreamSettings), &stream)
-	hyStream := stream["hysteriaSettings"].(map[string]any)
+	hyStream, _ := stream["hysteriaSettings"].(map[string]any)
 	outHyStream := map[string]any{
 		"version": int(version),
-		"auth":    client.Auth,
+		"auth":    auth,
 	}
 	if udpIdleTimeout, ok := hyStream["udpIdleTimeout"].(float64); ok {
 		outHyStream["udpIdleTimeout"] = int(udpIdleTimeout)

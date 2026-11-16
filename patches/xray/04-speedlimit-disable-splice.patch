@@ -1,0 +1,94 @@
+diff --git a/app/dispatcher/default.go b/app/dispatcher/default.go
+index 6090b648..3ef914c1 100644
+--- a/app/dispatcher/default.go
++++ b/app/dispatcher/default.go
+@@ -189,6 +189,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
+ 	// connection an account has open. It is looked up outside the block above
+ 	// because it must also fire when the email is empty: see LookupSession.
+ 	if l := speedlimit.LookupSession(user, sessionInbound); l != nil {
++		speedlimit.DisableSplice(sessionInbound)
+ 		inboundLink.Writer = speedlimit.NewWriter(ctx, inboundLink.Writer, l.Up)
+ 		outboundLink.Writer = speedlimit.NewWriter(ctx, outboundLink.Writer, l.Down)
+ 	}
+@@ -209,6 +210,7 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
+ 	// must stay outermost because the stats block type-asserts it, and so does
+ 	// DispatchLink before sniffing.
+ 	if l := speedlimit.LookupSession(user, sessionInbound); l != nil {
++		speedlimit.DisableSplice(sessionInbound)
+ 		link.Reader = speedlimit.NewReader(ctx, link.Reader, l.Up)
+ 		link.Writer = speedlimit.NewWriter(ctx, link.Writer, l.Down)
+ 	}
+diff --git a/common/speedlimit/speedlimit.go b/common/speedlimit/speedlimit.go
+index 6f04ad3e..059cf0bd 100644
+--- a/common/speedlimit/speedlimit.go
++++ b/common/speedlimit/speedlimit.go
+@@ -189,6 +189,28 @@ func LookupSession(user *protocol.MemoryUser, inbound *session.Inbound) *Limits
+ 	return defaultTable.lookupSession(user, inbound)
+ }
+ 
++// DisableSplice marks a session as ineligible for the zero-copy splice path.
++//
++// It MUST be called for every session the limiter is applied to. Pacing lives in the
++// buf.Reader/buf.Writer wrappers the dispatcher installs, and the splice path
++// (proxy.CopyRawConnIfExist) hands the two raw TCP sockets to tc.ReadFrom instead,
++// moving bytes kernel-to-kernel WITHOUT ever touching those wrappers. A spliced
++// connection is therefore completely unlimited, silently.
++//
++// This is not a corner case: dokodemo-door sets CanSpliceCopy=1 and freedom sets it on
++// the outbound, which is exactly the shape every VPN tunnel protocol here arrives in
++// (l2tp/pptp/openvpn/openconnect/sstp/ikev2/wg-c/awg all enter through dokodemo and
++// egress through freedom), so before this the limiter did nothing at all for them
++// while working normally for vmess/vless/trojan (which must decrypt and so never splice).
++//
++// 3 is the "cannot splice" state CopyRawConnIfExist checks first. Only limited accounts
++// pay the buffered-copy cost; unlimited ones keep the fast path.
++func DisableSplice(inbound *session.Inbound) {
++	if inbound != nil {
++		inbound.CanSpliceCopy = 3
++	}
++}
++
+ func (t *table) lookupSession(user *protocol.MemoryUser, inbound *session.Inbound) *Limits {
+ 	var email string
+ 	if user != nil {
+diff --git a/common/speedlimit/splice_test.go b/common/speedlimit/splice_test.go
+new file mode 100644
+index 00000000..94942507
+--- /dev/null
++++ b/common/speedlimit/splice_test.go
+@@ -0,0 +1,35 @@
++package speedlimit
++
++import (
++	"testing"
++
++	"github.com/xtls/xray-core/common/session"
++)
++
++// A limited session must never take the splice path. Pacing lives in the buf
++// Reader/Writer wrappers; splice (proxy.CopyRawConnIfExist -> tc.ReadFrom) moves bytes
++// kernel-to-kernel and never touches them, so a spliced connection is silently
++// unlimited. That is the shape every dokodemo-based VPN protocol arrives in, which is
++// how the limiter came to do nothing at all for them.
++func TestDisableSpliceMarksSessionIneligible(t *testing.T) {
++	in := &session.Inbound{CanSpliceCopy: 1} // what dokodemo-door sets
++	DisableSplice(in)
++	if in.CanSpliceCopy != 3 {
++		t.Fatalf("CanSpliceCopy = %d, want 3 (cannot splice); a limited session would be paced only on paper", in.CanSpliceCopy)
++	}
++}
++
++// The dispatcher calls this on every limited session, including ones where the inbound
++// is absent, so it must not panic.
++func TestDisableSpliceNilSafe(t *testing.T) {
++	DisableSplice(nil)
++}
++
++// Already-ineligible sessions stay ineligible (3 is terminal, not toggled).
++func TestDisableSpliceIdempotent(t *testing.T) {
++	in := &session.Inbound{CanSpliceCopy: 3}
++	DisableSplice(in)
++	if in.CanSpliceCopy != 3 {
++		t.Fatalf("CanSpliceCopy = %d, want 3", in.CanSpliceCopy)
++	}
++}

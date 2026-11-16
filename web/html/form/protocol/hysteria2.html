@@ -1,0 +1,233 @@
+{{define "form/hysteria2"}}
+<a-collapse activeKey="0"
+    v-for="(client, index) in inbound.settings.hysteria2s.slice(0,1)"
+    v-if="!isEdit">
+    <a-collapse-panel header='{{ i18n "pages.inbounds.client" }}'>
+        {{template "form/client"}}
+    </a-collapse-panel>
+</a-collapse>
+<a-collapse v-else>
+    <a-collapse-panel :header="'{{ i18n "pages.client.clientCount"}} : ' +
+        inbound.settings.hysteria2s.length">
+        <table width="100%">
+            <tr class="client-table-header">
+                <th>{{ i18n "pages.inbounds.email" }}</th>
+                <th>Auth</th>
+            </tr>
+            <tr v-for="(client, index) in inbound.settings.hysteria2s"
+                :class="index % 2 == 1 ? 'client-table-odd-row' : ''">
+                <td>[[ client.email ]]</td>
+                <td>[[ client.auth ]]</td>
+            </tr>
+        </table>
+    </a-collapse-panel>
+</a-collapse>
+<a-form :colon="false" :label-col="{ md: {span:8} }" :wrapper-col="{ md: {span:14} }">
+    <a-form-item label="Upload (Mbps)">
+        <a-input-number v-model.number="inbound.settings.upMbps" :min="0"></a-input-number>
+    </a-form-item>
+    <a-form-item label="Download (Mbps)">
+        <a-input-number v-model.number="inbound.settings.downMbps" :min="0"></a-input-number>
+    </a-form-item>
+    <a-form-item label="Ignore Client Bandwidth">
+        <a-switch v-model="inbound.settings.ignoreClientBandwidth"></a-switch>
+    </a-form-item>
+    <a-form-item label="Obfuscation">
+        <a-select v-model="inbound.settings.obfsType" :dropdown-class-name="themeSwitcher.currentTheme">
+            <a-select-option value="">None</a-select-option>
+            <a-select-option value="salamander">Salamander</a-select-option>
+        </a-select>
+    </a-form-item>
+    <a-form-item v-if="inbound.settings.obfsType" label="Obfs Password">
+        <a-input v-model.trim="inbound.settings.obfsPassword" placeholder="Salamander pre-shared key">
+            <template slot="addonAfter">
+                <a-icon type="sync" @click="inbound.settings.obfsPassword = RandomUtil.randomSeq(16)"></a-icon>
+            </template>
+        </a-input>
+    </a-form-item>
+    <a-form-item label="Masquerade">
+        <a-input v-model.trim="inbound.settings.masquerade"
+            placeholder="https://www.bing.com or string://hello (empty = 404)"></a-input>
+    </a-form-item>
+    <a-form-item label="Port Hopping">
+        <a-input v-model.trim="inbound.settings.hopPorts"
+            placeholder="e.g. 20000-20100 or 443,20000-20100"></a-input>
+    </a-form-item>
+    <a-form-item v-if="inbound.settings.hopPorts" label="Hop Interval">
+        <a-input v-model.trim="inbound.settings.hopInterval" placeholder="30s"></a-input>
+    </a-form-item>
+    <a-form-item>
+        <template slot="label">
+            <a-tooltip>
+                <template slot="title">
+                    Forward authenticated Hysteria 2 traffic through Xray's internal SOCKS5 bridge so
+                    Xray routing rules, balancer, and per-account stats apply. Turn off for direct sing-box exit.
+                </template>
+                Route via Xray
+                <a-icon type="question-circle"></a-icon>
+            </a-tooltip>
+        </template>
+        <a-switch v-model="inbound.settings.routeThroughXray"></a-switch>
+    </a-form-item>
+</a-form>
+{{end}}
+{{define "form/hysteria2/security"}}
+<a-form :colon="false" :label-col="{ md: {span:8} }" :wrapper-col="{ md: {span:14} }">
+    <div class="bo-if-sub">TLS Certificate</div>
+    <a-form-item label="Certificate Source">
+        <a-radio-group v-model="inbound.settings.tlsUseFile" button-style="solid">
+            <a-radio-button :value="true">Path</a-radio-button>
+            <a-radio-button :value="false">Content</a-radio-button>
+        </a-radio-group>
+    </a-form-item>
+    <a-form-item v-if="sslCertChoices().length" label='{{ i18n "pages.inbounds.useManagedCert" }}'>
+        <a-select :value="sslCertSelectedSettings()" @change="applyManagedCertSettings"
+            :dropdown-class-name="themeSwitcher.currentTheme">
+            <a-select-option :value="''">{{ i18n "none" }}</a-select-option>
+            <a-select-option v-for="c in sslCertChoices()" :key="c.profile" :value="c.profile">
+                [[ c.label ]]<span v-if="c.expired"> &middot; {{ i18n "pages.settings.ssl.expired" }}</span><span
+                    v-else-if="c.selfSigned"> &middot; {{ i18n "pages.settings.ssl.selfSigned" }}</span>
+            </a-select-option>
+        </a-select>
+    </a-form-item>
+    <template v-if="inbound.settings.tlsUseFile">
+        <a-form-item label="Certificate Path">
+            <a-input v-model.trim="inbound.settings.certificateFile" placeholder="/path/to/fullchain.pem">
+                <template slot="addonAfter">
+                    <a-tooltip title="Use the panel's TLS certificate paths">
+                        <a-icon type="import" @click="hy2SetDefaultCert"></a-icon>
+                    </a-tooltip>
+                </template>
+            </a-input>
+        </a-form-item>
+        <a-form-item label="Key Path">
+            <a-input v-model.trim="inbound.settings.keyFile" placeholder="/path/to/privkey.pem"></a-input>
+        </a-form-item>
+    </template>
+    <template v-else>
+        <a-form-item label="Server Certificate">
+            <a-textarea v-model="inbound.settings.certificate" :rows="3"
+                placeholder="-----BEGIN CERTIFICATE----- (leave blank to auto-generate self-signed)"></a-textarea>
+        </a-form-item>
+        <a-form-item label="Server Key">
+            <a-textarea v-model="inbound.settings.key" :rows="3"
+                placeholder="-----BEGIN EC PRIVATE KEY-----"></a-textarea>
+        </a-form-item>
+        <a-form-item :wrapper-col="{ md: {offset:8, span:14} }">
+            <a-button type="primary" @click="generateOcservCert">
+                Generate Self-Signed Cert
+            </a-button>
+        </a-form-item>
+    </template>
+    <a-form-item label="Server Name (SNI)">
+        <a-input v-model.trim="inbound.settings.serverName" placeholder="example.com"></a-input>
+    </a-form-item>
+    <a-form-item label="ALPN">
+        <a-select v-model="inbound.settings.alpn" mode="tags" :dropdown-class-name="themeSwitcher.currentTheme"
+            placeholder="h3">
+            <a-select-option value="h3">h3</a-select-option>
+        </a-select>
+    </a-form-item>
+    <a-form-item label="Allow Insecure">
+        <a-switch v-model="inbound.settings.allowInsecure"></a-switch>
+    </a-form-item>
+    <a-form-item label="Pin SHA-256">
+        <a-input v-model.trim="inbound.settings.pinSHA256"
+            placeholder="Optional SHA-256 hex (auto-computed if blank)"></a-input>
+    </a-form-item>
+    <a-form-item label="uTLS Fingerprint">
+        <a-input v-model.trim="inbound.settings.fingerprint" placeholder="chrome / firefox (optional)"></a-input>
+    </a-form-item>
+</a-form>
+{{end}}
+{{define "form/hysteria2/access"}}
+<a-form :colon="false" :label-col="{ md: {span:8} }" :wrapper-col="{ md: {span:14} }">
+    <a-form-item>
+        <template slot="label">
+            <a-tooltip>
+                <template slot="title">
+                    Max simultaneous client IPs per account on this inbound (0 = no limit, up to 64).
+                </template>
+                IP Limit
+                <a-icon type="question-circle"></a-icon>
+            </a-tooltip>
+        </template>
+        <a-input-number
+            :value="inbound.settings.userLimit"
+            @change="inbound.settings.userLimit = Math.max(0, Math.min(64, Math.floor($event || 0)))"
+            :min="0" :max="64" :step="1" :precision="0" style="width: 90px"
+        ></a-input-number>
+    </a-form-item>
+    <a-form-item>
+        <template slot="label">
+            <a-tooltip>
+                <template slot="title">
+                    When an account is already at its IP limit: reject new IPs or accept and close the oldest IP's connections.
+                </template>
+                IP Limit Strategy
+                <a-icon type="question-circle"></a-icon>
+            </a-tooltip>
+        </template>
+        <a-radio-group v-model="inbound.settings.userLimitStrategy" button-style="solid">
+            <a-radio-button value="accept">Accept</a-radio-button>
+            <a-radio-button value="reject">Reject</a-radio-button>
+        </a-radio-group>
+    </a-form-item>
+</a-form>
+{{end}}
+{{define "form/hysteria2/reach"}}
+<a-form :colon="false" :label-col="{ md: {span:8} }" :wrapper-col="{ md: {span:14} }">
+    <a-form-item>
+        <template slot="label">
+            <a-tooltip>
+                <template slot="title">
+                    Alternate Endpoint(s) (relay/CDN host:port) written into generated client configs and links instead of the panel host.
+                </template>
+                External Proxy
+                <a-icon type="question-circle"></a-icon>
+            </a-tooltip>
+        </template>
+        <a-switch v-model="wgcExternalProxy"></a-switch>
+        <a-button
+            icon="plus"
+            v-if="wgcExternalProxy"
+            type="primary"
+            :style="{ marginLeft: '10px' }"
+            size="small"
+            @click="inbound.settings.externalProxy.push({dest: '', port: inbound.port, remark: ''})"
+        ></a-button>
+    </a-form-item>
+    <a-input-group
+        :style="{ margin: '8px 0' }"
+        compact
+        v-for="(row, index) in inbound.settings.externalProxy"
+    >
+        <a-input
+            :style="{ width: '45%' }"
+            v-model.trim="row.dest"
+            placeholder='{{ i18n "host" }}'
+        ></a-input>
+        <a-tooltip title='{{ i18n "pages.inbounds.port" }}'>
+            <a-input-number
+                :style="{ width: '20%' }"
+                v-model.number="row.port"
+                min="1"
+                max="65535"
+            ></a-input-number>
+        </a-tooltip>
+        <a-input
+            :style="{ width: '30%', top: '0' }"
+            v-model.trim="row.remark"
+            placeholder='{{ i18n "remark" }}'
+        >
+            <template slot="addonAfter">
+                <a-button
+                    icon="minus"
+                    size="small"
+                    @click="inbound.settings.externalProxy.splice(index, 1)"
+                ></a-button>
+            </template>
+        </a-input>
+    </a-input-group>
+</a-form>
+{{end}}

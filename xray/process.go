@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/config"
+	"github.com/mhsanaei/3x-ui/v2/corebundle"
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/util/common"
 )
@@ -24,9 +25,10 @@ func GetBinaryName() string {
 	return fmt.Sprintf("xray-%s-%s", runtime.GOOS, runtime.GOARCH)
 }
 
-// GetBinaryPath returns the full path to the Xray binary executable.
+// GetBinaryPath returns the full path to the Xray binary executable, preferring
+// any valid custom override under the custom binary directory.
 func GetBinaryPath() string {
-	return config.GetBinFolderPath() + "/" + GetBinaryName()
+	return corebundle.ResolveXrayBinaryPath(config.GetBinFolderPath())
 }
 
 // GetConfigPath returns the path to the Xray configuration file in the binary folder.

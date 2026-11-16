@@ -28,9 +28,10 @@ type XrayTrafficJob struct {
 	ikev2Service    service.Ikev2Service
 	wgcService      service.WgcService
 	awgService      service.AwgService
-	greService      service.GreService
-	mtprotoService  service.MtprotoService
-	sshService      service.SshService
+	greService       service.GreService
+	mtprotoService   service.MtprotoService
+	hysteria2Service service.Hysteria2Service
+	sshService       service.SshService
 	nftService      service.NftService
 	radiusService   *service.RadiusService
 	sweeper         *rbridge.Sweeper
@@ -236,6 +237,13 @@ func (j *XrayTrafficJob) Run() {
 		j.mtprotoService.CollectTraffic(), j.inboundService.SingleInboundIdByEmail("mtproto")))
 	clientTraffics = appendUnrecorded(clientTraffics, stampSourceInbound(
 		j.sshService.CollectTraffic(), j.inboundService.SingleInboundIdByEmail("ssh")))
+	hy2InboundTraffics, hy2ClientTraffics := j.hysteria2Service.CollectAllTraffic()
+	if len(hy2InboundTraffics) > 0 {
+		traffics = append(traffics, hy2InboundTraffics...)
+	}
+	if len(hy2ClientTraffics) > 0 {
+		clientTraffics = append(clientTraffics, hy2ClientTraffics...)
+	}
 
 	// Level-triggered enforcement: disconnect any STILL-connected client that is no
 	// longer allowed (quota/expiry hit, or disabled in settings). The edge-triggered
@@ -255,6 +263,7 @@ func (j *XrayTrafficJob) Run() {
 	// watcher applies it and cancels the disabled accounts' live sessions itself, so
 	// there is no separate kill path and no daemon restart.
 	j.mtprotoService.KillDisabledSessions()
+	j.hysteria2Service.KillDisabledSessions()
 	// SSH: close the live sessions of any disabled account and trim every account to
 	// its User Limit. The server owns every net.Conn, so this is an in-process close.
 	j.sshService.KillDisabledSessions()
@@ -286,6 +295,7 @@ func (j *XrayTrafficJob) Run() {
 	// re-renders the config and generateServerConfig now skips writing when the bytes
 	// are unchanged, so a no-op tick costs a read and no reload.
 	j.mtprotoService.KillDisabledSessions()
+	j.hysteria2Service.KillDisabledSessions()
 	// Enforce limits on L2TP clients (kill sessions, regenerate chap-secrets)
 	if len(l2tpDisabledEmails) > 0 {
 		j.l2tpService.DisableClients(l2tpDisabledEmails)

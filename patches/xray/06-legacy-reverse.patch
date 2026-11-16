@@ -1,0 +1,12 @@
+diff --git a/infra/conf/xray.go b/infra/conf/xray.go
+index ee90633d..ab825a96 100644
+--- a/infra/conf/xray.go
++++ b/infra/conf/xray.go
+@@ -678,7 +678,6 @@ func (c *Config) Build() (*core.Config, error) {
+ 	}
+ 
+ 	if c.Reverse != nil {
+-		return nil, errors.PrintRemovedFeatureError(`"legacy reverse"`, `"VLESS Reverse Proxy"`)
+ 		r, err := c.Reverse.Build()
+ 		if err != nil {
+ 			return nil, errors.New("failed to build reverse configuration").Base(err)

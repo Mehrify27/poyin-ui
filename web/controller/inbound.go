@@ -31,9 +31,10 @@ type InboundController struct {
 	ikev2Service   service.Ikev2Service
 	wgcService     service.WgcService
 	awgService     service.AwgService
-	greService     service.GreService
-	mtprotoService service.MtprotoService
-	sshService     service.SshService
+	greService       service.GreService
+	mtprotoService   service.MtprotoService
+	hysteria2Service service.Hysteria2Service
+	sshService       service.SshService
 }
 
 // NewInboundController creates a new InboundController and sets up its routes.
@@ -340,6 +341,27 @@ func (a *InboundController) mtprotoChanged(clientOnly bool) {
 	a.mtprotoService.KillDisabledSessions()
 	// The paired socks inbound (and thus this inbound's routing tag) is built from
 	// the mtproto settings, so Xray must pick the change up.
+	a.xrayService.SetToNeedRestart()
+}
+
+// onHysteria2Changed reconciles sing-box Hysteria 2 daemons and the paired Xray
+// loopback socks inbounds whenever a Hysteria 2 inbound or its clients change.
+func (a *InboundController) onHysteria2Changed()       { a.hysteria2Changed(false) }
+func (a *InboundController) onHysteria2ClientChanged() { a.hysteria2Changed(true) }
+func (a *InboundController) hysteria2Changed(clientOnly bool) {
+	if err := a.hysteria2Service.GenerateAllConfigs(); err != nil {
+		logger.Warning("Hysteria2: config generation failed:", err)
+	}
+	if !clientOnly {
+		if err := a.hysteria2Service.RestartServices(); err != nil {
+			logger.Warning("Hysteria2: service restart failed:", err)
+		}
+	} else {
+		if err := a.hysteria2Service.EnsureServicesRunning(); err != nil {
+			logger.Warning("Hysteria2: ensure-running failed:", err)
+		}
+	}
+	a.hysteria2Service.KillDisabledSessions()
 	a.xrayService.SetToNeedRestart()
 }
 
@@ -704,6 +726,8 @@ func (a *InboundController) addInbound(c *gin.Context) {
 		a.onGreChanged()
 	} else if inbound.Protocol == model.MTPROTO {
 		a.onMtprotoChanged()
+	} else if inbound.Protocol == model.Hysteria2 {
+		a.onHysteria2Changed()
 	} else if inbound.Protocol == model.SSH {
 		a.onSshChanged()
 	} else if inbound.Protocol == model.WireGuard {
@@ -789,6 +813,9 @@ func (a *InboundController) delInbound(c *gin.Context) {
 		a.onGreChanged()
 	} else if oldInbound != nil && oldInbound.Protocol == model.MTPROTO {
 		a.onMtprotoChanged()
+	} else if oldInbound != nil && oldInbound.Protocol == model.Hysteria2 {
+		a.hysteria2Service.RemoveInboundConfig(id)
+		a.onHysteria2Changed()
 	} else if oldInbound != nil && oldInbound.Protocol == model.SSH {
 		a.onSshChanged()
 	} else if oldInbound != nil && oldInbound.Protocol == model.WireGuard {
@@ -889,6 +916,8 @@ func (a *InboundController) updateInbound(c *gin.Context) {
 		a.onGreChanged()
 	} else if inbound.Protocol == model.MTPROTO {
 		a.onMtprotoChanged()
+	} else if inbound.Protocol == model.Hysteria2 {
+		a.onHysteria2Changed()
 	} else if inbound.Protocol == model.SSH {
 		a.onSshChanged()
 	} else if inbound.Protocol == model.WireGuard {
@@ -994,9 +1023,20 @@ func (a *InboundController) addInboundClient(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
-	// Prices the account against the reseller's balance, clamps the posted client to
-	// their limits, and RESERVES the bytes before the account exists. Inactive for an
-	// admin, who has no balance to reserve against.
+	batchEmails := postedClientEmails(data)
+	if len(batchEmails) == 0 {
+		if single := postedClientEmail(data); single != "" {
+			batchEmails = []string{single}
+		}
+	}
+	for _, mid := range membershipIds {
+		if refused := a.inboundService.AdmitAccounts(mid, batchEmails); refused != nil {
+			jsonMsg(c, I18nWeb(c, "somethingWentWrong"), refused)
+			return
+		}
+	}
+	// Prices the account(s) against the reseller's balance, clamps the posted client(s) to
+	// their limits, and RESERVES the total bytes atomically before any account exists.
 	//
 	// Reserve first, create second, on purpose: a failure between the two loses the
 	// reseller balance an admin can hand back, where the other order would hand out a
@@ -1009,43 +1049,34 @@ func (a *InboundController) addInboundClient(c *gin.Context) {
 
 	needRestart, err := a.inboundService.AddInboundClient(data)
 	if err != nil {
-		// The reservation paid for an account that never landed. Give it back.
+		// The reservation paid for account(s) that never landed. Give it back.
 		if rerr := resellerService.Rollback(ticket); rerr != nil {
 			logger.Warning("rolling back a reseller charge whose client write failed: ", rerr)
 		}
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
-	// Put the account on every requested inbound and re-project, so all of them
-	// carry it before any daemon config is regenerated below.
-	//
-	// A BULK add posts many clients in one request, and postedClientEmail answers
-	// "" for all of them on purpose: there is no single account for a membership
-	// set to be about. That left the batch mirrored nowhere - every client landed
-	// in settings.clients and client_traffics, and NONE of them appeared on the
-	// Clients page, which lists the accounts layer. It self-healed on the next
-	// single-client write to the same inbound, which is what made it look like a
-	// refresh problem. The mirror is per-inbound, so one call covers the batch.
-	//
-	// A batch can name a membership SET as well, and then every account in it has
-	// to reach every inbound in the set. That is per account, not per request, so
-	// it is a loop rather than one call: ApplyMemberships projects one email onto
-	// the set and mints whatever each protocol additionally needs. The mirror runs
-	// first, so the accounts exist for it to project. Without this the Clients
-	// page's bulk-add form could offer a checklist whose extra inbounds were
-	// silently dropped.
-	// The inbounds the projection actually rewrote. A write naming ONE inbound still
-	// re-projects the account onto every inbound serving it (the account-wide fields
-	// it just changed have to reach all of them), so the reconcile below has to cover
-	// those too or a daemon keeps serving the settings JSON it no longer matches.
 	var projected []int
-	if emails := postedClientEmails(data); len(emails) > 1 {
+	rollbackCreated := func(cause error) {
+		for _, em := range batchEmails {
+			if _, derr := a.inboundService.DelInboundClientByEmail(data.Id, em); derr != nil {
+				logger.Warning("cleaning up client ", em, " after membership failure: ", derr)
+			}
+		}
+		a.syncInboundAccounts(data.Id)
+		if rerr := resellerService.Rollback(ticket); rerr != nil {
+			logger.Warning("rolling back reseller charge after membership failure: ", rerr)
+		}
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), cause)
+	}
+	if len(batchEmails) > 1 {
 		a.syncInboundAccounts(data.Id)
 		if membershipsExplicit {
-			for _, email := range emails {
+			for _, email := range batchEmails {
 				touched, merr := a.applyClientMemberships(c, email, data.Id, membershipIds, membershipsExplicit)
 				if merr != nil {
-					logger.Warning("applying client memberships for ", email, ": ", merr)
+					rollbackCreated(merr)
+					return
 				}
 				projected = unionInboundIds(projected, touched)
 			}
@@ -1053,7 +1084,8 @@ func (a *InboundController) addInboundClient(c *gin.Context) {
 	} else {
 		touched, merr := a.applyClientMemberships(c, postedClientEmail(data), data.Id, membershipIds, membershipsExplicit)
 		if merr != nil {
-			logger.Warning("applying client memberships: ", merr)
+			rollbackCreated(merr)
+			return
 		}
 		projected = unionInboundIds(projected, touched)
 	}
@@ -1200,25 +1232,13 @@ func singlePostedClientEntry(settings string) (map[string]any, error) {
 
 // copyInboundClients copies clients from source inbound to target inbound.
 func (a *InboundController) copyInboundClients(c *gin.Context) {
-	// An empty clientEmails copies the SOURCE inbound whole, admins' accounts
-	// included, and a named list is not filtered by owner either. Both inbounds can
-	// legitimately be ones the reseller was assigned, so no ownership check catches it.
-	//
-	// Refused rather than scoped, even though CopyInboundClientsScoped exists and
-	// would restrict the source: scoping is only half of it. Every copy is a NEW
-	// account carrying the source's quota, so an unpriced copy is free traffic,
-	// and one route call mints as many of them as the source has clients. The
-	// missing half is pricing N accounts against one balance atomically, which is
-	// a reservation loop this handler has no business growing.
-	//
-	// TODO: price the copies (a Quote per client, reserved as one transaction),
-	// then switch this to CopyInboundClientsScoped.
-	if denyForReseller(c, msgResellerNoInboundWide) {
-		return
-	}
 	targetID, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	if !a.callerOwnsInbound(c, targetID) {
+		jsonMsg(c, I18nWeb(c, "pages.inbounds.notFound"), errNotOwned)
 		return
 	}
 
@@ -1241,7 +1261,21 @@ func (a *InboundController) copyInboundClients(c *gin.Context) {
 		return
 	}
 
-	result, needRestart, err := a.inboundService.CopyInboundClients(targetID, req.SourceInboundID, req.ClientEmails, req.Flow)
+	user := session.GetLoginUser(c)
+	var result *service.CopyClientsResult
+	var needRestart bool
+	if user != nil && user.IsReseller {
+		owned, oerr := resellerService.OwnedEmails(user.Id)
+		if oerr != nil {
+			jsonMsg(c, I18nWeb(c, "somethingWentWrong"), oerr)
+			return
+		}
+		result, needRestart, err = a.inboundService.CopyInboundClientsScopedWithReserve(
+			targetID, req.SourceInboundID, req.ClientEmails, req.Flow, owned, user)
+	} else {
+		result, needRestart, err = a.inboundService.CopyInboundClients(
+			targetID, req.SourceInboundID, req.ClientEmails, req.Flow)
+	}
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
@@ -1320,6 +1354,8 @@ func (a *InboundController) delInboundClient(c *gin.Context) {
 		a.onGreChanged()
 	} else if oldInbound != nil && oldInbound.Protocol == model.MTPROTO {
 		a.onMtprotoChanged()
+	} else if oldInbound != nil && oldInbound.Protocol == model.Hysteria2 {
+		a.onHysteria2ClientChanged()
 	} else if oldInbound != nil && oldInbound.Protocol == model.SSH {
 		a.onSshChanged()
 	} else if oldInbound != nil && oldInbound.Protocol == model.WireGuard {
@@ -1623,6 +1659,8 @@ func (a *InboundController) bulkUpdateClients(c *gin.Context) {
 			a.onGreClientChanged()
 		case string(model.MTPROTO):
 			a.onMtprotoClientChanged()
+		case string(model.Hysteria2):
+			a.onHysteria2ClientChanged()
 		case string(model.SSH):
 			a.onSshClientChanged()
 		default:
@@ -1938,6 +1976,7 @@ func (a *InboundController) resetClientTraffic(c *gin.Context) {
 	a.onWgcClientChanged()
 	a.onAwgClientChanged()
 	a.onMtprotoClientChanged()
+	a.onHysteria2ClientChanged()
 	a.onSshClientChanged()
 }
 
@@ -2013,6 +2052,7 @@ func (a *InboundController) resetAllTraffics(c *gin.Context) {
 	a.onWgcClientChanged()
 	a.onAwgClientChanged()
 	a.onMtprotoClientChanged()
+	a.onHysteria2ClientChanged()
 	a.onSshClientChanged()
 }
 
@@ -2048,6 +2088,7 @@ func (a *InboundController) resetAllClientTraffics(c *gin.Context) {
 	a.onWgcClientChanged()
 	a.onAwgClientChanged()
 	a.onMtprotoClientChanged()
+	a.onHysteria2ClientChanged()
 	a.onSshClientChanged()
 }
 
@@ -2766,7 +2807,7 @@ func (a *InboundController) delInboundClientByEmail(c *gin.Context) {
 
 	used, usedKnown := a.usageBeforeDelete(email)
 	needRestart, err := a.inboundService.DelInboundClientByEmail(inboundId, email)
-	if err == nil {
+	if err == nil && inboundId > 0 {
 		a.syncInboundAccounts(inboundId)
 	}
 	if err != nil {
@@ -3034,6 +3075,8 @@ func (a *InboundController) reconcileForInbounds(inboundIds []int, needRestart b
 			a.onGreClientChanged()
 		case model.MTPROTO:
 			a.onMtprotoClientChanged()
+		case model.Hysteria2:
+			a.onHysteria2ClientChanged()
 		case model.SSH:
 			a.onSshClientChanged()
 		case model.WireGuard:

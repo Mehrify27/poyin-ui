@@ -2,6 +2,7 @@ package service
 
 import (
 	"regexp"
+	"strings"
 
 	"github.com/vishvananda/netlink"
 )
@@ -68,7 +69,7 @@ var (
 // which matches none of the three shapes) and is also checked explicitly at the
 // call sites, because deleting it would break PPTP, which shares the module.
 func greOwnedName(name string) bool {
-	if name == "gre0" {
+	if name == "gre0" || strings.HasPrefix(name, greOutPrefix) {
 		return false
 	}
 	return greP2pNameRe.MatchString(name) ||
@@ -137,12 +138,17 @@ func vpnOutCarrierOwnsLink(l netlink.Link) bool {
 // awgOwnsLink is the full ownership test for an AmneziaWG netdev. The module is
 // out of tree, so the netlink library does not model it and the kernel hands it
 // back as a GenericLink carrying the "amneziawg" kind.
+func isAwgLinkKind(l netlink.Link) bool {
+	t := l.Type()
+	return t == amneziawgLinkKind || t == "tuntap" || t == "tun"
+}
+
 func awgOwnsLink(l netlink.Link) bool {
 	name := l.Attrs().Name
 	if !awgOwnedName(name) {
 		return false
 	}
-	if l.Type() != amneziawgLinkKind {
+	if !isAwgLinkKind(l) {
 		return false
 	}
 	return !ownForbidsDelete(ownIface, name)
@@ -189,7 +195,7 @@ func ownSynthesizeIfaces(installed map[string]bool) int {
 			}
 			core = "wgc"
 		case awgOwnedName(l.Attrs().Name):
-			if l.Type() != amneziawgLinkKind {
+			if !isAwgLinkKind(l) {
 				continue
 			}
 			core = "awg"

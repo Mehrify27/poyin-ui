@@ -212,6 +212,7 @@
                         <template slot="title">
                           [[ m.remark || ('#' + m.inboundId) ]]
                           <span v-if="!m.enable"> &middot; {{ i18n "disabled" }}</span>
+                          <div>&uarr; [[ sizeFormat(m.up || 0) ]] / &darr; [[ sizeFormat(m.down || 0) ]] ([[ sizeFormat(m.total || ((m.up || 0) + (m.down || 0))) ]])</div>
                         </template>
                         <a-tag class="bo-proto" :class="'bo-proto--' + protocolFamily(m.protocol)">
                           [[ ProtocolLabels[m.protocol] || m.protocol ]]<span class="bo-lg-port">:[[ m.port ]]</span>
@@ -220,7 +221,7 @@
                       <a-tooltip v-if="hiddenMemberships(row).length">
                         <template slot="title">
                           <div v-for="m in hiddenMemberships(row)" :key="m.inboundId">
-                            [[ m.remark || ('#' + m.inboundId) ]] ([[ m.protocol ]]:[[ m.port ]])
+                            [[ m.remark || ('#' + m.inboundId) ]] ([[ m.protocol ]]:[[ m.port ]]) &middot; &uarr; [[ sizeFormat(m.up || 0) ]] / &darr; [[ sizeFormat(m.down || 0) ]]
                           </div>
                         </template>
                         <a-tag class="bo-proto">+[[ hiddenMemberships(row).length ]]</a-tag>
@@ -395,6 +396,9 @@
                             </template>
                             <div class="bo-mb-use">
                               <b>[[ sizeFormat(getInboundSumStats(record, client.email)) ]]</b>
+                              <span style="opacity: 0.72; font-size: 11px; margin-left: 4px;">
+                                (&uarr;[[ sizeFormat(getInboundUpStats(record, client.email)) ]] / &darr;[[ sizeFormat(getInboundDownStats(record, client.email)) ]])
+                              </span>
                               <span v-if="isSharedStats(record, client.email)"
                                 class="bo-mb-shared">{{ i18n "pages.clients.sharedUsage" }}</span>
                             </div>

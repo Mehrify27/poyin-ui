@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/netip"
+	"strconv"
 	"strings"
 
 	"github.com/mhsanaei/3x-ui/v2/database/model"
@@ -69,6 +70,7 @@ var protocolSettingValidators = map[model.Protocol]func(map[string]any) error{
 	model.ANYTLS:      validateAnytlsSettings,
 	model.TUIC:        validateTuicSettings,
 	model.NAIVE:       validateNaiveSettings,
+	model.Hysteria2:   validateHysteria2Settings,
 }
 
 // --- per-protocol validators -------------------------------------------------------
@@ -214,15 +216,38 @@ func validateAwgSettings(m map[string]any) error {
 	if err := validateWireguardFamily(m); err != nil {
 		return err
 	}
-	// AWG 1.0 obfuscation. Jc is a packet COUNT and Jmin/Jmax a byte range, so
+	if rawBackend, hasBackend, err := optString(m, "backend"); err != nil {
+		return err
+	} else if hasBackend && strings.TrimSpace(rawBackend) != "" {
+		switch NormalizeAWGBackend(rawBackend) {
+		case AwgBackendAuto, AwgBackendKernel, AwgBackendUserspace:
+		default:
+			return common.NewErrorf(`"backend" must be "auto", "kernel", or "userspace" (got %q)`, rawBackend)
+		}
+	}
+	// AWG 1.0/2.0 obfuscation. Jc is a packet COUNT and Jmin/Jmax a byte range, so
 	// Jmin > Jmax is not a preference, it is a range the generator cannot satisfy.
-	for _, key := range []string{"jc", "jmin", "jmax", "s1", "s2"} {
+	for _, key := range []string{"jc", "jmin", "jmax", "s1", "s2", "s3", "s4"} {
 		v, present, err := optInt(m, key)
 		if err != nil {
 			return err
 		}
 		if present && v < 0 {
 			return common.NewErrorf("%q must not be negative (got %d)", key, v)
+		}
+	}
+	for key, base := range map[string]int{
+		"s1": awgMsgInitiationSize,
+		"s2": awgMsgResponseSize,
+		"s3": awgMsgCookieReplySize,
+		"s4": awgMsgTransportMin,
+	} {
+		v, present, err := optInt(m, key)
+		if err != nil {
+			return err
+		}
+		if present && v+base > awgMaxMessageSize {
+			return common.NewErrorf("%q (%d) exceeds maximum packet padding (%d)", key, v, awgMaxMessageSize-base)
 		}
 	}
 	jmin, hasMin, err := optInt(m, "jmin")
@@ -236,9 +261,26 @@ func validateAwgSettings(m map[string]any) error {
 	if hasMin && hasMax && jmin > jmax {
 		return common.NewErrorf(`"jmin" (%d) must not exceed "jmax" (%d)`, jmin, jmax)
 	}
-	for _, key := range []string{"h1", "h2", "h3", "h4"} {
-		if _, _, err := optString(m, key); err != nil {
+	hdrs := make([]string, 4)
+	for i, key := range []string{"h1", "h2", "h3", "h4"} {
+		val, _, err := optString(m, key)
+		if err != nil {
 			return err
+		}
+		hdrs[i] = val
+	}
+	if err := ValidateAwgHeaders(hdrs[0], hdrs[1], hdrs[2], hdrs[3]); err != nil {
+		return common.NewError(err.Error())
+	}
+	for _, key := range []string{"i1", "i2", "i3", "i4", "i5"} {
+		val, _, err := optString(m, key)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(val) != "" {
+			if err := ValidateAwgCPSSpec(key, val); err != nil {
+				return common.NewError(err.Error())
+			}
 		}
 	}
 	return nil
@@ -505,6 +547,89 @@ func validateNaiveSettings(m map[string]any) error {
 	case "string":
 		if v, _, _ := optString(masq, "string"); strings.TrimSpace(v) == "" {
 			return common.NewError(`"masquerade.string" is required when "masquerade.type" is "string"`)
+		}
+	}
+	return nil
+}
+
+func validateHysteria2Settings(m map[string]any) error {
+	for _, key := range []string{"upMbps", "downMbps"} {
+		v, present, err := optInt(m, key)
+		if err != nil {
+			return err
+		}
+		if present && v < 0 {
+			return common.NewErrorf("%q must not be negative (got %d)", key, v)
+		}
+	}
+	for _, key := range []string{"ignoreClientBandwidth", "routeThroughXray", "tlsUseFile", "allowInsecure"} {
+		if _, _, err := optBool(m, key); err != nil {
+			return err
+		}
+	}
+	if err := checkEnum(m, "obfsType", "", "none", "salamander", "gecko"); err != nil {
+		return err
+	}
+	obfsType, _, err := optString(m, "obfsType")
+	if err != nil {
+		return err
+	}
+	obfsPass, _, err := optString(m, "obfsPassword")
+	if err != nil {
+		return err
+	}
+	normObfs := strings.ToLower(strings.TrimSpace(obfsType))
+	if (normObfs == "salamander" || normObfs == "gecko") && strings.TrimSpace(obfsPass) == "" {
+		return common.NewErrorf(`"obfsPassword" is required when "obfsType" is %q`, normObfs)
+	}
+	if err := checkUserLimit(m); err != nil {
+		return err
+	}
+	if err := checkUserLimitStrategy(m); err != nil {
+		return err
+	}
+	if _, _, err := optStrings(m, "alpn"); err != nil {
+		return err
+	}
+	for _, key := range []string{"serverName", "masquerade", "fingerprint", "pinSHA256", "hopPorts", "hopInterval", "certFile"} {
+		if _, _, err := optString(m, key); err != nil {
+			return err
+		}
+	}
+	if hop, present, err := optString(m, "hopPorts"); err != nil {
+		return err
+	} else if present && strings.TrimSpace(hop) != "" {
+		if err := validatePortListOrRange(hop); err != nil {
+			return common.NewErrorf(`invalid "hopPorts" (%q): %v`, hop, err)
+		}
+	}
+	if err := checkTlsCertFields(m); err != nil {
+		return err
+	}
+	return checkExternalProxy(m)
+}
+
+func validatePortListOrRange(raw string) error {
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return common.NewError("empty port token")
+		}
+		if strings.Contains(part, "-") {
+			bounds := strings.Split(part, "-")
+			if len(bounds) != 2 {
+				return common.NewError("invalid port range")
+			}
+			a, err1 := strconv.Atoi(strings.TrimSpace(bounds[0]))
+			b, err2 := strconv.Atoi(strings.TrimSpace(bounds[1]))
+			if err1 != nil || err2 != nil || a < 1 || b > 65535 || a > b {
+				return common.NewError("port range out of 1..65535")
+			}
+			continue
+		}
+		p, err := strconv.Atoi(part)
+		if err != nil || p < 1 || p > 65535 {
+			return common.NewError("port out of 1..65535")
 		}
 	}
 	return nil

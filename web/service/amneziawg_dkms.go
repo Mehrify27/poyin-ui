@@ -15,13 +15,19 @@ import (
 const awgBuildDir = "/usr/src/vpn-ui-amneziawg"
 
 // ensureAmneziawg builds + loads the out-of-tree `amneziawg` kernel module from the vendored
-// source via DKMS, installing the toolchain + kernel headers first. This is the ONLY on-host
-// compile in the project (a kernel module must match the running kernel, so it can't be
-// prebuilt like the static daemons). On any failure it returns a Warn step (AmneziaWG
-// unavailable, every other protocol keeps working) with the build log , there is no userspace
-// fallback by design. DKMS registration makes the module auto-rebuild on kernel upgrade.
+// source via DKMS, installing the toolchain + kernel headers first. When the kernel module cannot
+// be built or loaded (Linux >= 7.1, EL9/EL10 backports, Secure Boot, LXC/OpenVZ), setup stays
+// non-blocking (OK: true) and reports that the hybrid userspace amneziawg-go (AWG 2.0) engine is
+// active instead.
 func ensureAmneziawg() ProvisionStep {
-	name := "AmneziaWG (amneziawg kernel module)"
+	name := "AmneziaWG (kernel DKMS + userspace amneziawg-go hybrid)"
+
+	withUserspaceNote := func(msg string) string {
+		if awgUserspaceAvailable() {
+			return msg + "; userspace amneziawg-go (AWG 2.0) engine is active"
+		}
+		return msg
+	}
 
 	// The question is NOT "is the module loadable right now" but "is it built for every
 	// kernel this host might boot". Asking the former is what made setup a no-op on the
@@ -31,27 +37,24 @@ func ensureAmneziawg() ProvisionStep {
 	missing := awgKernelsMissingModule()
 	if len(missing) == 0 && moduleAvailable(amneziawgModule) {
 		return ProvisionStep{Name: name, OK: true,
-			Msg: "amneziawg module already built for every installed kernel"}
+			Msg: "amneziawg kernel module ready (userspace amneziawg-go AWG 2.0 also available)"}
 	}
 
-	// Refuse up front on hosts where the module provably cannot build, instead of pulling
-	// in a compiler, DKMS and kernel headers (80+ packages) to reach a compile error. The
-	// operator gets told what actually works rather than a wall of make output. This gate
-	// runs AFTER the already-built check above, so a host that obtained the module some
-	// other way is never second-guessed.
+	// Refuse up front on hosts where the DKMS build cannot succeed cleanly, and
+	// hand off transparently to the userspace amneziawg-go engine instead of failing.
 	if ok, why := awgKernelModuleSupported(); !ok {
-		return ProvisionStep{Name: name, OK: true, Warn: true, Msg: why}
+		return ProvisionStep{Name: name, OK: true, Warn: true, Msg: withUserspaceNote(why)}
 	}
 
 	pm := detectPackageManager()
 	if pm == nil {
 		return ProvisionStep{Name: name, OK: true, Warn: true,
-			Msg: "no supported package manager , install dkms, kernel headers and a C toolchain, then re-run setup"}
+			Msg: withUserspaceNote("no supported package manager to install dkms/kernel headers")}
 	}
 
 	var log strings.Builder
 	warn := func(msg string) ProvisionStep {
-		return ProvisionStep{Name: name + " via " + pm.name, OK: true, Warn: true, Msg: msg, Log: log.String()}
+		return ProvisionStep{Name: name + " via " + pm.name, OK: true, Warn: true, Msg: withUserspaceNote(msg), Log: log.String()}
 	}
 
 	// EPEL first on EL (dkms lives in EPEL there). Best-effort.

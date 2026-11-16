@@ -23,6 +23,10 @@ const Protocols = {
     // Outbound.SshSettings and web/service/sshoutbound.go). Listed here so the
     // tunnel can be created from Add Outbound, where operators look for it.
     SSH: "ssh",
+    // Native sing-box-backed Hysteria 2 client tunnel, fronted by a managed loopback
+    // SOCKS5 proxy just like SSH above (see Outbound.Hysteria2Settings and
+    // web/service/hysteria2_outbound.go). Kept distinct from Protocols.Hysteria (Xray).
+    Hysteria2: "hysteria2",
     // The nine client tunnels, one picker entry each. Also not Xray protocols:
     // every one of them serialises to the SAME freedom outbound pinned to a
     // netdev (see VPN_OUT_KINDS and web/service/vpnoutbound.go), so the kind is
@@ -88,6 +92,8 @@ function vpnProtocolFor(kind) {
 // itself; an operator matching the row against the client they already run
 // should not have to guess that they are the same thing.
 const PROTOCOL_LABELS = {
+    [Protocols.Hysteria]: 'Hysteria (Xray)',
+    [Protocols.Hysteria2]: 'Hysteria 2 (sing-box)',
     [Protocols.Wireguard]: 'WireGuard (Xray)',
     [Protocols.AnyTLS]: 'AnyTLS',
     [Protocols.Tuic]: 'TUIC',
@@ -1463,7 +1469,7 @@ class Outbound extends CommonClass {
     // the caller so every path that serialises an outbound (Add Outbound, the JSON
     // tab, the config write) agrees.
     xrayProtocol() {
-        if (this.protocol === Protocols.SSH) return Protocols.Socks;
+        if (this.protocol === Protocols.SSH || this.protocol === Protocols.Hysteria2) return Protocols.Socks;
         if (isVpnProtocol(this.protocol)) return Protocols.Freedom;
         return this.protocol;
     }
@@ -1965,6 +1971,7 @@ Outbound.Settings = class extends CommonClass {
             case Protocols.Tuic: return new Outbound.TuicSettings();
             case Protocols.Naive: return new Outbound.NaiveSettings();
             case Protocols.SSH: return new Outbound.SshSettings();
+            case Protocols.Hysteria2: return new Outbound.Hysteria2Settings();
             // Reached only for a protocol nobody added a case for, and the null
             // is load-bearing downstream in the worst way: canEnableMux() reads
             // this.settings.flow unguarded, so a missing case does not render an
@@ -1992,6 +1999,7 @@ Outbound.Settings = class extends CommonClass {
             case Protocols.Tuic: return Outbound.TuicSettings.fromJson(json);
             case Protocols.Naive: return Outbound.NaiveSettings.fromJson(json);
             case Protocols.SSH: return Outbound.SshSettings.fromJson(json);
+            case Protocols.Hysteria2: return Outbound.Hysteria2Settings.fromJson(json);
             // Same null, same consequence as in getSettings above: an outbound
             // read back from the config with no case here reaches the form with
             // settings === null and blanks the page on the first render.
@@ -2775,18 +2783,34 @@ const VPN_OUT_WG_FIELDS = [
 // H1-H4 are text and not numbers because they are uint32 magic headers, and
 // values above 2^31 are exactly where an <a-input-number> starts rounding.
 const VPN_OUT_AWG_FIELDS = VPN_OUT_WG_FIELDS.concat([
+    {
+        name: 'backend', type: 'select', def: 'auto', plain: 'Backend',
+        options: [
+            { value: 'auto', text: 'Auto (Kernel / amneziawg-go)' },
+            { value: 'kernel', text: 'Kernel Module' },
+            { value: 'userspace', text: 'Userspace (amneziawg-go AWG 2.0)' },
+        ],
+    },
     { name: 'jc', type: 'number', def: null, min: 0, max: 128, plain: 'Jc' },
     { name: 'jmin', type: 'number', def: null, min: 0, max: 1280, plain: 'Jmin' },
     { name: 'jmax', type: 'number', def: null, min: 0, max: 1280, plain: 'Jmax' },
     { name: 's1', type: 'number', def: null, min: 0, max: 1280, plain: 'S1' },
     { name: 's2', type: 'number', def: null, min: 0, max: 1280, plain: 'S2' },
+    { name: 's3', type: 'number', def: null, min: 0, max: 1280, plain: 'S3' },
+    { name: 's4', type: 'number', def: null, min: 0, max: 1280, plain: 'S4' },
     // All four or none: they replace the four packet types together, so a partial
-    // set breaks half the packets. The driver rejects it, but the rule is not
-    // guessable from the form.
-    { name: 'h1', type: 'text', def: '', plain: 'H1', help: 'vpnOutAwgHeadersHelp' },
-    { name: 'h2', type: 'text', def: '', plain: 'H2' },
-    { name: 'h3', type: 'text', def: '', plain: 'H3' },
-    { name: 'h4', type: 'text', def: '', plain: 'H4' },
+    // set breaks half the packets. Supports AWG 1.0 scalar ("12345") or AWG 2.0
+    // non-overlapping range ("100000-200000").
+    { name: 'h1', type: 'text', def: '', plain: 'H1', placeholder: 'e.g. 12345 or 100000-200000', help: 'vpnOutAwgHeadersHelp' },
+    { name: 'h2', type: 'text', def: '', plain: 'H2', placeholder: 'e.g. 22345 or 200001-300000' },
+    { name: 'h3', type: 'text', def: '', plain: 'H3', placeholder: 'e.g. 32345 or 300001-400000' },
+    { name: 'h4', type: 'text', def: '', plain: 'H4', placeholder: 'e.g. 42345 or 400001-500000' },
+    // AWG 1.5/2.0 Custom Protocol Signature (CPS) handshake preamble packets.
+    { name: 'i1', type: 'text', def: '', plain: 'I1', placeholder: '<b 0x...><c><t><r 16>' },
+    { name: 'i2', type: 'text', def: '', plain: 'I2', placeholder: '<b 0x...>' },
+    { name: 'i3', type: 'text', def: '', plain: 'I3', placeholder: '<b 0x...>' },
+    { name: 'i4', type: 'text', def: '', plain: 'I4', placeholder: '<b 0x...>' },
+    { name: 'i5', type: 'text', def: '', plain: 'I5', placeholder: '<b 0x...>' },
 ]);
 
 const VPN_OUT_KINDS = {
@@ -3134,10 +3158,17 @@ const WG_CONF_INTERFACE_KEYS = {
     jmax: 'jmax',
     s1: 's1',
     s2: 's2',
+    s3: 's3',
+    s4: 's4',
     h1: 'h1',
     h2: 'h2',
     h3: 'h3',
     h4: 'h4',
+    i1: 'i1',
+    i2: 'i2',
+    i3: 'i3',
+    i4: 'i4',
+    i5: 'i5',
 };
 const WG_CONF_PEER_KEYS = {
     publickey: 'peerPublicKey',
@@ -3608,6 +3639,77 @@ Outbound.HysteriaSettings = class extends CommonClass {
             address: this.address,
             port: this.port,
             version: this.version
+        };
+    }
+};
+
+Outbound.Hysteria2Settings = class extends CommonClass {
+    constructor(
+        address = '',
+        port = 443,
+        hopPorts = '',
+        hopInterval = '',
+        password = '',
+        obfsType = '',
+        obfsPassword = '',
+        upMbps = 0,
+        downMbps = 0,
+        serverName = '',
+        alpn = ['h3'],
+        allowInsecure = false,
+        pinSHA256 = '',
+        certificatePEM = '',
+        socksPort = 0,
+        remark = '',
+    ) {
+        super();
+        this.address = address;
+        this.port = port;
+        this.hopPorts = hopPorts;
+        this.hopInterval = hopInterval;
+        this.password = password;
+        this.obfsType = obfsType;
+        this.obfsPassword = obfsPassword;
+        this.upMbps = upMbps;
+        this.downMbps = downMbps;
+        this.serverName = serverName;
+        this.alpn = Array.isArray(alpn) && alpn.length ? alpn : ['h3'];
+        this.allowInsecure = !!allowInsecure;
+        this.pinSHA256 = pinSHA256;
+        this.certificatePEM = certificatePEM;
+        this.socksPort = socksPort;
+        this.remark = remark;
+    }
+
+    static fromJson(json = {}) {
+        if (!json || Object.keys(json).length === 0) return new Outbound.Hysteria2Settings();
+        const first = firstServerOf(json)[0];
+        return new Outbound.Hysteria2Settings(
+            json.address || '',
+            json.port || 443,
+            json.hopPorts || '',
+            json.hopInterval || '',
+            json.password || '',
+            json.obfsType || '',
+            json.obfsPassword || '',
+            json.upMbps || 0,
+            json.downMbps || 0,
+            json.serverName || '',
+            json.alpn || ['h3'],
+            json.allowInsecure || false,
+            json.pinSHA256 || '',
+            json.certificatePEM || '',
+            json.socksPort || first.port || 0,
+            json.remark || '',
+        );
+    }
+
+    toJson() {
+        return {
+            servers: [{
+                address: '127.0.0.1',
+                port: Number(this.socksPort) || 0,
+            }],
         };
     }
 };

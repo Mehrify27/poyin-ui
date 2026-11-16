@@ -247,6 +247,8 @@ func (s *CoreService) coreConfigTargets(core string) []coreConfigTarget {
 		return s.greConfigTargets()
 	case "mtproto":
 		return s.mtprotoConfigTargets()
+	case "hysteria2":
+		return s.hysteria2ConfigTargets()
 	case "ipsec":
 		return s.ipsecConfigTargets()
 	}
@@ -411,7 +413,12 @@ func (s *CoreService) openvpnConfigTargets() []coreConfigTarget {
 				Path:   fmt.Sprintf("%s/server-%s.conf", svc.configDir(inbound.Id), proto),
 				Format: "conf",
 				render: func() (string, error) {
-					return svc.buildServerConfig(ib, st, pr, port, svc.binaryPath()), nil
+					rendered := svc.buildServerConfig(ib, st, pr, port, svc.binaryPath())
+					if strings.TrimSpace(st.CustomConfig) != "" {
+						merged, _ := mergeOpenVpnCustomConfig(rendered, st.CustomConfig, "")
+						return merged, nil
+					}
+					return rendered, nil
 				},
 			})
 		}
@@ -437,7 +444,14 @@ func (s *CoreService) openconnectConfigTargets() []coreConfigTarget {
 			Label: "ocserv.conf", Remark: coreConfigRemark(inbound),
 			Path:   svc.configDir(inbound.Id) + "/ocserv.conf",
 			Format: "conf",
-			render: func() (string, error) { return svc.buildServerConfig(ib, st), nil },
+			render: func() (string, error) {
+				rendered := svc.buildServerConfig(ib, st)
+				if strings.TrimSpace(st.CustomConfig) != "" {
+					merged, _ := mergeOcservCustomConfig(rendered, st.CustomConfig, "")
+					return merged, nil
+				}
+				return rendered, nil
+			},
 			// The one daemon here that can check a config without serving it.
 			validate: func(content string) error {
 				return validateWithDaemon(svc.ocservBinaryPath(), "ocserv.conf", content,
@@ -554,6 +568,47 @@ func (s *CoreService) mtprotoConfigTargets() []coreConfigTarget {
 				var probe map[string]any
 				if err := toml.Unmarshal([]byte(content), &probe); err != nil {
 					return common.NewError("not valid TOML:", err)
+				}
+				return nil
+			},
+		})
+	}
+	return out
+}
+
+func (s *CoreService) hysteria2ConfigTargets() []coreConfigTarget {
+	inbounds, err := s.hysteria2Service.GetHysteria2Inbounds()
+	if err != nil {
+		return nil
+	}
+	svc := &s.hysteria2Service
+	var out []coreConfigTarget
+	for _, inbound := range inbounds {
+		settings, err := svc.parseSettings(inbound)
+		if err != nil {
+			continue
+		}
+		ib, st := inbound, settings
+		out = append(out, coreConfigTarget{
+			Core: "hysteria2", InboundId: inbound.Id, File: "config.json",
+			Label: "config.json", Remark: coreConfigRemark(inbound),
+			Path:   svc.configPath(inbound.Id),
+			Format: "json",
+			render: func() (string, error) {
+				certPath, keyPath, _, err := svc.resolveTLSCerts(ib, st)
+				if err != nil {
+					return "", err
+				}
+				secret := svc.getOrCreateClashSecret(ib.Id)
+				b, _, err := svc.buildServerConfig(ib, st, certPath, keyPath, secret)
+				if err != nil {
+					return "", err
+				}
+				return string(b), nil
+			},
+			validate: func(content string) error {
+				if !json.Valid([]byte(content)) {
+					return common.NewError("not valid JSON")
 				}
 				return nil
 			},
@@ -713,12 +768,31 @@ func (s *CoreService) SaveCoreConfigOverride(core string, inboundId int, file, m
 	overrides := copyCoreConfigOverrides()
 	key := coreConfigKey(core, inboundId, file)
 	previous, hadPrevious := overrides[key]
+	var prevCustom string
+	hasPrevCustom := false
+	syncedCustom := false
+	if !clearing && inboundId > 0 && (core == "openvpn" || core == "openconnect") {
+		if customLines := extractDelimitedCustomBlock(stripCoreConfigBanner(text), userCustomBeginMarker, userCustomEndMarker); len(customLines) > 0 {
+			if ib, err := (&InboundService{}).GetInbound(inboundId); err == nil && ib != nil {
+				var raw map[string]any
+				if json.Unmarshal([]byte(ib.Settings), &raw) == nil && raw != nil {
+					prevCustom, _ = raw["customConfig"].(string)
+					hasPrevCustom = true
+				}
+			}
+			syncInboundCustomConfig(inboundId, strings.Join(customLines, "\n"), true)
+			syncedCustom = true
+		}
+	}
 	if clearing {
 		delete(overrides, key)
 	} else {
 		overrides[key] = CoreConfigOverride{Mode: mode, Text: text}
 	}
 	if err := setCoreConfigOverrides(overrides); err != nil {
+		if syncedCustom && hasPrevCustom {
+			syncInboundCustomConfig(inboundId, prevCustom, true)
+		}
 		return nil, err
 	}
 
@@ -739,6 +813,9 @@ func (s *CoreService) SaveCoreConfigOverride(core string, inboundId int, file, m
 		overrides[key] = previous
 	} else {
 		delete(overrides, key)
+	}
+	if syncedCustom && hasPrevCustom {
+		syncInboundCustomConfig(inboundId, prevCustom, true)
 	}
 	if err := setCoreConfigOverrides(overrides); err != nil {
 		logger.Warning("core config: could not revert the override:", err)
@@ -776,6 +853,8 @@ func (s *CoreService) ApplyCoreConfig(core string) error {
 		genErr = s.greService.GenerateAllConfigs()
 	case "mtproto":
 		genErr = s.mtprotoService.GenerateAllConfigs()
+	case "hysteria2":
+		genErr = s.hysteria2Service.GenerateAllConfigs()
 	case "ipsec":
 		// The shared charon. Restarting ikev2 runs syncCharon, which rewrites
 		// strongswan.conf and reloads every connection on it, l2tp's and gre's too.
@@ -810,6 +889,8 @@ func coreConfigProcNames(core string, inboundId int) []string {
 		return []string{sstpProcName(inboundId)}
 	case "mtproto":
 		return []string{mtprotoProcName(inboundId)}
+	case "hysteria2":
+		return []string{hy2ProcName(inboundId)}
 	case "ikev2", "ipsec", "gre":
 		// Every swanctl-backed file is loaded into the ONE shared charon.
 		return []string{ikev2ProcName}

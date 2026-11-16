@@ -52,35 +52,51 @@
 
 {{define "component/aThemeSwitch"}}
 <script>
+  function applyBodyThemeClass(isDark) {
+    if (!document.body) {
+      return;
+    }
+    document.body.classList.remove('dark', 'light');
+    document.body.classList.add(isDark ? 'dark' : 'light');
+  }
   function createThemeSwitcher() {
     const darkModePreference = localStorage.getItem('dark-mode');
-    const isDarkTheme = darkModePreference === null ? true : darkModePreference === 'true';
-    const isUltra = localStorage.getItem('isUltraDarkThemeEnabled') === 'true';
-    if (isUltra) {
+    let isDarkTheme = darkModePreference === null ? true : darkModePreference === 'true';
+    let isUltra = localStorage.getItem('isUltraDarkThemeEnabled') === 'true';
+    if (!isDarkTheme && isUltra) {
+      isUltra = false;
+      localStorage.setItem('isUltraDarkThemeEnabled', 'false');
+      document.documentElement.removeAttribute('data-theme');
+    } else if (isDarkTheme && isUltra) {
       document.documentElement.setAttribute('data-theme', 'ultra-dark');
+    } else {
+      document.documentElement.removeAttribute('data-theme');
     }
-    const theme = isDarkTheme ? 'dark' : 'light';
-    document.querySelector('body').setAttribute('class', theme);
+    applyBodyThemeClass(isDarkTheme);
     return {
       animationsOff() {
         document.documentElement.setAttribute('data-theme-animations', 'off');
         const themeAnimations = document.querySelector('#change-theme');
-        themeAnimations.addEventListener('mouseleave', () => {
+        if (!themeAnimations) {
+          return;
+        }
+        const restoreAnimations = () => {
           document.documentElement.removeAttribute('data-theme-animations');
-        });
-        themeAnimations.addEventListener('touchend', () => {
-          document.documentElement.removeAttribute('data-theme-animations');
-        });
+        };
+        themeAnimations.addEventListener('mouseleave', restoreAnimations, { once: true });
+        themeAnimations.addEventListener('touchend', restoreAnimations, { once: true });
       },
       animationsOffUltra() {
         document.documentElement.setAttribute('data-theme-animations', 'off');
         const themeAnimationsUltra = document.querySelector('#change-theme-ultra');
-        themeAnimationsUltra.addEventListener('mouseleave', () => {
+        if (!themeAnimationsUltra) {
+          return;
+        }
+        const restoreAnimations = () => {
           document.documentElement.removeAttribute('data-theme-animations');
-        });
-        themeAnimationsUltra.addEventListener('touchend', () => {
-          document.documentElement.removeAttribute('data-theme-animations');
-        });
+        };
+        themeAnimationsUltra.addEventListener('mouseleave', restoreAnimations, { once: true });
+        themeAnimationsUltra.addEventListener('touchend', restoreAnimations, { once: true });
       },
       isDarkTheme,
       isUltra,
@@ -90,12 +106,31 @@
       toggleTheme() {
         this.isDarkTheme = !this.isDarkTheme;
         localStorage.setItem('dark-mode', this.isDarkTheme);
-        document.querySelector('body').setAttribute('class', this.isDarkTheme ? 'dark' : 'light');
-        document.getElementById('message').className = themeSwitcher.currentTheme;
+        if (!this.isDarkTheme && this.isUltra) {
+          this.isUltra = false;
+          localStorage.setItem('isUltraDarkThemeEnabled', 'false');
+          document.documentElement.removeAttribute('data-theme');
+        } else if (this.isDarkTheme && this.isUltra) {
+          document.documentElement.setAttribute('data-theme', 'ultra-dark');
+        }
+        applyBodyThemeClass(this.isDarkTheme);
+        const msgEl = document.getElementById('message');
+        if (msgEl) {
+          msgEl.className = this.currentTheme;
+        }
       },
       toggleUltra() {
         this.isUltra = !this.isUltra;
         if (this.isUltra) {
+          if (!this.isDarkTheme) {
+            this.isDarkTheme = true;
+            localStorage.setItem('dark-mode', 'true');
+            applyBodyThemeClass(true);
+            const msgEl = document.getElementById('message');
+            if (msgEl) {
+              msgEl.className = this.currentTheme;
+            }
+          }
           document.documentElement.setAttribute('data-theme', 'ultra-dark');
         } else {
           document.documentElement.removeAttribute('data-theme');
@@ -114,7 +149,10 @@
       this.$message.config({
         getContainer: () => document.getElementById('message')
       });
-      document.getElementById('message').className = themeSwitcher.currentTheme;
+      const msgEl = document.getElementById('message');
+      if (msgEl) {
+        msgEl.className = themeSwitcher.currentTheme;
+      }
     }
   });
   Vue.component('a-theme-switch-login', {
@@ -126,7 +164,10 @@
       this.$message.config({
         getContainer: () => document.getElementById('message')
       });
-      document.getElementById('message').className = themeSwitcher.currentTheme;
+      const msgEl = document.getElementById('message');
+      if (msgEl) {
+        msgEl.className = themeSwitcher.currentTheme;
+      }
     }
   });
 </script>

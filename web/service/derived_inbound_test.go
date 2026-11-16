@@ -21,7 +21,7 @@ func TestDerivedXrayInboundsSkipTheLiveApiPath(t *testing.T) {
 	derived := []model.Protocol{
 		model.L2TP, model.PPTP, model.OPENVPN, model.OPENCONNECT,
 		model.SSTP, model.IKEV2, model.WGC, model.AWG, // dokodemo
-		model.MTPROTO, model.SSH, // paired socks inbound
+		model.MTPROTO, model.SSH, model.Hysteria2, // paired socks inbound
 	}
 	for _, p := range derived {
 		if !hasDerivedXrayInbound(p) {
@@ -49,7 +49,7 @@ func TestDerivedXrayInboundsSkipTheLiveApiPath(t *testing.T) {
 // into isVpnProtocol, which would then mislead every isVpnProtocol caller (addressing,
 // nftables, RBridge) into treating a relay as a tunnel.
 func TestRelayProtocolsAreNotVpnProtocols(t *testing.T) {
-	for _, p := range []model.Protocol{model.MTPROTO, model.SSH} {
+	for _, p := range []model.Protocol{model.MTPROTO, model.SSH, model.Hysteria2} {
 		if !isRelayProtocol(p) {
 			t.Errorf("%q must be a relay: it egresses through a paired socks inbound", p)
 		}

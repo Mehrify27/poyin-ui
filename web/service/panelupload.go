@@ -93,8 +93,8 @@ var (
 
 // panelVersionPattern is what a version line has to look like. It is the cheapest test
 // that separates "a vpn-ui binary" from "some other ELF that printed its usage": the
-// panel answers -v with a bare dotted version and nothing else.
-var panelVersionPattern = regexp.MustCompile(`^v?\d+(\.\d+)*$`)
+// panel answers -v with a bare SemVer version and nothing else.
+var panelVersionPattern = regexp.MustCompile(`^v?\d+(?:\.\d+)+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`)
 
 // StagePanelBinary writes an uploaded binary next to the running one, checks it is
 // something this host can actually exec, reads its version, and holds it for a
@@ -332,7 +332,7 @@ func StagePanelBinaryFromURL(rawURL string) (StagedPanelInfo, error) {
 // info parse, and a -v probe that execs it), and reporting a download through all of
 // that shows a bar frozen at 99% with the speed decaying to zero.
 type phaseFlipReader struct {
-	r      io.Reader
+	r       io.Reader
 	flipped bool
 }
 

@@ -244,6 +244,23 @@ build_arch() {
         -v "$REPO_ROOT/third_party/telemt:/src:ro" \
         rust:alpine sh -e /telemt-bundle.sh
 
+    # sing-box (Hysteria 2 server/client engine), static Go binary with QUIC + Clash API.
+    step "Building sing-box (Hysteria 2) static binary for $goarch"
+    docker run --rm ${DOCKER_NET:-} \
+        -e GO_ARCH="$goarch" \
+        -v "$outdir:/out" \
+        -v "$REPO_ROOT/build/backend/sing-box-bundle.sh:/sing-box-bundle.sh:ro" \
+        golang:alpine sh -e /sing-box-bundle.sh
+
+    # Optional static amneziawg-go userspace binary (best-effort alongside built-in Go engine).
+    step "Building amneziawg-go static binary for $goarch"
+    docker run --rm ${DOCKER_NET:-} \
+        -e GO_ARCH="$goarch" \
+        -v "$outdir:/out" \
+        -v "$REPO_ROOT/build/backend/amneziawg-go-bundle.sh:/amneziawg-go-bundle.sh:ro" \
+        golang:alpine sh -e /amneziawg-go-bundle.sh || \
+        echo "amneziawg-go bundle skipped (built-in Go AWG 2.0 engine remains active)"
+
     ok "Done: $(ls -lh "$outdir")"
 }
 

@@ -1,0 +1,1004 @@
+diff --git a/app/dispatcher/default.go b/app/dispatcher/default.go
+index cae97351..b85869c8 100644
+--- a/app/dispatcher/default.go
++++ b/app/dispatcher/default.go
+@@ -13,6 +13,7 @@ import (
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/common/protocol"
+ 	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/common/speedlimit"
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/features/dns"
+ 	"github.com/xtls/xray-core/features/outbound"
+@@ -184,6 +185,14 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
+ 		}
+ 	}
+ 
++	// Speed limiting is keyed by account email, so one bucket covers every
++	// connection an account has open. It is looked up outside the block above
++	// because it must also fire when the email is empty: see LookupSession.
++	if l := speedlimit.LookupSession(user, sessionInbound); l != nil {
++		inboundLink.Writer = speedlimit.NewWriter(ctx, inboundLink.Writer, l.Up)
++		outboundLink.Writer = speedlimit.NewWriter(ctx, outboundLink.Writer, l.Down)
++	}
++
+ 	return inboundLink, outboundLink
+ }
+ 
+@@ -194,6 +203,16 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
+ 		user = sessionInbound.User
+ 	}
+ 
++	// Same lookup as getLink, but this seam is asymmetric: link.Reader carries the
++	// client's upload and link.Writer its download, so a paced Reader is needed as
++	// well as a paced Writer. Wrap before the TimeoutWrapperReader below, which
++	// must stay outermost because the stats block type-asserts it, and so does
++	// DispatchLink before sniffing.
++	if l := speedlimit.LookupSession(user, sessionInbound); l != nil {
++		link.Reader = speedlimit.NewReader(ctx, link.Reader, l.Up)
++		link.Writer = speedlimit.NewWriter(ctx, link.Writer, l.Down)
++	}
++
+ 	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
+ 
+ 	if user != nil && len(user.Email) > 0 {
+diff --git a/common/speedlimit/io.go b/common/speedlimit/io.go
+new file mode 100644
+index 00000000..f504dad3
+--- /dev/null
++++ b/common/speedlimit/io.go
+@@ -0,0 +1,126 @@
++package speedlimit
++
++import (
++	"context"
++
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/buf"
++	"golang.org/x/time/rate"
++)
++
++// wait blocks until n bytes' worth of tokens are available.
++//
++// It asks for tokens in chunks no larger than the bucket's depth because
++// rate.Limiter.WaitN REPORTS AN ERROR, rather than blocking and draining, when a
++// single request exceeds the burst (rate.go: "n > burst && limit != Inf"). Xray
++// hands whole buf.MultiBuffers to the writers, so an unchunked WaitN would fail
++// every write on a slow account rather than pace it. Chunking the token requests
++// rather than the payload keeps the write itself atomic while the pacing still
++// accounts for every byte.
++//
++// ctx is the dispatch context, so a closed connection aborts the wait instead of
++// parking a goroutine on a bucket nobody is draining.
++//
++// Both TCP and UDP are paced by blocking. For UDP that trades loss for latency,
++// since a token bucket delays rather than drops; an over-limit UDP flow queues
++// instead of shedding. That is a deliberate first cut: blocking is what makes TCP
++// back-pressure work, and the dispatcher does not cheaply separate the two paths.
++// Revisit with AllowN-and-drop on the UDP path if latency proves worse than loss.
++func wait(ctx context.Context, l *rate.Limiter, n int) error {
++	for n > 0 {
++		c := l.Burst()
++		// Burst is only ever below n on a misconfigured bucket; hand the request
++		// over whole and let WaitN report it rather than spin here.
++		if c <= 0 || c > n {
++			c = n
++		}
++		if err := l.WaitN(ctx, c); err != nil {
++			return err
++		}
++		n -= c
++	}
++	return nil
++}
++
++// Writer paces a buf.Writer against one direction of an account's bucket.
++//
++// Shaping counts payload bytes only. Encryption overhead, padding and transport
++// headers are added below this layer and are invisible here, so a limit measures
++// a few percent under true wire rate.
++type Writer struct {
++	ctx     context.Context
++	writer  buf.Writer
++	limiter *rate.Limiter
++}
++
++// NewWriter wraps writer so its throughput is paced by limiter. A nil limiter
++// returns writer untouched, so an unlimited direction costs nothing.
++func NewWriter(ctx context.Context, writer buf.Writer, limiter *rate.Limiter) buf.Writer {
++	if limiter == nil {
++		return writer
++	}
++	return &Writer{ctx: ctx, writer: writer, limiter: limiter}
++}
++
++func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
++	if n := int(mb.Len()); n > 0 {
++		if err := wait(w.ctx, w.limiter, n); err != nil {
++			buf.ReleaseMulti(mb)
++			return err
++		}
++	}
++	return w.writer.WriteMultiBuffer(mb)
++}
++
++// Close and Interrupt forward to the wrapped writer. Xray tears a link down
++// through these, so swallowing them here would leak the pipe. SizeStatWriter,
++// which sits in the same position in the chain, does the same.
++func (w *Writer) Close() error {
++	return common.Close(w.writer)
++}
++
++func (w *Writer) Interrupt() {
++	common.Interrupt(w.writer)
++}
++
++// Reader paces a buf.Reader against one direction of an account's bucket.
++//
++// It must sit INSIDE buf.TimeoutWrapperReader, never outside it: the dispatcher
++// type-asserts link.Reader to *buf.TimeoutWrapperReader to attach the uplink
++// stats counter, and DispatchLink asserts it to buf.TimeoutReader before
++// sniffing. Wrapping from the outside would panic both.
++type Reader struct {
++	ctx     context.Context
++	reader  buf.Reader
++	limiter *rate.Limiter
++}
++
++// NewReader wraps reader so its throughput is paced by limiter. A nil limiter
++// returns reader untouched.
++func NewReader(ctx context.Context, reader buf.Reader, limiter *rate.Limiter) buf.Reader {
++	if limiter == nil {
++		return reader
++	}
++	return &Reader{ctx: ctx, reader: reader, limiter: limiter}
++}
++
++func (r *Reader) ReadMultiBuffer() (buf.MultiBuffer, error) {
++	mb, err := r.reader.ReadMultiBuffer()
++	// Pace after the read: the bytes have already arrived, so it is delaying their
++	// hand-off upstream that pushes back on the sender's window.
++	if n := int(mb.Len()); n > 0 {
++		if werr := wait(r.ctx, r.limiter, n); werr != nil {
++			buf.ReleaseMulti(mb)
++			return nil, werr
++		}
++	}
++	return mb, err
++}
++
++func (r *Reader) Close() error {
++	return common.Close(r.reader)
++}
++
++func (r *Reader) Interrupt() {
++	common.Interrupt(r.reader)
++}
+diff --git a/common/speedlimit/speedlimit.go b/common/speedlimit/speedlimit.go
+new file mode 100644
+index 00000000..b452de83
+--- /dev/null
++++ b/common/speedlimit/speedlimit.go
+@@ -0,0 +1,409 @@
++// Package speedlimit implements per-account bandwidth shaping for the dispatcher.
++//
++// This is a fork addition, not part of upstream Xray, so it is built to be cheap
++// to rebase: one self-contained package plus two small edits in
++// app/dispatcher/default.go.
++//
++// Limits arrive out of band, through a JSON sidecar file named by the
++// XRAY_SPEEDLIMIT_FILE environment variable, rather than through the Xray config.
++// Two reasons. The panel re-arms an account's limit as quota thresholds are
++// crossed, which happens continuously; carrying limits in the config would mean
++// rewriting it and restarting the core on every crossing, dropping every
++// connection on the box, which is the exact thing this feature exists to avoid.
++// And an environment variable touches nothing in infra/conf, whose app configs
++// are protobuf Any values that a non-protobuf side channel would drag codegen
++// into.
++//
++// With XRAY_SPEEDLIMIT_FILE unset the limiter is permanently disabled: every
++// lookup returns nil, nothing is allocated, and no goroutine is started, so an
++// unpatched deployment behaves exactly as stock Xray.
++package speedlimit
++
++import (
++	"context"
++	"encoding/json"
++	"net"
++	"net/netip"
++	"os"
++	"sort"
++	"sync"
++	"time"
++
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/session"
++	"golang.org/x/time/rate"
++)
++
++// EnvPath names the environment variable holding the sidecar file's path.
++const EnvPath = "XRAY_SPEEDLIMIT_FILE"
++
++// pollInterval is how often the sidecar's path is stat()ed for changes.
++const pollInterval = 2 * time.Second
++
++const (
++	// minBurst is the floor for a bucket's depth.
++	//
++	// rate.Limiter.WaitN reports an error, rather than blocking and draining, when
++	// a single request exceeds the burst. Xray hands whole buf.MultiBuffers to the
++	// writers, so a shallow bucket would fail every write on a slow account instead
++	// of pacing it. This floor keeps buckets deeper than any realistic MultiBuffer;
++	// wait() in io.go independently chunks its token requests, so correctness never
++	// rests on the floor alone.
++	minBurst = 512 * 1024
++
++	// maxBurst caps bucket depth so that converting a rate to an int burst cannot
++	// overflow on 32-bit builds.
++	maxBurst = 1 << 30
++)
++
++// Limits holds one account's two independent token buckets.
++//
++// The directions are separate limiters on purpose: a single shared bucket can
++// only express a combined up+down ceiling, never "5 Mbit down, 2 Mbit up". Both
++// fields are non-nil for any account present in the sidecar. An unlimited
++// direction is rate.Inf rather than a nil limiter, so that a reload can re-rate
++// it in place for connections already holding a reference.
++type Limits struct {
++	Up   *rate.Limiter
++	Down *rate.Limiter
++}
++
++// sidecarFile is the on-disk format. Rates are BYTES per second; 0 means that
++// direction is unlimited, and an account that is entirely unlimited is simply
++// absent from the file.
++type sidecarFile struct {
++	Users []sidecarUser `json:"users"`
++}
++
++type sidecarUser struct {
++	Email   string   `json:"email"`
++	DownBps int64    `json:"downBps"`
++	UpBps   int64    `json:"upBps"`
++	IPs     []string `json:"ips"`
++}
++
++// index is an immutable snapshot. It is replaced wholesale on reload, but the
++// *Limits it points at are reused and re-rated so that in-flight connections
++// pick up rate changes.
++//
++// The IP lookup is an exact-address map plus a slice of the remaining prefixes
++// sorted longest-first, not a trie. Nearly every account owns individual /32s,
++// one per device, which the map answers in O(1). Real CIDRs only come from
++// ikev2 psk/eap-tls and wg-c, which bind a whole block to a single account, so
++// the linear scan covers a handful of entries. A trie would be more code than
++// the workload justifies.
++type index struct {
++	byEmail  map[string]*Limits
++	exact    map[netip.Addr]string
++	prefixes []prefixEntry
++}
++
++type prefixEntry struct {
++	prefix netip.Prefix
++	email  string
++}
++
++type table struct {
++	path string
++
++	mu  sync.RWMutex
++	idx *index
++
++	// Touched only by the loading goroutine (and, before it starts, by init).
++	mtime   time.Time
++	size    int64
++	lastErr string
++}
++
++// defaultTable is nil when XRAY_SPEEDLIMIT_FILE is unset, which is the disabled
++// case. It is written in init, before any lookup can run, and never again.
++var defaultTable *table
++
++func init() {
++	path := os.Getenv(EnvPath)
++	if path == "" {
++		return
++	}
++	t := &table{path: path}
++	// Load synchronously so that limits are in force for the first connection
++	// rather than up to one poll interval later. A missing file is not fatal: the
++	// panel may not have written it yet, and until it appears everyone is
++	// unlimited.
++	t.reloadIfChanged()
++	go t.watch(pollInterval)
++	defaultTable = t
++}
++
++// LookupSession resolves the limiters for a dispatcher session, returning nil
++// when the limiter is disabled or the account is unlimited.
++//
++// Email is the key for every protocol, so an account's devices share one bucket.
++// The source address is only a fallback lookup step, needed because
++// dokodemo-door allocates a MemoryUser with an EMPTY email
++// (proxy/dokodemo/dokodemo.go), which is how all of the VPN tunnel protocols
++// arrive.
++//
++// The resolved email is used here and NEVER written back onto user.Email.
++// Assigning it would switch on Xray's per-user traffic counters for accounts the
++// panel already meters through nft/RADIUS, double counting their quota, and would
++// make routing "user" rules start matching VPN clients.
++func LookupSession(user *protocol.MemoryUser, inbound *session.Inbound) *Limits {
++	if defaultTable == nil {
++		return nil
++	}
++	var email string
++	if user != nil {
++		email = user.Email
++	}
++	var ip net.IP
++	// Address.IP() panics on a domain address, hence the family check.
++	if email == "" && inbound != nil && inbound.Source.Address != nil && inbound.Source.Address.Family().IsIP() {
++		ip = inbound.Source.Address.IP()
++	}
++	return defaultTable.lookup(email, ip)
++}
++
++func (t *table) lookup(email string, ip net.IP) *Limits {
++	t.mu.RLock()
++	idx := t.idx
++	t.mu.RUnlock()
++
++	if idx == nil {
++		return nil
++	}
++	if email != "" {
++		// A miss is an unlimited account, which is the common case and costs one
++		// map lookup and no allocation.
++		return idx.byEmail[email]
++	}
++	addr, ok := netip.AddrFromSlice(ip)
++	if !ok {
++		return nil
++	}
++	// net.IP holds IPv4 in 16-byte v4-in-v6 form as often as not, while a sidecar
++	// entry of "10.0.0.5/32" parses as a 32-bit prefix. netip.Prefix.Contains
++	// refuses to compare across address families, so unmap before matching.
++	addr = addr.Unmap()
++	if e, ok := idx.exact[addr]; ok {
++		return idx.byEmail[e]
++	}
++	for _, pe := range idx.prefixes {
++		if pe.prefix.Contains(addr) {
++			return idx.byEmail[pe.email]
++		}
++	}
++	return nil
++}
++
++func (t *table) watch(interval time.Duration) {
++	ticker := time.NewTicker(interval)
++	defer ticker.Stop()
++	for range ticker.C {
++		t.reloadIfChanged()
++	}
++}
++
++// reloadIfChanged polls the sidecar's PATH. This is deliberate, and it is why
++// there is no fsnotify dependency here.
++//
++// The panel rewrites the file with the temp-file-plus-rename idiom, so its
++// contents never change in place. An inotify watch would fire IN_MOVED_TO rather
++// than IN_MODIFY, and a watch installed on the file itself would follow the old
++// unlinked inode and then silently never fire again. stat() on the path cannot
++// miss a rename.
++//
++// Change detection is mtime plus size. On a filesystem with coarse (1s) mtime
++// granularity, two writes of identical size within the same second could be
++// missed; on ext4's nanosecond timestamps this does not arise.
++func (t *table) reloadIfChanged() {
++	fi, err := os.Stat(t.path)
++	if err != nil {
++		t.logOnce("speedlimit: cannot stat " + t.path)
++		return
++	}
++	if fi.ModTime().Equal(t.mtime) && fi.Size() == t.size {
++		return
++	}
++	t.mtime, t.size = fi.ModTime(), fi.Size()
++
++	idx, err := t.load()
++	if err != nil {
++		// Keep the last good state. Dropping to unlimited because someone wrote a
++		// truncated file would be worse than serving a slightly stale limit, and a
++		// half-written file is exactly what a crashed writer leaves behind.
++		t.logOnce("speedlimit: keeping previous limits, cannot load " + t.path + ": " + err.Error())
++		return
++	}
++	t.mu.Lock()
++	t.idx = idx
++	t.mu.Unlock()
++	t.lastErr = ""
++	errors.LogInfo(context.Background(), "speedlimit: loaded ", len(idx.byEmail), " limited account(s) from ", t.path)
++}
++
++// logOnce suppresses repeats so that a persistent fault does not emit a line
++// every poll interval.
++func (t *table) logOnce(msg string) {
++	if t.lastErr == msg {
++		return
++	}
++	t.lastErr = msg
++	errors.LogWarning(context.Background(), msg)
++}
++
++func (t *table) load() (*index, error) {
++	data, err := os.ReadFile(t.path)
++	if err != nil {
++		return nil, err
++	}
++	var f sidecarFile
++	if err := json.Unmarshal(data, &f); err != nil {
++		return nil, err
++	}
++
++	t.mu.RLock()
++	prev := t.idx
++	t.mu.RUnlock()
++
++	return buildIndex(prev, &f)
++}
++
++type parsedUser struct {
++	user     sidecarUser
++	prefixes []netip.Prefix
++}
++
++func buildIndex(prev *index, f *sidecarFile) (*index, error) {
++	// Phase 1: parse and validate the whole file before touching anything shared.
++	//
++	// Re-rating below mutates limiters that open connections already hold, so it
++	// is not undoable. Were the two phases interleaved, a file that turned out to
++	// be bad half way through would leave the accounts it had already reached
++	// moved to the new rates while the index was discarded, quietly breaking the
++	// promise that a malformed file changes nothing.
++	users := make([]parsedUser, 0, len(f.Users))
++	seen := make(map[string]bool, len(f.Users))
++	for _, u := range f.Users {
++		if u.Email == "" {
++			return nil, errors.New("speedlimit: entry with empty email")
++		}
++		if seen[u.Email] {
++			// Email is the enforcement key, so a duplicate would silently merge two
++			// accounts into one bucket.
++			return nil, errors.New("speedlimit: duplicate email ", u.Email)
++		}
++		seen[u.Email] = true
++
++		p := parsedUser{user: u}
++		for _, s := range u.IPs {
++			pfx, err := parsePrefix(s)
++			if err != nil {
++				return nil, errors.New("speedlimit: bad ip ", s, " for ", u.Email).Base(err)
++			}
++			p.prefixes = append(p.prefixes, pfx)
++		}
++		users = append(users, p)
++	}
++
++	// Phase 2: commit. Nothing beyond this point may fail.
++	idx := &index{
++		byEmail: make(map[string]*Limits, len(users)),
++		exact:   make(map[netip.Addr]string),
++	}
++	for _, p := range users {
++		u := p.user
++
++		var l *Limits
++		if prev != nil {
++			l = prev.byEmail[u.Email]
++		}
++		if l == nil {
++			l = &Limits{
++				Up:   rate.NewLimiter(rateOf(u.UpBps), burstFor(u.UpBps)),
++				Down: rate.NewLimiter(rateOf(u.DownBps), burstFor(u.DownBps)),
++			}
++		} else {
++			// Re-rate the EXISTING limiters. Connections that are already open hold
++			// a reference to them, and replacing the limiters would pin in-flight
++			// traffic to the old rate until it ends.
++			setRate(l.Up, u.UpBps)
++			setRate(l.Down, u.DownBps)
++		}
++		idx.byEmail[u.Email] = l
++
++		for _, pfx := range p.prefixes {
++			if pfx.Bits() == pfx.Addr().BitLen() {
++				idx.exact[pfx.Addr()] = u.Email
++				continue
++			}
++			idx.prefixes = append(idx.prefixes, prefixEntry{prefix: pfx, email: u.Email})
++		}
++	}
++
++	// Longest prefix first, so the most specific entry wins the linear scan.
++	sort.SliceStable(idx.prefixes, func(i, j int) bool {
++		return idx.prefixes[i].prefix.Bits() > idx.prefixes[j].prefix.Bits()
++	})
++
++	// An account that vanished from the file is unlimited from now on. Its open
++	// connections still hold the old *Limits, so the buckets must be opened up
++	// rather than merely dropped from the index.
++	if prev != nil {
++		for email, l := range prev.byEmail {
++			if _, ok := idx.byEmail[email]; !ok {
++				setRate(l.Up, 0)
++				setRate(l.Down, 0)
++			}
++		}
++	}
++	return idx, nil
++}
++
++// parsePrefix turns a sidecar ips entry into a prefix.
++//
++// The panel writer always emits CIDR, widening the bare addresses that the
++// ppp-family paths produce to /32 or /128 before writing, so the fallback to a
++// bare address here is tolerance for a hand-edited file rather than part of the
++// contract. It is worth its few lines: a single bare address would otherwise
++// invalidate the whole document and silently freeze every account's limit at its
++// last good value.
++//
++// Prefix matching, not exact match, is required because ikev2 psk/eap-tls and
++// wg-c map one account onto a whole block.
++func parsePrefix(s string) (netip.Prefix, error) {
++	if p, err := netip.ParsePrefix(s); err == nil {
++		return p.Masked(), nil
++	}
++	a, err := netip.ParseAddr(s)
++	if err != nil {
++		return netip.Prefix{}, err
++	}
++	a = a.Unmap()
++	return netip.PrefixFrom(a, a.BitLen()), nil
++}
++
++// rateOf maps the sidecar's "0 means this direction is unlimited" onto rate.Inf.
++func rateOf(bps int64) rate.Limit {
++	if bps <= 0 {
++		return rate.Inf
++	}
++	return rate.Limit(bps)
++}
++
++// burstFor sizes a bucket at one second of traffic, floored at minBurst, so that
++// an idle account may burst briefly to its nominal rate before being paced.
++func burstFor(bps int64) int {
++	if bps > maxBurst {
++		return maxBurst
++	}
++	if bps < minBurst {
++		return minBurst
++	}
++	return int(bps)
++}
++
++func setRate(l *rate.Limiter, bps int64) {
++	l.SetLimit(rateOf(bps))
++	l.SetBurst(burstFor(bps))
++}
+diff --git a/common/speedlimit/speedlimit_test.go b/common/speedlimit/speedlimit_test.go
+new file mode 100644
+index 00000000..715bd716
+--- /dev/null
++++ b/common/speedlimit/speedlimit_test.go
+@@ -0,0 +1,380 @@
++package speedlimit
++
++import (
++	"context"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/buf"
++	"golang.org/x/time/rate"
++)
++
++// write replaces the sidecar and moves its mtime forward, so that a reload is
++// detected deterministically rather than depending on clock granularity.
++func write(t *testing.T, path, body string, age time.Duration) {
++	t.Helper()
++	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	ts := time.Now().Add(age)
++	if err := os.Chtimes(path, ts, ts); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func newTestTable(t *testing.T, body string) (*table, string) {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "speedlimits.json")
++	write(t, path, body, 0)
++	tb := &table{path: path}
++	tb.reloadIfChanged()
++	return tb, path
++}
++
++// sample mirrors the panel writer's real output: every ips entry is CIDR (bare
++// addresses are widened to /32 before they are written), and an account with no
++// IPs serializes an empty array rather than null.
++const sample = `{"users":[
++	{"email":"a@x","downBps":655360,"upBps":262144,"ips":["10.0.0.5/32","10.7.8.8/29"]},
++	{"email":"b@x","downBps":1310720,"upBps":0,"ips":["10.9.0.0/24"]},
++	{"email":"native@x","downBps":100,"upBps":100,"ips":[]}
++]}`
++
++// TestEnvUnsetDisabled pins the default: with XRAY_SPEEDLIMIT_FILE unset the
++// package never builds a table, so the core behaves exactly as stock Xray. The
++// test binary's init ran without the variable, so this asserts the real state.
++func TestEnvUnsetDisabled(t *testing.T) {
++	if os.Getenv(EnvPath) != "" {
++		t.Skip("XRAY_SPEEDLIMIT_FILE is set in the environment")
++	}
++	if defaultTable != nil {
++		t.Fatal("expected no table when the env var is unset")
++	}
++	if l := LookupSession(nil, nil); l != nil {
++		t.Fatal("expected nil limits when disabled")
++	}
++}
++
++func TestLookup(t *testing.T) {
++	tb, _ := newTestTable(t, sample)
++
++	cases := []struct {
++		name  string
++		email string
++		ip    string
++		want  string // "" means expect nil
++	}{
++		{"exact /32", "", "10.0.0.5", "a@x"},
++		{"cidr /29 first host", "", "10.7.8.8", "a@x"},
++		{"cidr /29 last host", "", "10.7.8.15", "a@x"},
++		{"cidr /24", "", "10.9.0.77", "b@x"},
++		{"unknown ip", "", "192.0.2.1", ""},
++		{"ip just past /29", "", "10.7.8.16", ""},
++		{"email wins, no ip needed", "native@x", "", "native@x"},
++		{"unlimited email is a miss", "nobody@x", "", ""},
++	}
++
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			var ip net.IP
++			if c.ip != "" {
++				ip = net.ParseIP(c.ip)
++			}
++			got := tb.lookup(c.email, ip)
++			if c.want == "" {
++				if got != nil {
++					t.Fatalf("want nil, got limits")
++				}
++				return
++			}
++			if got == nil {
++				t.Fatalf("want %s, got nil", c.want)
++			}
++			if got != tb.idx.byEmail[c.want] {
++				t.Fatalf("resolved to the wrong account, want %s", c.want)
++			}
++		})
++	}
++}
++
++// TestLookupIPv4In16Byte guards the unmap step: net.ParseIP hands back IPv4 in
++// 16-byte v4-in-v6 form, which netip.Prefix.Contains refuses to compare against
++// a 32-bit prefix.
++func TestLookupIPv4In16Byte(t *testing.T) {
++	tb, _ := newTestTable(t, sample)
++	ip := net.ParseIP("10.0.0.5").To16()
++	if len(ip) != 16 {
++		t.Fatal("expected a 16-byte representation")
++	}
++	if tb.lookup("", ip) == nil {
++		t.Fatal("16-byte IPv4 failed to match a /32")
++	}
++}
++
++// TestReloadRerates is the core of the hot-reload contract: an open connection
++// holds the *rate.Limiter, so a reload must re-rate it in place rather than
++// swap in a new one.
++func TestReloadRerates(t *testing.T) {
++	tb, path := newTestTable(t, sample)
++
++	before := tb.lookup("", net.ParseIP("10.0.0.5"))
++	if before == nil {
++		t.Fatal("setup: no limits for a@x")
++	}
++	if got := before.Down.Limit(); got != rate.Limit(655360) {
++		t.Fatalf("down limit = %v, want 655360", got)
++	}
++	if got := before.Up.Limit(); got != rate.Limit(262144) {
++		t.Fatalf("up limit = %v, want 262144", got)
++	}
++	downLimiter := before.Down
++
++	write(t, path, `{"users":[{"email":"a@x","downBps":1000,"upBps":0,"ips":["10.0.0.5/32"]}]}`, time.Second)
++	tb.reloadIfChanged()
++
++	after := tb.lookup("", net.ParseIP("10.0.0.5"))
++	if after == nil {
++		t.Fatal("a@x disappeared after reload")
++	}
++	if after != before {
++		t.Fatal("Limits was replaced; in-flight connections would keep the old rate")
++	}
++	if after.Down != downLimiter {
++		t.Fatal("Down limiter was recreated instead of re-rated")
++	}
++	if got := after.Down.Limit(); got != rate.Limit(1000) {
++		t.Fatalf("down limit = %v, want the re-rated 1000", got)
++	}
++	// upBps 0 means that direction became unlimited.
++	if got := after.Up.Limit(); got != rate.Inf {
++		t.Fatalf("up limit = %v, want Inf", got)
++	}
++	if got := after.Down.Burst(); got != minBurst {
++		t.Fatalf("burst = %d, want the %d floor", got, minBurst)
++	}
++}
++
++// TestReloadRemovedAccountGoesUnlimited covers the account that vanishes from
++// the file while it still has connections open: dropping it from the index is
++// not enough, its buckets must be opened up.
++func TestReloadRemovedAccountGoesUnlimited(t *testing.T) {
++	tb, path := newTestTable(t, sample)
++	held := tb.lookup("", net.ParseIP("10.0.0.5"))
++	if held == nil {
++		t.Fatal("setup: no limits for a@x")
++	}
++
++	write(t, path, `{"users":[{"email":"b@x","downBps":1310720,"upBps":0,"ips":["10.9.0.0/24"]}]}`, time.Second)
++	tb.reloadIfChanged()
++
++	if tb.lookup("", net.ParseIP("10.0.0.5")) != nil {
++		t.Fatal("a@x should be gone from the index")
++	}
++	if held.Down.Limit() != rate.Inf || held.Up.Limit() != rate.Inf {
++		t.Fatal("a reference held by an open connection is still throttled")
++	}
++}
++
++func TestReloadMalformedKeepsLastGood(t *testing.T) {
++	tb, path := newTestTable(t, sample)
++	good := tb.lookup("", net.ParseIP("10.0.0.5"))
++	if good == nil {
++		t.Fatal("setup: no limits for a@x")
++	}
++
++	for _, bad := range []string{
++		`{"users":[{"email":"a@x","downBps":`, // truncated, the crashed-writer case
++		`not json at all`,
++		`{"users":[{"email":"","downBps":1}]}`,            // no key to index on
++		`{"users":[{"email":"a@x","ips":["not-an-ip"]}]}`, // unparseable prefix
++		// The bad entry sorts after a good one, so this only holds if validation
++		// completes before any limiter is re-rated.
++		`{"users":[{"email":"a@x","downBps":1},{"email":"b@x","ips":["oops"]}]}`,
++		// Duplicate emails would merge two accounts onto one bucket.
++		`{"users":[{"email":"a@x","downBps":1},{"email":"a@x","downBps":2}]}`,
++	} {
++		write(t, path, bad, 2*time.Second)
++		tb.reloadIfChanged()
++
++		got := tb.lookup("", net.ParseIP("10.0.0.5"))
++		if got != good {
++			t.Fatalf("malformed input %q lost the last good state", bad)
++		}
++		if got.Down.Limit() != rate.Limit(655360) {
++			t.Fatalf("malformed input %q changed the rate", bad)
++		}
++	}
++}
++
++// TestReloadEmptyDocumentClearsLimits pins the writer's contract: {"users":[]}
++// is the empty state, and it is a VALID document, not a malformed one. It must
++// remove every limit. Holding the last good state here would strand accounts
++// throttled forever after their limit was lifted, and {"users":[]} is the
++// steady-state file on any deployment not using the feature.
++func TestReloadEmptyDocumentClearsLimits(t *testing.T) {
++	tb, path := newTestTable(t, sample)
++	held := tb.lookup("", net.ParseIP("10.0.0.5"))
++	if held == nil {
++		t.Fatal("setup: no limits for a@x")
++	}
++
++	write(t, path, `{"users":[]}`, time.Second)
++	tb.reloadIfChanged()
++
++	if tb.lookup("", net.ParseIP("10.0.0.5")) != nil {
++		t.Fatal("empty document did not clear the IP index")
++	}
++	if tb.lookup("native@x", nil) != nil {
++		t.Fatal("empty document did not clear the email index")
++	}
++	if held.Down.Limit() != rate.Inf || held.Up.Limit() != rate.Inf {
++		t.Fatal("a connection open across the change is still throttled")
++	}
++}
++
++func TestReloadMissingFileKeepsLastGood(t *testing.T) {
++	tb, path := newTestTable(t, sample)
++	good := tb.lookup("", net.ParseIP("10.0.0.5"))
++
++	if err := os.Remove(path); err != nil {
++		t.Fatal(err)
++	}
++	tb.reloadIfChanged()
++
++	if tb.lookup("", net.ParseIP("10.0.0.5")) != good {
++		t.Fatal("a missing file dropped the limits")
++	}
++}
++
++func TestBurstFor(t *testing.T) {
++	if got := burstFor(0); got != minBurst {
++		t.Fatalf("burstFor(0) = %d, want the %d floor", got, minBurst)
++	}
++	if got := burstFor(1024); got != minBurst {
++		t.Fatalf("burstFor(1024) = %d, want the %d floor", got, minBurst)
++	}
++	// Above the floor the bucket is one second deep.
++	if got := burstFor(4 << 20); got != 4<<20 {
++		t.Fatalf("burstFor(4MiB) = %d, want one second of traffic", got)
++	}
++	if got := burstFor(1 << 40); got != maxBurst {
++		t.Fatalf("burstFor(1TiB) = %d, want the %d cap (int overflow guard)", got, maxBurst)
++	}
++}
++
++type countingWriter struct{ n int64 }
++
++func (w *countingWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
++	w.n += int64(mb.Len())
++	buf.ReleaseMulti(mb)
++	return nil
++}
++
++func makeMB(t *testing.T, size int) buf.MultiBuffer {
++	t.Helper()
++	var mb buf.MultiBuffer
++	for size > 0 {
++		b := buf.New()
++		n := size
++		if n > int(b.Cap()) {
++			n = int(b.Cap())
++		}
++		b.Extend(int32(n))
++		mb = append(mb, b)
++		size -= n
++	}
++	return mb
++}
++
++// TestWriteLargerThanBurstDoesNotError is the regression test for the trap this
++// package exists to dodge: rate.Limiter.WaitN errors instead of blocking when a
++// request exceeds the burst, and Xray writes whole MultiBuffers.
++func TestWriteLargerThanBurstDoesNotError(t *testing.T) {
++	const size = 800 * 1024
++	const burst = 1024
++
++	// Control: prove the trap is real at these numbers, so this test cannot pass
++	// vacuously if x/time/rate ever changes its behaviour.
++	naive := rate.NewLimiter(rate.Limit(64<<20), burst)
++	if err := naive.WaitN(context.Background(), size); err == nil {
++		t.Fatal("expected an unchunked WaitN over the burst to error; the trap this test guards is gone")
++	}
++
++	inner := &countingWriter{}
++	// A deliberately shallow bucket, shallower than burstFor would ever build, so
++	// that only the chunking in wait() can carry the write.
++	w := NewWriter(context.Background(), inner, rate.NewLimiter(rate.Limit(64<<20), burst))
++
++	if err := w.WriteMultiBuffer(makeMB(t, size)); err != nil {
++		t.Fatalf("write of %d bytes against a %d burst errored: %v", size, burst, err)
++	}
++	if inner.n != size {
++		t.Fatalf("wrote %d bytes, want %d", inner.n, size)
++	}
++}
++
++// TestWriteRealisticBurstIsUnchunked checks the other defence: at a bucket built
++// by burstFor, a normal MultiBuffer fits in one chunk and is not delayed.
++func TestWriteRealisticBurstIsUnchunked(t *testing.T) {
++	inner := &countingWriter{}
++	l := rate.NewLimiter(rateOf(65536), burstFor(65536)) // 64 KB/s, floored burst
++	w := NewWriter(context.Background(), inner, l)
++
++	start := time.Now()
++	if err := w.WriteMultiBuffer(makeMB(t, 64*1024)); err != nil {
++		t.Fatal(err)
++	}
++	if d := time.Since(start); d > 100*time.Millisecond {
++		t.Fatalf("first write into a full bucket took %v, want no delay", d)
++	}
++	if inner.n != 64*1024 {
++		t.Fatalf("wrote %d bytes, want %d", inner.n, 64*1024)
++	}
++}
++
++// TestNilLimiterIsPassThrough pins the zero-overhead path: an unlimited
++// direction must not allocate a wrapper at all.
++func TestNilLimiterIsPassThrough(t *testing.T) {
++	inner := &countingWriter{}
++	if got := NewWriter(context.Background(), inner, nil); got != buf.Writer(inner) {
++		t.Fatal("a nil limiter should return the writer untouched")
++	}
++	r := buf.Reader(&buf.MultiBufferContainer{})
++	if got := NewReader(context.Background(), r, nil); got != r {
++		t.Fatal("a nil limiter should return the reader untouched")
++	}
++}
++
++// TestWaitAbortsOnContextCancel: a closed connection must not park a goroutine
++// on a bucket nobody is draining.
++func TestWaitAbortsOnContextCancel(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	l := rate.NewLimiter(rate.Limit(1), minBurst)
++	if err := wait(ctx, l, 10*minBurst); err == nil {
++		t.Fatal("expected a cancelled context to abort the wait")
++	}
++}
++
++func TestPacingIsApproximatelyTheLimit(t *testing.T) {
++	inner := &countingWriter{}
++	const bps = 256 * 1024
++	l := rate.NewLimiter(rateOf(bps), burstFor(bps))
++	w := NewWriter(context.Background(), inner, l)
++
++	// Drain the initial burst, which is free by design, then measure.
++	if err := w.WriteMultiBuffer(makeMB(t, minBurst)); err != nil {
++		t.Fatal(err)
++	}
++	start := time.Now()
++	if err := w.WriteMultiBuffer(makeMB(t, bps/4)); err != nil {
++		t.Fatal(err)
++	}
++	elapsed := time.Since(start)
++	if elapsed < 200*time.Millisecond || elapsed > 400*time.Millisecond {
++		t.Fatalf("a quarter second of traffic took %v, want roughly 250ms", elapsed)
++	}
++}
+diff --git a/go.mod b/go.mod
+index aa5694ca..94e3e4c3 100644
+--- a/go.mod
++++ b/go.mod
+@@ -29,6 +29,7 @@ require (
+ 	golang.org/x/net v0.62.0
+ 	golang.org/x/sync v0.24.0
+ 	golang.org/x/sys v0.49.0
++	golang.org/x/time v0.16.0
+ 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
+ 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb
+ 	golang.zx2c4.com/wireguard/windows v1.1.1
+diff --git a/go.sum b/go.sum
+index a69efbe5..ddbc756a 100644
+--- a/go.sum
++++ b/go.sum
+@@ -129,8 +129,8 @@ golang.org/x/text v0.3.6/go.mod h1:5Zoc/QRtKVWzQhOtBMvqHzDpF6irO9z98xDceosuGiQ=
+ golang.org/x/text v0.3.7/go.mod h1:u+2+/6zg+i71rQMx5EYifcz6MCKuco9NR6JIITiCfzQ=
+ golang.org/x/text v0.43.0 h1:1QivrlhwAsnMOcqgOdl9my7s9OyZl8O5/UGUTJVXoWc=
+ golang.org/x/text v0.43.0/go.mod h1:hbSIYA/amXcRXTFSZqh8tWHEoqRvvbKPJ2uz/KU+a+s=
+-golang.org/x/time v0.14.0 h1:MRx4UaLrDotUKUdCIqzPC48t1Y9hANFKIRpNx+Te8PI=
+-golang.org/x/time v0.14.0/go.mod h1:eL/Oa2bBBK0TkX57Fyni+NgnyQQN4LitPmob2Hjnqw4=
++golang.org/x/time v0.16.0 h1:vMb6ptszcQMkcwiRTAuNNU50gom6++Q/6gY2hDM6VDE=
++golang.org/x/time v0.16.0/go.mod h1:rVKOqvZeKvrDKTQiAHJ7wmwP0RzleSphoEA9RcdLA0s=
+ golang.org/x/tools v0.0.0-20180917221912-90fa682c2a6e/go.mod h1:n7NCudcB/nEzxVGmLbDWY5pfWTLqBcC2KZ6jyYvM4mQ=
+ golang.org/x/tools v0.0.0-20191119224855-298f0cb1881e/go.mod h1:b+2E5dAYhXwXZwtnZ6UAqBI28+e2cm9otk0dWdXHAEo=
+ golang.org/x/tools v0.0.0-20200130002326-2f3ba24bd6e7/go.mod h1:TB2adYChydJhpapKDTa4BR/hXlZSLoq2Wpct/0txZ28=

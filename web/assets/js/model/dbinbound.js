@@ -194,6 +194,7 @@ class DBInbound {
             case Protocols.VLESS:
             case Protocols.TROJAN:
             case Protocols.HYSTERIA:
+            case Protocols.HYSTERIA2:
             case Protocols.ANYTLS:
             case Protocols.TUIC:
             case Protocols.NAIVE:
@@ -265,6 +266,7 @@ class DBInbound {
             case Protocols.TROJAN:
             case Protocols.SHADOWSOCKS:
             case Protocols.HYSTERIA:
+            case Protocols.HYSTERIA2:
             // AnyTLS, TUIC and naive each generate a real client-importable share
             // link (see genAnytlsLink / genTuicLink / genNaiveLink), so their
             // accounts get the QR icon and the shared QR modal like any other

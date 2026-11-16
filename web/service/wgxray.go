@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/mhsanaei/3x-ui/v2/database"
@@ -459,13 +460,88 @@ type WgxrayClientConfig struct {
 	Port        int    `json:"port"`
 }
 
-// RenderWireguardXrayConfigs returns the .conf(s) one account installs, one per device
-// slot. endpointHost is the address the customer dials.
-//
-// AllowedIPs is IPv4-only full tunnel, matching every other protocol in this panel:
-// adding ::/0 to a tunnel whose inside has no IPv6 sends the client's v6 traffic into
-// a black hole, and adding neither leaks it past the tunnel entirely.
-func RenderWireguardXrayConfigs(inbound *model.Inbound, email, endpointHost string) ([]WgxrayClientConfig, error) {
+type wgxrayEndpoint struct {
+	Host   string
+	Port   int
+	Remark string
+}
+
+type wgxrayRenderedEntry struct {
+	DeviceIndex int
+	Params      WgcClientParams
+}
+
+func parseWgxrayExternalEndpoints(streamRaw, settingsRaw, defaultHost string, defaultPort int) []wgxrayEndpoint {
+	extractFrom := func(raw string) []any {
+		if strings.TrimSpace(raw) == "" {
+			return nil
+		}
+		var m map[string]any
+		if json.Unmarshal([]byte(raw), &m) != nil || m == nil {
+			return nil
+		}
+		if list, ok := m["externalProxy"].([]any); ok && len(list) > 0 {
+			return list
+		}
+		return nil
+	}
+	rawList := extractFrom(streamRaw)
+	if len(rawList) == 0 {
+		rawList = extractFrom(settingsRaw)
+	}
+	if len(rawList) == 0 {
+		return nil
+	}
+	out := make([]wgxrayEndpoint, 0, len(rawList))
+	for _, item := range rawList {
+		ep, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		dest, _ := ep["dest"].(string)
+		dest = strings.TrimSpace(dest)
+		if dest == "" {
+			dest = defaultHost
+		}
+		if dest == "" {
+			continue
+		}
+		port := 0
+		switch p := ep["port"].(type) {
+		case float64:
+			port = int(p)
+		case float32:
+			port = int(p)
+		case int:
+			port = p
+		case int64:
+			port = int(p)
+		case json.Number:
+			if n, err := p.Int64(); err == nil {
+				port = int(n)
+			}
+		case string:
+			if n, err := strconv.Atoi(strings.TrimSpace(p)); err == nil {
+				port = n
+			}
+		}
+		if port <= 0 || port > 65535 {
+			port = defaultPort
+		}
+		if port <= 0 {
+			continue
+		}
+		remark, _ := ep["remark"].(string)
+		out = append(out, wgxrayEndpoint{
+			Host:   dest,
+			Port:   port,
+			Remark: remark,
+		})
+	}
+	return out
+}
+
+func renderWireguardXrayEntries(inbound *model.Inbound, email, endpointHost string) ([]wgxrayRenderedEntry, error) {
 	if inbound == nil || inbound.Protocol != model.WireGuard {
 		return nil, common.NewError("not an Xray wireguard inbound")
 	}
@@ -511,7 +587,16 @@ func RenderWireguardXrayConfigs(inbound *model.Inbound, email, endpointHost stri
 		_ = json.Unmarshal(ab, &addrs)
 	}
 
-	out := make([]WgxrayClientConfig, 0, len(slots))
+	endpoints := parseWgxrayExternalEndpoints(inbound.StreamSettings, inbound.Settings, endpointHost, inbound.Port)
+	if len(endpoints) == 0 {
+		endpoints = []wgxrayEndpoint{{
+			Host:   endpointHost,
+			Port:   inbound.Port,
+			Remark: "",
+		}}
+	}
+
+	out := make([]wgxrayRenderedEntry, 0, len(slots)*len(endpoints))
 	for i, d := range slots {
 		if i >= len(addrs) {
 			break
@@ -520,28 +605,99 @@ func RenderWireguardXrayConfigs(inbound *model.Inbound, email, endpointHost stri
 		if priv == "" {
 			continue
 		}
+		psk := strings.TrimSpace(jsonString(d["psk"]))
+		for _, ep := range endpoints {
+			out = append(out, wgxrayRenderedEntry{
+				DeviceIndex: i,
+				Params: WgcClientParams{
+					Name:         ep.Remark,
+					PrivateKey:   priv,
+					Address:      addrs[i],
+					PublicKey:    serverPub,
+					PreSharedKey: psk,
+					Host:         ep.Host,
+					Port:         ep.Port,
+					MTU:          mtu,
+					DNS:          []string{"1.1.1.1", "1.0.0.1"},
+					AllowedIPs:   []string{"0.0.0.0/0"},
+				},
+			})
+		}
+	}
+	return out, nil
+}
+
+// RenderWireguardXrayParams returns structured WireGuard parameters per device/endpoint
+// for Xray-native wireguard accounts so subscriptions and .conf downloads agree.
+func RenderWireguardXrayParams(inbound *model.Inbound, email, endpointHost string) ([]WgcClientParams, error) {
+	entries, err := renderWireguardXrayEntries(inbound, email, endpointHost)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]WgcClientParams, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Params)
+	}
+	return out, nil
+}
+
+// RenderWireguardXrayConfigs returns the .conf(s) one account installs, one per device
+// slot. endpointHost is the address the customer dials.
+//
+// AllowedIPs is IPv4-only full tunnel, matching every other protocol in this panel:
+// adding ::/0 to a tunnel whose inside has no IPv6 sends the client's v6 traffic into
+// a black hole, and adding neither leaks it past the tunnel entirely.
+func RenderWireguardXrayConfigs(inbound *model.Inbound, email, endpointHost string) ([]WgxrayClientConfig, error) {
+	entries, err := renderWireguardXrayEntries(inbound, email, endpointHost)
+	if err != nil {
+		return nil, err
+	}
+	var raw map[string]json.RawMessage
+	_ = json.Unmarshal([]byte(inbound.Settings), &raw)
+	var clients []map[string]json.RawMessage
+	if cb, ok := raw["clients"]; ok {
+		_ = json.Unmarshal(cb, &clients)
+	}
+	var slots []map[string]json.RawMessage
+	for _, c := range clients {
+		if accountKey(jsonString(c["email"])) == accountKey(email) {
+			if db, ok := c["devices"]; ok {
+				_ = json.Unmarshal(db, &slots)
+			}
+			break
+		}
+	}
+
+	out := make([]WgxrayClientConfig, 0, len(entries))
+	for _, e := range entries {
+		p := e.Params
+		pubKey := ""
+		if e.DeviceIndex < len(slots) {
+			pubKey = strings.TrimSpace(jsonString(slots[e.DeviceIndex]["pubKey"]))
+		}
 		var b strings.Builder
 		b.WriteString("[Interface]\n")
-		fmt.Fprintf(&b, "PrivateKey = %s\n", priv)
-		fmt.Fprintf(&b, "Address = %s\n", addrs[i])
-		fmt.Fprintf(&b, "MTU = %d\n", mtu)
+		fmt.Fprintf(&b, "PrivateKey = %s\n", p.PrivateKey)
+		fmt.Fprintf(&b, "Address = %s\n", p.Address)
+		fmt.Fprintf(&b, "MTU = %d\n", p.MTU)
 		b.WriteString("DNS = 1.1.1.1, 1.0.0.1\n\n")
 		b.WriteString("[Peer]\n")
-		fmt.Fprintf(&b, "PublicKey = %s\n", serverPub)
-		if psk := strings.TrimSpace(jsonString(d["psk"])); psk != "" {
-			fmt.Fprintf(&b, "PresharedKey = %s\n", psk)
+		fmt.Fprintf(&b, "PublicKey = %s\n", p.PublicKey)
+		if p.PreSharedKey != "" {
+			fmt.Fprintf(&b, "PresharedKey = %s\n", p.PreSharedKey)
 		}
 		b.WriteString("AllowedIPs = 0.0.0.0/0\n")
-		fmt.Fprintf(&b, "Endpoint = %s:%d\n", endpointHost, inbound.Port)
+		fmt.Fprintf(&b, "Endpoint = %s\n", net.JoinHostPort(p.Host, strconv.Itoa(p.Port)))
 		b.WriteString("PersistentKeepalive = 25\n")
 
 		out = append(out, WgxrayClientConfig{
-			DeviceIndex: i,
-			IP:          addrs[i],
-			PublicKey:   strings.TrimSpace(jsonString(d["pubKey"])),
+			DeviceIndex: e.DeviceIndex,
+			IP:          p.Address,
+			Remark:      p.Name,
+			PublicKey:   pubKey,
 			Config:      b.String(),
-			Host:        endpointHost,
-			Port:        inbound.Port,
+			Host:        p.Host,
+			Port:        p.Port,
 		})
 	}
 	return out, nil

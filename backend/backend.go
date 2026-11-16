@@ -21,6 +21,8 @@ import (
 	"strings"
 
 	"github.com/mhsanaei/3x-ui/v2/config"
+	"github.com/mhsanaei/3x-ui/v2/logger"
+	"github.com/mhsanaei/3x-ui/v2/util/binutil"
 )
 
 // bundleFS holds the per-architecture daemon binaries. The `all:` prefix keeps
@@ -57,6 +59,10 @@ var Daemons = []Daemon{
 	// dlopen and no fixed install path, so it belongs in this flat manifest rather
 	// than needing a relocatable tree bundle like accel-ppp/strongSwan.
 	{Name: "telemt"},
+	// sing-box powers native Hysteria 2 inbounds and client outbounds.
+	{Name: "sing-box"},
+	// amneziawg-go provides the userspace AmneziaWG 2.0 daemon when prebuilt in the bundle.
+	{Name: "amneziawg-go"},
 
 	// The client side. Three protocols the panel can serve can also be dialed
 	// out to, but only by separate upstream projects: pptpd, ocserv and
@@ -122,9 +128,28 @@ func BinDir() string {
 	return filepath.Join(filepath.Dir(exe), bin)
 }
 
-// DaemonPath returns the extracted path of a bundled daemon if it exists on
-// disk, otherwise "".
+// CustomBinDir returns the override directory checked before BinDir().
+func CustomBinDir() string {
+	return binutil.CustomBinDir()
+}
+
+// DaemonPath returns the resolved path of a managed daemon, preferring any valid
+// executable override inside CustomBinDir() before falling back to BinDir().
 func DaemonPath(name string) string {
+	if p, warnErr := binutil.ResolveCustomBinary(name); warnErr != nil || p != "" {
+		if warnErr != nil {
+			logger.Warning(warnErr)
+		}
+		if p != "" {
+			return p
+		}
+	}
+	return BundledDaemonPath(name)
+}
+
+// BundledDaemonPath returns the extracted bundled path inside BinDir() if it
+// exists on disk, otherwise "".
+func BundledDaemonPath(name string) string {
 	p := filepath.Join(BinDir(), name)
 	if st, err := os.Stat(p); err == nil && !st.IsDir() {
 		return p

@@ -164,9 +164,172 @@ type membershipUsageRow struct {
 	// supplies it also drops any share whose inbound has been DELETED, for the same
 	// reason: subtracting it would hide those bytes on every page.
 	Protocol model.Protocol
+	Remark   string
+	Port     int
+	Enable   bool
 	Up       int64
 	Down     int64
 	AllTime  int64
+}
+
+// buildInboundTraffics constructs the sorted per-inbound traffic breakdown for
+// one account from its aggregate traffic row and membership splits.
+func buildInboundTraffics(
+	total *xray.ClientTraffic,
+	split *accountUsageSplit,
+	fallbackInbound *model.Inbound,
+) []xray.InboundTrafficBreakdown {
+	if total == nil {
+		return nil
+	}
+	if split == nil || !split.hasMemberships || len(split.byInbound) == 0 {
+		if fallbackInbound == nil && total.InboundId <= 0 {
+			return nil
+		}
+		b := xray.InboundTrafficBreakdown{
+			InboundId: total.InboundId,
+			Enable:    total.Enable,
+			Up:        total.Up,
+			Down:      total.Down,
+			Total:     total.Up + total.Down,
+			AllTime:   total.AllTime,
+		}
+		if fallbackInbound != nil {
+			b.Protocol = string(fallbackInbound.Protocol)
+			b.Remark = fallbackInbound.Remark
+			b.Port = fallbackInbound.Port
+			b.Enable = fallbackInbound.Enable
+		}
+		return []xray.InboundTrafficBreakdown{b}
+	}
+
+	hasPooled := split.pooled.Up+split.pooled.Down+split.pooled.AllTime > 0
+	out := make([]xray.InboundTrafficBreakdown, 0, len(split.byInbound))
+	for _, share := range split.byInbound {
+		up, down, allTime := share.Up, share.Down, share.AllTime
+		shared := false
+		if hasPooled && mayHoldCoreTraffic(share.Protocol) {
+			up += split.pooled.Up
+			down += split.pooled.Down
+			allTime += split.pooled.AllTime
+			shared = true
+		}
+		out = append(out, xray.InboundTrafficBreakdown{
+			InboundId: share.InboundId,
+			Protocol:  string(share.Protocol),
+			Remark:    share.Remark,
+			Port:      share.Port,
+			Enable:    share.Enable,
+			Up:        up,
+			Down:      down,
+			Total:     up + down,
+			AllTime:   allTime,
+			Shared:    shared,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].InboundId < out[j].InboundId
+	})
+	return out
+}
+
+// populateClientInboundTraffics attaches the per-inbound breakdown slice
+// (InboundTraffics) to each ClientTraffic record for API consumers such as
+// getClientTraffics and getClientTrafficsById.
+func (s *InboundService) populateClientInboundTraffics(db *gorm.DB, traffics []*xray.ClientTraffic) {
+	if db == nil || len(traffics) == 0 {
+		return
+	}
+	byEmail := make(map[string]*xray.ClientTraffic, len(traffics))
+	emailKeys := make([]string, 0, len(traffics))
+	fallbackIDs := make([]int, 0, len(traffics))
+	seenFallback := make(map[int]bool, len(traffics))
+	for _, t := range traffics {
+		if t == nil {
+			continue
+		}
+		key := accountKey(t.Email)
+		if key != "" && byEmail[key] == nil {
+			byEmail[key] = t
+			emailKeys = append(emailKeys, key)
+		}
+		if t.InboundId > 0 && !seenFallback[t.InboundId] {
+			seenFallback[t.InboundId] = true
+			fallbackIDs = append(fallbackIDs, t.InboundId)
+		}
+	}
+	if len(emailKeys) == 0 {
+		return
+	}
+
+	var shares []membershipUsageRow
+	if err := db.Table("account_inbounds").
+		Select("account_inbounds.inbound_id AS inbound_id, accounts.email AS email, " +
+			"inbounds.protocol AS protocol, inbounds.remark AS remark, " +
+			"inbounds.port AS port, inbounds.enable AS enable, " +
+			"COALESCE(account_inbounds.up, 0) AS up, COALESCE(account_inbounds.down, 0) AS down, " +
+			"COALESCE(account_inbounds.all_time, 0) AS all_time").
+		Joins("JOIN accounts ON accounts.id = account_inbounds.account_id").
+		Joins("JOIN inbounds ON inbounds.id = account_inbounds.inbound_id").
+		Where("LOWER(TRIM(accounts.email)) IN ?", emailKeys).
+		Scan(&shares).Error; err != nil {
+		logger.Warning("per-inbound usage: cannot load breakdown shares: ", err)
+		return
+	}
+
+	splits := make(map[string]*accountUsageSplit, len(emailKeys))
+	for _, share := range shares {
+		key := accountKey(share.Email)
+		if key == "" {
+			continue
+		}
+		split := splits[key]
+		if split == nil {
+			split = &accountUsageSplit{byInbound: map[int]membershipUsageRow{}}
+			splits[key] = split
+		}
+		split.hasMemberships = true
+		split.email = share.Email
+		split.byInbound[share.InboundId] = share
+	}
+	for key, split := range splits {
+		total := byEmail[key]
+		if total == nil {
+			continue
+		}
+		var up, down, allTime int64
+		for _, share := range split.byInbound {
+			up += share.Up
+			down += share.Down
+			allTime += share.AllTime
+		}
+		split.pooled = xray.ClientTraffic{
+			Up:      max64(total.Up-up, 0),
+			Down:    max64(total.Down-down, 0),
+			AllTime: max64(total.AllTime-allTime, 0),
+		}
+	}
+
+	fallbackById := make(map[int]*model.Inbound, len(fallbackIDs))
+	if len(fallbackIDs) > 0 {
+		var fallbackInbounds []model.Inbound
+		if err := db.Model(&model.Inbound{}).
+			Select("id", "protocol", "remark", "port", "enable").
+			Where("id IN ?", fallbackIDs).
+			Find(&fallbackInbounds).Error; err == nil {
+			for i := range fallbackInbounds {
+				fallbackById[fallbackInbounds[i].Id] = &fallbackInbounds[i]
+			}
+		}
+	}
+
+	for _, t := range traffics {
+		if t == nil {
+			continue
+		}
+		key := accountKey(t.Email)
+		t.InboundTraffics = buildInboundTraffics(t, splits[key], fallbackById[t.InboundId])
+	}
 }
 
 // accountUsageSplit is one account's usage, already divided.
@@ -227,7 +390,8 @@ func (s *InboundService) attachClientStats(db *gorm.DB, inbounds []*model.Inboun
 	var shares []membershipUsageRow
 	if err := db.Table("account_inbounds").
 		Select("account_inbounds.inbound_id AS inbound_id, accounts.email AS email, " +
-			"inbounds.protocol AS protocol, " +
+			"inbounds.protocol AS protocol, inbounds.remark AS remark, " +
+			"inbounds.port AS port, inbounds.enable AS enable, " +
 			"COALESCE(account_inbounds.up, 0) AS up, COALESCE(account_inbounds.down, 0) AS down, " +
 			"COALESCE(account_inbounds.all_time, 0) AS all_time").
 		Joins("JOIN accounts ON accounts.id = account_inbounds.account_id").
@@ -289,8 +453,22 @@ func (s *InboundService) attachClientStats(db *gorm.DB, inbounds []*model.Inboun
 		}
 	}
 
+	inboundsById := make(map[int]*model.Inbound, len(inbounds))
 	for _, inbound := range inbounds {
-		inbound.ClientStats = s.clientStatsFor(inbound, byEmail, splits)
+		if inbound != nil {
+			inboundsById[inbound.Id] = inbound
+		}
+	}
+	breakdownByEmail := make(map[string][]xray.InboundTrafficBreakdown, len(byEmail))
+	for key, total := range byEmail {
+		if total == nil {
+			continue
+		}
+		breakdownByEmail[key] = buildInboundTraffics(total, splits[key], inboundsById[total.InboundId])
+	}
+
+	for _, inbound := range inbounds {
+		inbound.ClientStats = s.clientStatsFor(inbound, byEmail, splits, breakdownByEmail)
 	}
 	return nil
 }
@@ -300,6 +478,7 @@ func (s *InboundService) clientStatsFor(
 	inbound *model.Inbound,
 	byEmail map[string]*xray.ClientTraffic,
 	splits map[string]*accountUsageSplit,
+	breakdownByEmail map[string][]xray.InboundTrafficBreakdown,
 ) []xray.ClientTraffic {
 	// Whether this inbound can be holding some of what the core could not place. Only
 	// such an inbound shows the pooled remainder on top of its own share.
@@ -363,6 +542,9 @@ func (s *InboundService) clientStatsFor(
 				row.InboundAllTime += split.pooled.AllTime
 				row.Shared = true
 			}
+		}
+		if breakdown := breakdownByEmail[key]; len(breakdown) > 0 {
+			row.InboundTraffics = breakdown
 		}
 		stats = append(stats, row)
 	}

@@ -282,7 +282,7 @@ func (s *VpnOutboundService) InitVpnOutbound() {
 	// pair of rules already; this is the repair pass, and it is the only thing that
 	// removes a steer rule left behind by a crash or pointing at a table number that a
 	// rebuilt device has since given up.
-	vpnOutApplyVia(all, vpnOutApplyCarriers(all, (&SshOutboundService{}).List()))
+	vpnOutApplyVia(all, vpnOutApplyCarriers(all, loadedProxyTunnels()))
 }
 
 // VpnOutSecrets is an OPTIONAL interface naming the settings keys that must never
@@ -448,8 +448,8 @@ func (s *VpnOutboundService) Save(cfg VpnOutboundConfig) (VpnOutboundConfig, err
 	// both tunnels dead, a Via naming an Xray outbound has no netdev to steer into, and
 	// a Via naming itself installs a rule sending a tunnel's handshake into its own
 	// table.
-	sshList := (&SshOutboundService{}).List()
-	carriers, _ := vpnOutCarrierPlan(all, sshList, vpnOutTemplateOutbounds())
+	proxyTunnels := loadedProxyTunnels()
+	carriers, _ := vpnOutCarrierPlan(all, proxyTunnels, vpnOutTemplateOutbounds())
 	if err := vpnOutViaCheck(all, vpnOutCarrierExtras(carriers), cfg); err != nil {
 		return cfg, err
 	}
@@ -532,10 +532,11 @@ func (s *VpnOutboundService) Save(cfg VpnOutboundConfig) (VpnOutboundConfig, err
 		}
 		return cfg, err
 	}
+	syncVpnOutboundToTemplate(cfg, false)
 	// Over the whole list, because this save can have changed somebody else's answer:
 	// disabling a tunnel that carries two others has to remove their steer rules, and
 	// they are not in this call anywhere.
-	vpnOutApplyVia(out, vpnOutApplyCarriers(out, (&SshOutboundService{}).List()))
+	vpnOutApplyVia(out, vpnOutApplyCarriers(out, loadedProxyTunnels()))
 	// The freedom outbound fronting this tunnel is derived from the stored list when
 	// the config is built, so the core has to be rebuilt for the change to reach it.
 	(&XrayService{}).SetToNeedRestart()
@@ -569,6 +570,7 @@ func (s *VpnOutboundService) Delete(tag string) error {
 	if err := s.persist(out); err != nil {
 		return err
 	}
+	syncVpnOutboundToTemplate(VpnOutboundConfig{Tag: tag}, true)
 	if drv, err := vpnOutDriverFor(victim.Kind); err == nil {
 		vpnOutUnbindEgress(victim.Iface)
 		if err := drv.Down(*victim); err != nil {
@@ -579,7 +581,7 @@ func (s *VpnOutboundService) Delete(tag string) error {
 	// rule pointing into its table, and vpnOutUnbindEgress has just taken the table's
 	// blackhole with it: without this pass the tunnels it carried would fall through to
 	// main and leave in the clear.
-	vpnOutApplyVia(out, vpnOutApplyCarriers(out, (&SshOutboundService{}).List()))
+	vpnOutApplyVia(out, vpnOutApplyCarriers(out, loadedProxyTunnels()))
 	(&XrayService{}).SetToNeedRestart()
 	return nil
 }
@@ -658,7 +660,7 @@ func (s *VpnOutboundService) bringUp(cfg VpnOutboundConfig, all []VpnOutboundCon
 	var carrier vpnOutCarrier
 	if cfg.Via != "" {
 		var facts vpnOutViaFacts
-		carrier, facts, err = vpnOutResolveCarrier(cfg.Via, all, (&SshOutboundService{}).List())
+		carrier, facts, err = vpnOutResolveCarrier(cfg.Via, all, loadedProxyTunnels())
 		if err != nil {
 			return "", err
 		}
@@ -841,7 +843,12 @@ func vpnOutEgressRoutes(table, linkIndex int) []*netlink.Route {
 // vpnOutReplaceRoute and vpnOutFlushTable are the two places this file writes routes.
 // Vars so the teardown ORDER, which is where the leak lives, can be observed in a test
 // without a kernel.
-var vpnOutReplaceRoute = func(r *netlink.Route) error { return netlink.RouteReplace(r) }
+var vpnOutReplaceRoute = func(r *netlink.Route) error {
+	if err := netlink.RouteReplace(r); err != nil && !errIsExist(err) {
+		return err
+	}
+	return nil
+}
 
 var vpnOutFlushTable = func(table int) {
 	routes, err := netlink.RouteListFiltered(netlink.FAMILY_ALL,
@@ -894,7 +901,10 @@ func vpnOutEnsureRule(want *netlink.Rule) error {
 			}
 		}
 	}
-	return netlink.RuleAdd(want)
+	if err := netlink.RuleAdd(want); err != nil && !errIsExist(err) {
+		return err
+	}
+	return nil
 }
 
 // vpnOutSweepRules deletes the rules belonging to one tunnel: every rule selecting on

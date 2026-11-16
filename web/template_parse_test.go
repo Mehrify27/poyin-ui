@@ -46,8 +46,8 @@ func TestAllTemplatesParseAndProtocolFormsDefined(t *testing.T) {
 	// {{define}} tree over the same protocols, and a mis-named one there fails the
 	// same way - a 500 when the inbound modal renders, for the operators who
 	// turned it on and nobody else.
-	for _, name := range []string{"form/ssh", "form/mtproto", "form/wgc", "form/ikev2", "form/sstp", "form/openconnect", "form/openvpn", "form/pptp", "form/l2tp", "form/anytls", "form/tuic", "form/naive",
-		"form/inbound", "form/inbound/legacy", "form/legacy/openvpn", "form/legacy/vless", "form/legacy/ssh"} {
+	for _, name := range []string{"form/ssh", "form/hysteria2", "form/mtproto", "form/wgc", "form/ikev2", "form/sstp", "form/openconnect", "form/openvpn", "form/pptp", "form/l2tp", "form/anytls", "form/tuic", "form/naive",
+		"form/inbound", "form/inbound/legacy", "form/legacy/openvpn", "form/legacy/vless", "form/legacy/ssh", "form/legacy/hysteria2"} {
 		if tpl.Lookup(name) == nil {
 			t.Errorf("template %q not defined — its protocol form failed to parse or is mis-named", name)
 		}

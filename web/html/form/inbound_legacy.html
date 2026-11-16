@@ -668,6 +668,11 @@
     {{template "form/hysteria"}}
 </template>
 
+<!-- hysteria2 (sing-box) -->
+<template v-if="inbound.protocol === Protocols.HYSTERIA2">
+    {{template "form/legacy/hysteria2"}}
+</template>
+
 <!-- anytls -->
 <template v-if="inbound.protocol === Protocols.ANYTLS">
     {{template "form/anytls"}}

@@ -1222,29 +1222,66 @@ func printCoreStatus(cores []service.CoreStatus) {
 // restartPanel, which without an active systemd unit does
 // syscall.Exec(exe, os.Args). That is correct for the panel process, but from the CLI it
 // would re-exec the CLI with its own `update` arguments and loop. So this reuses
-// the pieces (DownloadPanelBinary, IsCompatibleBinary, the same release asset) and
-// owns the ordering itself: DB backup, swap, restart.
-func runUpdate() {
+// runUpdate implements `vpn-ui update [--local <path>] [--mirror <url>] [--repo <owner/repo>] [--force]`
+// (which menu item 1 calls too): install either a local binary/bundle or the latest
+// GitHub release over the running panel. It reuses service's staging/download/ELF/rollback
+// helpers and owns the ordering: check SemVer, WAL-checkpointed DB backup, binary backup
+// (.bak), swap, menu refresh, non-destructive migrate check, systemd restart, health check,
+// and automatic rollback if the restarted panel fails health verification.
+func runUpdate(args ...string) {
+	updateCmd := flag.NewFlagSet("update", flag.ContinueOnError)
+	var (
+		localPath string
+		mirrorURL string
+		repoSlug  string
+		force     bool
+		reinstall bool
+	)
+	updateCmd.StringVar(&localPath, "local", "", "install from a local vpn-ui binary or .tar.gz release bundle")
+	updateCmd.StringVar(&mirrorURL, "mirror", "", "GitHub mirror/proxy URL prefix (e.g. https://ghproxy.example.com/)")
+	updateCmd.StringVar(&repoSlug, "repo", "", "override GitHub repository slug (owner/name)")
+	updateCmd.BoolVar(&force, "force", false, "reinstall the same version or force downgrade")
+	updateCmd.BoolVar(&reinstall, "reinstall", false, "alias for --force")
+	if err := updateCmd.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if reinstall {
+		force = true
+	}
+	if localPath == "" {
+		localPath = strings.TrimSpace(os.Getenv("LOCAL_ASSET"))
+	}
+	if mirrorURL == "" {
+		if m := strings.TrimSpace(os.Getenv("VPNUI_GH_PROXY")); m != "" {
+			mirrorURL = m
+		} else {
+			mirrorURL = strings.TrimSpace(os.Getenv("GH_PROXY"))
+		}
+	}
+	if repoSlug == "" {
+		if r := strings.TrimSpace(os.Getenv("VPNUI_REPO")); r != "" {
+			repoSlug = r
+		} else {
+			repoSlug = strings.TrimSpace(os.Getenv("REPO"))
+		}
+	}
+	if !force {
+		if f := strings.ToLower(strings.TrimSpace(os.Getenv("FORCE_UPDATE"))); f == "1" || f == "true" || f == "yes" {
+			force = true
+		}
+	}
+
+	if repoSlug != "" {
+		config.SetRepoOverride(repoSlug)
+	}
+	if mirrorURL != "" {
+		config.SetGHProxyOverride(mirrorURL)
+	}
+
 	initLogger()
 	if err := database.InitDB(config.GetDBPath()); err != nil {
 		fmt.Fprintln(os.Stderr, "Database initialization failed:", err)
 		os.Exit(1)
-	}
-
-	var serverService service.ServerService
-	fmt.Println(ansiVpnUI())
-	upd, err := serverService.CheckPanelUpdate()
-	if err != nil {
-		// Refuse rather than guess: without the latest tag there is nothing to compare
-		// against, and downloading blind could reinstall the same build for no reason.
-		fmt.Fprintln(os.Stderr, "Could not check for updates:", err)
-		os.Exit(1)
-	}
-	fmt.Printf("  Current: %s\n", upd.Current)
-	fmt.Printf("  Latest:  %s\n", upd.Latest)
-	if !upd.Available {
-		fmt.Println("Already up to date, nothing to do.")
-		return
 	}
 
 	exe, err := os.Executable()
@@ -1255,72 +1292,155 @@ func runUpdate() {
 	if resolved, rerr := filepath.EvalSymlinks(exe); rerr == nil {
 		exe = resolved
 	}
+	exeDir := filepath.Dir(exe)
 
-	tmp := exe + ".new"
-	fmt.Printf("Downloading %s ...\n", service.PanelDownloadURL)
-	if err := service.DownloadPanelBinary(context.Background(), tmp, service.PanelDownloadURL); err != nil {
-		_ = os.Remove(tmp)
-		fmt.Fprintln(os.Stderr, "Download failed:", err)
-		os.Exit(1)
-	}
-	// An HTML 404 page, a truncated transfer or a wrong-arch asset would otherwise be
-	// renamed over the running binary and brick the panel on its next start.
-	if !service.IsCompatibleBinary(tmp) {
-		_ = os.Remove(tmp)
-		fmt.Fprintf(os.Stderr, "Downloaded file is not a %s Linux binary (no valid '%s' asset?)\n",
-			runtime.GOARCH, service.PanelAsset)
-		os.Exit(1)
-	}
-	if err := os.Chmod(tmp, 0o755); err != nil {
-		_ = os.Remove(tmp)
-		fmt.Fprintln(os.Stderr, "Could not make the downloaded binary executable:", err)
-		os.Exit(1)
+	var (
+		staged    string
+		targetVer string
+		curVer    = config.GetVersion()
+	)
+
+	fmt.Println(ansiVpnUI())
+	if localPath != "" {
+		fmt.Printf("  Current: %s\n", curVer)
+		fmt.Printf("  Source:  local asset (%s)\n", localPath)
+		var incomingVer string
+		staged, incomingVer, err = service.StageLocalPanelAsset(localPath, exeDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Local asset validation failed:", err)
+			os.Exit(1)
+		}
+		if incomingVer != "" {
+			fmt.Printf("  Target:  %s\n", incomingVer)
+			cmp := config.CompareSemVer(incomingVer, curVer)
+			if cmp < 0 && !force {
+				_ = os.Remove(staged)
+				fmt.Fprintf(os.Stderr, "Refusing downgrade from v%s to v%s without --force.\n", curVer, incomingVer)
+				os.Exit(1)
+			}
+			if cmp == 0 && !force {
+				_ = os.Remove(staged)
+				fmt.Println("Already on this version; re-run with --force / --reinstall to reinstall.")
+				return
+			}
+			targetVer = incomingVer
+		} else {
+			targetVer = "local"
+		}
+	} else {
+		var serverService service.ServerService
+		upd, checkErr := serverService.CheckPanelUpdate()
+		if checkErr != nil {
+			fmt.Fprintln(os.Stderr, "Could not check for updates:", checkErr)
+			fmt.Fprintf(os.Stderr, "Tip (restricted/offline network): run with --mirror <proxy-url> or --local <path/to/%s or .tar.gz>\n",
+				service.PanelAssetForArch(runtime.GOARCH))
+			os.Exit(1)
+		}
+		fmt.Printf("  Current: %s\n", upd.Current)
+		fmt.Printf("  Latest:  %s\n", upd.Latest)
+		if !upd.Available && !force {
+			fmt.Println("Already up to date, nothing to do.")
+			return
+		}
+		targetVer = upd.Latest
+		dlURL := service.PanelDownloadURLForArch(runtime.GOARCH)
+		staged = exe + ".new"
+		fmt.Printf("Downloading %s ...\n", dlURL)
+		if err := service.DownloadPanelBinary(context.Background(), staged, dlURL); err != nil {
+			_ = os.Remove(staged)
+			fmt.Fprintln(os.Stderr, "Download failed:", err)
+			fmt.Fprintf(os.Stderr, "Tip: retry with --mirror <proxy-url> or --local <path/to/%s or .tar.gz>\n",
+				service.PanelAssetForArch(runtime.GOARCH))
+			os.Exit(1)
+		}
+		if !service.IsCompatibleBinary(staged) {
+			_ = os.Remove(staged)
+			fmt.Fprintf(os.Stderr, "Downloaded file is not a %s Linux binary (no valid '%s' asset?)\n",
+				runtime.GOARCH, service.PanelAssetForArch(runtime.GOARCH))
+			os.Exit(1)
+		}
+		if err := os.Chmod(staged, 0o755); err != nil {
+			_ = os.Remove(staged)
+			fmt.Fprintln(os.Stderr, "Could not make the downloaded binary executable:", err)
+			os.Exit(1)
+		}
 	}
 
 	// The DB comes FIRST, before the swap, so the restore point predates any
 	// migration the new binary may run on its first start.
-	backup, err := backupPanelDBForUpdate(upd.Current)
+	backup, err := backupPanelDBForUpdate(curVer)
 	if err != nil {
-		_ = os.Remove(tmp)
+		_ = os.Remove(staged)
 		fmt.Fprintln(os.Stderr, "DB backup failed:", err)
 		fmt.Fprintln(os.Stderr, "Aborting before replacing the binary: an update without a good backup is not worth it.")
 		os.Exit(1)
 	}
 	fmt.Printf("Backed up DB -> %s\n", backup)
 
-	// Keep the outgoing binary next to the new one: once renamed over, its inode is
-	// gone, and this is the only way back from a bad release (mv the .bak over it).
-	if err := service.CopyFile(exe, exe+".bak"); err == nil {
-		_ = os.Chmod(exe+".bak", 0o755)
-	} else {
-		fmt.Fprintln(os.Stderr, "warning: could not keep a backup of the current binary:", err)
-	}
+	// Close the updater's own DB handle before swapping / migrating / restarting so no
+	// SQLite file lock interferes with the incoming binary.
+	_ = database.CloseDB()
 
-	if err := os.Rename(tmp, exe); err != nil {
-		_ = os.Remove(tmp)
+	var sd service.SystemdService
+	unit := sd.GetServiceName()
+	wasActive := exec.Command("systemctl", "is-active", "--quiet", unit).Run() == nil
+
+	backupBin, err := service.SwapPanelBinaryWithBackup(staged, exe)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "Replacing the binary failed:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Installed %s -> %s\n", upd.Latest, exe)
+	fmt.Printf("Installed %s -> %s (previous saved at %s)\n", targetVer, exe, backupBin)
 
-	// Refresh /usr/bin/vpn-ui from the NEW binary, not from this (outgoing) one: the
-	// menu script ships inside the binary precisely so the two always match, and a
-	// menu from the old release driving the new binary is the version skew this
-	// design exists to prevent. Best-effort: a failed menu refresh must not make a
-	// successful binary update look failed.
+	rollbackAndExit := func(reason string) {
+		fmt.Fprintln(os.Stderr, "Update health verification failed:", reason)
+		fmt.Fprintln(os.Stderr, "Rolling back binary and database to pre-update state...")
+		if wasActive {
+			_ = exec.Command("systemctl", "stop", unit).Run()
+		}
+		if rbErr := service.RollbackPanelUpdate(exe, backupBin, backup); rbErr != nil {
+			fmt.Fprintf(os.Stderr, "CRITICAL: automatic rollback encountered an error: %v\n", rbErr)
+		} else {
+			_ = exec.Command(exe, "install-menu").Run()
+			if wasActive {
+				_ = exec.Command("systemctl", "restart", unit).Run()
+			}
+			fmt.Fprintln(os.Stderr, "Rollback complete: restored previous binary and DB snapshot.")
+		}
+		os.Exit(1)
+	}
+
+	// Verify the new binary actually runs (`-v` + non-destructive `migrate`).
+	if out, vErr := exec.Command(exe, "-v").CombinedOutput(); vErr != nil {
+		rollbackAndExit(fmt.Sprintf("new binary failed -v check (%v): %s", vErr, strings.TrimSpace(string(out))))
+	}
+	if out, mErr := exec.Command(exe, "migrate").CombinedOutput(); mErr != nil {
+		rollbackAndExit(fmt.Sprintf("database migration check failed (%v): %s", mErr, strings.TrimSpace(string(out))))
+	}
+
+	// Refresh /usr/bin/vpn-ui from the NEW binary so the menu matches the release.
 	if err := exec.Command(exe, "install-menu").Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not refresh the %s menu script: %v\n", service.MenuScriptPath, err)
 	}
 
-	var sd service.SystemdService
-	unit := sd.GetServiceName()
-	if exec.Command("systemctl", "is-active", "--quiet", unit).Run() == nil {
+	if wasActive {
 		fmt.Printf("Restarting %s ...\n", unit)
 		if err := exec.Command("systemctl", "restart", unit).Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "Restart failed: %v\nRestart it yourself: systemctl restart %s\n", err, unit)
-			os.Exit(1)
+			rollbackAndExit(fmt.Sprintf("systemctl restart %s failed: %v", unit, err))
 		}
-		fmt.Println("Done. The panel now runs the new binary.")
+		healthy := false
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			if exec.Command("systemctl", "is-active", "--quiet", unit).Run() == nil && ctlPing() {
+				healthy = true
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if !healthy {
+			rollbackAndExit(fmt.Sprintf("%s did not become healthy within 15s (check journalctl -u %s -e)", unit, unit))
+		}
+		fmt.Println("Done. The panel now runs the new binary and passed health verification.")
 		return
 	}
 
@@ -1333,6 +1453,170 @@ func runUpdate() {
 		fmt.Println("the OLD binary until you stop that process and start the new one.")
 	} else {
 		fmt.Printf("Start the panel when ready: systemctl start %s\n", unit)
+	}
+}
+
+// runUpdateCore implements `vpn-ui update-core <target|all> [flags]`: manages
+// independent updates and rollbacks for sidecar binaries (xray, telemt, sing-box,
+// amneziawg-go, ocserv) inside the custom override directory.
+func runUpdateCore(args ...string) {
+	var positional []string
+	var flagArgs []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			positional = append(positional, a)
+			continue
+		}
+		flagArgs = append(flagArgs, a)
+		name := strings.TrimLeft(a, "-")
+		if !strings.Contains(name, "=") {
+			switch name {
+			case "version", "url", "file", "sha256":
+				if i+1 < len(args) {
+					i++
+					flagArgs = append(flagArgs, args[i])
+				}
+			}
+		}
+	}
+
+	fs := flag.NewFlagSet("update-core", flag.ContinueOnError)
+	var (
+		version  string
+		url      string
+		filePath string
+		sha256   string
+		rollback bool
+		listOnly bool
+		asJSON   bool
+	)
+	fs.StringVar(&version, "version", "", "target release tag/version (e.g. v26.11.9 or v1.14.4)")
+	fs.StringVar(&url, "url", "", "download archive/binary directly from this URL")
+	fs.StringVar(&filePath, "file", "", "install binary or .tar.gz/.zip archive from a local path")
+	fs.StringVar(&sha256, "sha256", "", "expected SHA-256 hex checksum of the artifact")
+	fs.BoolVar(&rollback, "rollback", false, "roll back target's custom override to .bak or bundled binary")
+	fs.BoolVar(&listOnly, "list", false, "list active, custom, and bundled sidecar binary versions")
+	fs.BoolVar(&asJSON, "json", false, "output JSON")
+	if err := fs.Parse(flagArgs); err != nil {
+		os.Exit(2)
+	}
+
+	target := ""
+	if len(positional) > 0 {
+		target = positional[0]
+	}
+
+	var coreSvc service.CoreService
+	if listOnly || (target == "" && !rollback && filePath == "" && url == "") {
+		inv := coreSvc.GetCoreBinaryInventory()
+		if asJSON {
+			out, _ := json.MarshalIndent(inv, "", "  ")
+			fmt.Println(string(out))
+			return
+		}
+		fmt.Printf("%-14s %-12s %-16s %-24s %s\n", "TARGET", "SERVICE", "SOURCE", "VERSION", "ACTIVE PATH")
+		for _, item := range inv {
+			ver := item.Version
+			if ver == "" {
+				ver = "-"
+			} else if len(ver) > 23 {
+				ver = ver[:23]
+			}
+			ap := item.ActivePath
+			if ap == "" {
+				ap = "(missing)"
+			}
+			if item.HasBackup {
+				ap += " [.bak]"
+			}
+			fmt.Printf("%-14s %-12s %-16s %-24s %s\n", item.Core, item.ServiceCore, item.Source, ver, ap)
+		}
+		return
+	}
+
+	if target == "" {
+		fmt.Fprintf(os.Stderr, "usage: vpn-ui update-core <target|all> [--version vX.Y.Z] [--url URL] [--file PATH] [--sha256 HEX] [--rollback] [--list] [--json]\n")
+		fmt.Fprintf(os.Stderr, "targets: %s, all\n", strings.Join(service.SupportedCoreUpdateTargets(), ", "))
+		os.Exit(2)
+	}
+
+	requireRoot()
+	initLogger()
+
+	panelLive := ctlPing()
+	restartViaSocket := func(serviceCore string) error {
+		if !panelLive {
+			return nil
+		}
+		conn, err := ctlDial()
+		if err != nil {
+			return fmt.Errorf("connect panel control socket: %w", err)
+		}
+		defer conn.Close()
+		resp, err := ctlSend(conn, "cores.restart:"+serviceCore)
+		if err != nil {
+			return err
+		}
+		if !resp.OK {
+			return fmt.Errorf("%s", resp.Error)
+		}
+		return nil
+	}
+	verifyViaSocketOrExec := func(spec service.CoreUpdateSpec, destPath string) error {
+		if runtime.GOOS == "linux" && len(spec.VersionArgs) > 0 {
+			out, err := exec.Command(destPath, spec.VersionArgs...).CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("%s execution smoke test failed: %v (%s)", spec.Target, err, strings.TrimSpace(string(out)))
+			}
+		}
+		return nil
+	}
+
+	if rollback {
+		res, err := coreSvc.RollbackCore(target, restartViaSocket)
+		if asJSON {
+			out, _ := json.MarshalIndent(res, "", "  ")
+			fmt.Println(string(out))
+		} else {
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "rollback failed: %v\n", err)
+			} else {
+				fmt.Printf("[%s] %s\n", res.Status, res.Message)
+			}
+		}
+		if err != nil {
+			os.Exit(1)
+		}
+		if !panelLive {
+			fmt.Println("Note: panel is not running; changes apply when the panel starts.")
+		}
+		return
+	}
+
+	results, err := coreSvc.UpdateCore(service.CoreUpdateOptions{
+		Target:           target,
+		Version:          version,
+		URL:              url,
+		File:             filePath,
+		SHA256:           sha256,
+		RestartFunc:      restartViaSocket,
+		VerifyHealthFunc: verifyViaSocketOrExec,
+	})
+	if asJSON {
+		out, _ := json.MarshalIndent(results, "", "  ")
+		fmt.Println(string(out))
+	} else {
+		for _, r := range results {
+			fmt.Printf("[%s] %s (%s): %s\n", r.Status, r.Target, r.ServiceCore, r.Message)
+		}
+		if !panelLive {
+			fmt.Println("Note: panel is not running; updated binaries apply on next panel start.")
+		}
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "update-core finished with errors: %v\n", err)
+		os.Exit(1)
 	}
 }
 
@@ -3042,7 +3326,8 @@ func main() {
 		fmt.Println("                   (--json for scripts, --get <field> for one raw value)")
 		fmt.Println("    ctl <cmd>      control the RUNNING panel over its socket:")
 		fmt.Println("                   " + strings.Join(service.ControlCommands, ", "))
-		fmt.Println("    update         install the latest release (backs the DB up first)")
+		fmt.Println("    update         install the latest release or --local <path> (backs up DB + .bak rollback)")
+		fmt.Println("    update-core    independently update/rollback sidecar binaries (xray, telemt, sing-box, amneziawg-go, ocserv, all)")
 		fmt.Println("    install-menu   install the 'vpn-ui' management menu to " + service.MenuScriptPath)
 		fmt.Println("    --systemd      install+enable+start the panel as a systemd service")
 		fmt.Println("    --random       randomize panel port + username + password + web path")
@@ -3152,7 +3437,9 @@ func main() {
 	case "ctl":
 		runCtl(os.Args[2:])
 	case "update":
-		runUpdate()
+		runUpdate(os.Args[2:]...)
+	case "update-core":
+		runUpdateCore(os.Args[2:]...)
 	case "install-menu":
 		installMenuScript(os.Args[2:])
 	case "install-acme":

@@ -104,3 +104,59 @@ func TestInstallPanelBinaryAbortsOnBinaryBackupFailureAndRollsBackRenameFailure(
 		t.Fatalf("DB backup failed ValidateSQLiteDB: %v", err)
 	}
 }
+
+func TestRollbackPanelUpdateRestoresBinaryAndDatabase(t *testing.T) {
+	t.Cleanup(func() { _ = database.CloseDB() })
+
+	dir := t.TempDir()
+	t.Setenv("VPNUI_DB_FOLDER", dir)
+	_ = database.CloseDB()
+	if err := database.InitDB(config.GetDBPath()); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+	if err := database.GetDB().Create(&model.Setting{Key: "rollbackMarker", Value: "before-upgrade"}).Error; err != nil {
+		t.Fatalf("seed setting: %v", err)
+	}
+
+	exe := filepath.Join(dir, "vpn-ui-amd64")
+	if err := os.WriteFile(exe, []byte("v1.9.4-good-bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	backupDB, err := backupPanelDB()
+	if err != nil {
+		t.Fatalf("backupPanelDB: %v", err)
+	}
+
+	// Simulate an upgrade mutation + bad binary swap.
+	if err := database.GetDB().Model(&model.Setting{}).Where("key = ?", "rollbackMarker").Update("value", "broken-after-upgrade").Error; err != nil {
+		t.Fatalf("mutate setting: %v", err)
+	}
+	staged := filepath.Join(dir, "vpn-ui.new")
+	if err := os.WriteFile(staged, []byte("v2.0.0-broken-bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	backupBin, err := SwapPanelBinaryWithBackup(staged, exe)
+	if err != nil {
+		t.Fatalf("SwapPanelBinaryWithBackup: %v", err)
+	}
+
+	if err := RollbackPanelUpdate(exe, backupBin, backupDB); err != nil {
+		t.Fatalf("RollbackPanelUpdate: %v", err)
+	}
+
+	binBytes, err := os.ReadFile(exe)
+	if err != nil || string(binBytes) != "v1.9.4-good-bin" {
+		t.Fatalf("binary after rollback = %q (err=%v); want v1.9.4-good-bin", string(binBytes), err)
+	}
+
+	if err := database.InitDB(config.GetDBPath()); err != nil {
+		t.Fatalf("re-InitDB after rollback: %v", err)
+	}
+	var s model.Setting
+	if err := database.GetDB().Where("key = ?", "rollbackMarker").First(&s).Error; err != nil {
+		t.Fatalf("query restored setting: %v", err)
+	}
+	if s.Value != "before-upgrade" {
+		t.Fatalf("restored setting = %q; want before-upgrade", s.Value)
+	}
+}

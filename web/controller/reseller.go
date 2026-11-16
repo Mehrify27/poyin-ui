@@ -256,6 +256,8 @@ func reconfigureAfterCascade(res service.DeleteResult) {
 			ic.onGreChanged()
 		case model.MTPROTO:
 			ic.onMtprotoChanged()
+		case model.Hysteria2:
+			ic.onHysteria2Changed()
 		case model.SSH:
 			ic.onSshChanged()
 			// Native Xray protocols (vmess/vless/trojan/shadowsocks/wireguard) have no

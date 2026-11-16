@@ -4,8 +4,10 @@
 # that get embedded into the panel binary (go:embed) and extracted at runtime by
 # the `corebundle` package.
 #
-# The panel ships a SPECIFIC patched Xray-core fork (Sir-MmD/Xray-core) whose
-# Shadowsocks per-user `method` fallback the product depends on. This script
+# The panel ships upstream XTLS/Xray-core with reproducible patches from
+# patches/xray/*.patch applied in a staging copy before compilation (Shadowsocks
+# per-user `method` fallback, per-account speed/IP limit + CanSpliceCopy=3
+# splice guard, AnyTLS/TUIC/NaiveProxy, and legacy reverse support). This script
 # produces that exact core, statically linked (CGO_ENABLED=0) so it runs on any
 # Linux distro, and drops it, plus every geo file the routing editor can name,
 # where the go:embed picks them up.
@@ -18,14 +20,14 @@
 # Usage:
 #   build/core/build.sh [goarch...]        # default: amd64
 #
-# Source of truth is the pinned submodule third_party/Xray-core (@ a fixed
-# commit). It's used automatically when present; the clone path below is only a
-# fallback for checkouts where the submodule wasn't initialised.
+# Source of truth is the pinned submodule third_party/Xray-core (@ an upstream
+# tag/commit) plus patches/xray/*.patch. The clone path below is only a fallback
+# for checkouts where the submodule wasn't initialised.
 #
 # Env:
 #   XRAY_SRC   path to a local Xray-core checkout (overrides the submodule)
-#   XRAY_REPO  fork git URL for the fallback clone (default: Sir-MmD/Xray-core)
-#   XRAY_REF   git ref for the fallback clone       (default: default branch)
+#   XRAY_REPO  upstream git URL for the fallback clone (default: XTLS/Xray-core)
+#   XRAY_REF   git ref for the fallback clone       (default: v26.11.9)
 #   GEO_ONLY=1 only refresh geo files, skip the core build
 #   GEO_LEAN=1 embed ONLY geoip.dat + geosite.dat, dropping the ~118MB of country
 #              files geo{ip,site}_{IR,RU}.dat. The panel then downloads whichever
@@ -35,13 +37,31 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT_ROOT="$REPO_ROOT/corebundle/core"
+PATCH_DIR="$REPO_ROOT/patches/xray"
 
 # shellcheck source=../lib/log.sh
 source "$REPO_ROOT/build/lib/log.sh" 2>/dev/null || { step(){ echo "==> $*"; }; ok(){ echo "  - $*"; }; info(){ echo "  $*"; }; warn(){ echo "  ! $*" >&2; }; err(){ echo "  x $*" >&2; }; hr(){ :; }; }
 
-XRAY_REPO="${XRAY_REPO:-https://github.com/Sir-MmD/Xray-core}"
-XRAY_REF="${XRAY_REF:-}"
+XRAY_REPO="${XRAY_REPO:-https://github.com/XTLS/Xray-core}"
+XRAY_REF="${XRAY_REF:-v26.11.9}"
+GH_PROXY_PREFIX="${VPNUI_GH_PROXY:-${GH_PROXY:-}}"
 ARCHES=("${@:-amd64}")
+
+apply_gh_proxy() {
+    local url="$1"
+    [[ -n "$GH_PROXY_PREFIX" ]] || { printf '%s' "$url"; return 0; }
+    local p="$GH_PROXY_PREFIX"
+    [[ "$p" == */ ]] || p="${p}/"
+    if [[ "$url" == "$p"* ]]; then
+        printf '%s' "$url"
+    elif [[ "$url" == https://github.com/* || "$url" == https://raw.githubusercontent.com/* || "$url" == https://api.github.com/* ]]; then
+        printf '%s%s' "$p" "$url"
+    else
+        printf '%s' "$url"
+    fi
+}
+
+XRAY_REPO="$(apply_gh_proxy "$XRAY_REPO")"
 
 mkdir -p "$OUT_ROOT"
 
@@ -99,7 +119,7 @@ GEO_COUNTRY_FILES=(
 _geo_batch() {
     local entry url name
     for entry in "$@"; do
-        url="${entry%%|*}"
+        url="$(apply_gh_proxy "${entry%%|*}")"
         name="${entry#*|}"
         _geo_one "$url" "$OUT_ROOT/$name"
         _geo_stamp "$url" "$OUT_ROOT/$name"
@@ -216,6 +236,49 @@ prepare_src() {
     echo "$cache"
 }
 
+stage_patched_src() {
+    local raw_src="$1"
+    local stage="$2"
+    rm -rf "$stage"
+    mkdir -p "$stage"
+    cp -a "$raw_src/." "$stage/"
+    # Submodule checkouts carry a relative `gitdir: ../../.git/modules/...` file
+    # that breaks once copied to /tmp. Re-init a clean scratch repo so `git apply`
+    # works regardless of whether raw_src was a submodule or plain checkout.
+    rm -rf "$stage/.git"
+    git -C "$stage" init -q
+
+    if [[ ! -d "$PATCH_DIR" ]]; then
+        err "Xray patch directory not found: $PATCH_DIR"
+        return 1
+    fi
+    shopt -s nullglob
+    local patches=("$PATCH_DIR"/*.patch)
+    shopt -u nullglob
+    if (( ${#patches[@]} == 0 )); then
+        err "No Xray patch files found in $PATCH_DIR"
+        return 1
+    fi
+
+    local p
+    for p in "${patches[@]}"; do
+        if git -C "$stage" apply --check --reverse "$p" >/dev/null 2>&1; then
+            info "patch already present (skipping): $(basename "$p")" >&2
+            continue
+        fi
+        step "Applying Xray patch $(basename "$p")" >&2
+        git -C "$stage" apply "$p"
+    done
+}
+
+patch_bundle_digest() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        ( cd "$PATCH_DIR" && sha256sum ./*.patch | sha256sum | awk '{print $1}' )
+    else
+        ( cd "$PATCH_DIR" && shasum -a 256 ./*.patch | shasum -a 256 | awk '{print $1}' )
+    fi
+}
+
 verify_speedlimit_splice_patch() {
     local src="$1"
     local sl_file="$src/common/speedlimit/speedlimit.go"
@@ -240,31 +303,85 @@ verify_speedlimit_splice_patch() {
     fi
 }
 
-build_core() {
-    local src
-    src="$(prepare_src)"
+verify_xray_patches() {
+    local src="$1"
     verify_speedlimit_splice_patch "$src"
-    # The commit the source is at. If the cached xray was built from this same
-    # commit, there is nothing to rebuild — skip the (slow) go build. Bump the
-    # submodule/ref to trigger a rebuild, or set CORE_FORCE=1.
-    local srccommit
-    srccommit="$(git -C "$src" rev-parse HEAD 2>/dev/null || echo unknown)"
-    info "pinned Xray core source: $src @ ${srccommit:0:12}"
+
+    local ss_file="$src/infra/conf/shadowsocks.go"
+    if [[ ! -f "$ss_file" ]] || ! grep -q "cipher := user.Cipher" "$ss_file"; then
+        err "Xray core missing Shadowsocks per-user cipher fallback patch in $ss_file"
+        return 1
+    fi
+
+    local sl_file="$src/common/speedlimit/speedlimit.go"
+    local ip_file="$src/common/speedlimit/iplimit.go"
+    local disp_file="$src/app/dispatcher/default.go"
+    if [[ ! -f "$ip_file" ]] || ! grep -q "func LookupSession" "$sl_file" || ! grep -q "func Admit(" "$ip_file"; then
+        err "Xray core missing speedlimit LookupSession / Admit implementation"
+        return 1
+    fi
+    if [[ "$(grep -c "speedlimit\.Admit(" "$disp_file" || true)" -lt 2 ]]; then
+        err "Xray core dispatcher $disp_file missing speedlimit.Admit admission calls"
+        return 1
+    fi
+
+    local conf_file="$src/infra/conf/xray.go"
+    local distro_file="$src/main/distro/all/all.go"
+    for proto in '"anytls"' '"tuic"' '"naive"'; do
+        if ! grep -q "$proto" "$conf_file"; then
+            err "Xray core missing $proto registration in $conf_file"
+            return 1
+        fi
+    done
+    for pkg in "proxy/anytls" "proxy/tuic" "proxy/naive" "transport/internet/tuic" "transport/internet/naive"; do
+        if ! grep -q "$pkg" "$distro_file"; then
+            err "Xray core missing $pkg import in $distro_file"
+            return 1
+        fi
+    done
+    if grep -q 'PrintRemovedFeatureError.*legacy reverse' "$conf_file"; then
+        err "Xray core $conf_file still rejects legacy reverse configuration"
+        return 1
+    fi
+}
+
+build_core() {
+    local raw_src
+    raw_src="$(prepare_src)"
+    local srccommit patchhash buildstamp
+    srccommit="$(git -C "$raw_src" rev-parse HEAD 2>/dev/null || echo unknown)"
+    patchhash="$(patch_bundle_digest)"
+    buildstamp="${srccommit}-${patchhash:0:12}"
+    info "pinned Xray core source: $raw_src @ ${srccommit:0:12} (patches ${patchhash:0:12})"
+
+    local staged_src=""
+    cleanup_staged_src() {
+        if [[ -n "$staged_src" && -d "$staged_src" ]]; then
+            rm -rf "$staged_src"
+        fi
+    }
+    trap cleanup_staged_src RETURN
+
     for goarch in "${ARCHES[@]}"; do
         local outdir="$OUT_ROOT/$goarch"
         mkdir -p "$outdir"
         local marker="$outdir/.xray.commit"
         if [[ "${CORE_FORCE:-0}" != "1" && -x "$outdir/xray" && "$srccommit" != "unknown" \
-              && "$(cat "$marker" 2>/dev/null)" == "$srccommit" ]]; then
-            ok "core ($goarch) already built from ${srccommit:0:12} — skipping (CORE_FORCE=1 to rebuild)"
+              && "$(cat "$marker" 2>/dev/null)" == "$buildstamp" ]]; then
+            ok "core ($goarch) already built from ${buildstamp} — skipping (CORE_FORCE=1 to rebuild)"
             continue
         fi
+        if [[ -z "$staged_src" ]]; then
+            staged_src="$(mktemp -d)"
+            stage_patched_src "$raw_src" "$staged_src"
+            verify_xray_patches "$staged_src"
+        fi
         step "go build xray ($goarch, CGO_ENABLED=0, static)"
-        ( cd "$src" && \
+        ( cd "$staged_src" && \
           CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
           go build -trimpath -buildvcs=false -ldflags "-s -w -buildid=" -v -o "$outdir/xray" ./main )
         chmod 0755 "$outdir/xray"
-        echo "$srccommit" > "$marker"
+        echo "$buildstamp" > "$marker"
         file "$outdir/xray" || true
         ok "core: $(ls -lh "$outdir/xray" | awk '{print $5, $9}')"
     done

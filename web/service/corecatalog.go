@@ -188,8 +188,8 @@ var coreCatalog = []coreSpec{
 		optModules: []string{"wireguard"},
 	},
 	{
-		name: "awg", title: "AmneziaWG", backend: "AmneziaWG (kernel)",
-		desc:       "WireGuard with obfuscated handshakes, built on this host via DKMS",
+		name: "awg", title: "AmneziaWG", backend: "AmneziaWG (hybrid kernel + amneziawg-go)",
+		desc:       "WireGuard with AWG 1.0/1.5/2.0 obfuscation (kernel DKMS or userspace amneziawg-go)",
 		optModules: []string{amneziawgModule},
 		feats:      []string{featAmneziawg},
 	},
@@ -211,6 +211,13 @@ var coreCatalog = []coreSpec{
 		// See the SSTP entry: the root goes too.
 		paths: []string{"/etc/vpn-ui-mtproto"},
 		globs: []string{"/etc/vpn-ui-mtproto/server-*"},
+	},
+	{
+		name: "hysteria2", title: "Hysteria 2", backend: "sing-box",
+		desc:    "QUIC proxy with Brutal congestion control & Salamander obfuscation",
+		daemons: []string{"sing-box"},
+		paths:   []string{"/etc/vpn-ui-hysteria2"},
+		globs:   []string{"/etc/vpn-ui-hysteria2/server-*", "/etc/vpn-ui-hysteria2/outbound-*"},
 	},
 	{
 		name: "ssh", title: "SSH", backend: "Built-in (vpn-ui)",
@@ -484,6 +491,8 @@ func (s *CoreService) inboundCountsByCore() map[string]int {
 	add("gre", len(gre), err)
 	mt, err := s.mtprotoService.GetMtprotoInbounds()
 	add("mtproto", len(mt), err)
+	hy2, err := s.hysteria2Service.GetHysteria2Inbounds()
+	add("hysteria2", len(hy2), err)
 	ssh, err := s.sshService.GetSshInbounds()
 	add("ssh", len(ssh), err)
 	return counts

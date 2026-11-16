@@ -361,11 +361,12 @@ func (s *ResellerService) ClientOwner(email string) (*model.ResellerClient, erro
 // own view and the refund path can never find it again, because the ledger is
 // keyed on the panel-wide email identity.
 func (s *ResellerService) RenameClient(oldEmail, newEmail string) error {
-	if oldEmail == "" || newEmail == "" || oldEmail == newEmail {
+	oldKey, newKey := emailKey(oldEmail), emailKey(newEmail)
+	if oldKey == "" || newKey == "" || strings.TrimSpace(oldEmail) == strings.TrimSpace(newEmail) {
 		return nil
 	}
 	return database.GetDB().Model(&model.ResellerClient{}).
-		Where("email = ?", oldEmail).Update("email", newEmail).Error
+		Where("LOWER(TRIM(email)) = ?", oldKey).Update("email", strings.TrimSpace(newEmail)).Error
 }
 
 // DropInbound settles the ledger after an inbound has been deleted. It removes a
@@ -451,39 +452,54 @@ type ChargeTicket struct {
 	Active    bool
 	UserId    int
 	Email     string
+	Emails    []string
 	InboundId int
 	Quote     ChargeQuote
+	Items     []clientChargeItem
 	Create    bool
 	// PrevCharged is what to restore on rollback.
 	PrevCharged int64
 }
 
-// postedClient pulls the single client out of a client-mutating request body.
-//
-// Exactly one, always: every one of those routes posts one, and more than one
-// would let a single reservation pay for several accounts.
+type clientChargeItem struct {
+	Email string
+	Quote ChargeQuote
+}
+
+// postedClient pulls the single client out of a single-client mutating request body.
 func postedClient(data *model.Inbound) (map[string]any, map[string]any, []any, error) {
+	maps, settings, clients, err := postedClients(data)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(maps) != 1 {
+		return nil, nil, nil, errors.New("expected exactly one client in the request")
+	}
+	return maps[0], settings, clients, nil
+}
+
+// postedClients extracts 1..N clients out of an add/bulk-create request body.
+func postedClients(data *model.Inbound) ([]map[string]any, map[string]any, []any, error) {
 	settings := map[string]any{}
 	if err := json.Unmarshal([]byte(data.Settings), &settings); err != nil {
 		return nil, nil, nil, err
 	}
 	clients, _ := settings["clients"].([]any)
-	if len(clients) != 1 {
-		return nil, nil, nil, errors.New("expected exactly one client in the request")
+	if len(clients) == 0 {
+		return nil, nil, nil, errors.New("expected at least one client in the request")
 	}
-	cm, ok := clients[0].(map[string]any)
-	if !ok {
-		return nil, nil, nil, errors.New("malformed client in the request")
+	maps := make([]map[string]any, 0, len(clients))
+	for _, raw := range clients {
+		cm, ok := raw.(map[string]any)
+		if !ok {
+			return nil, nil, nil, errors.New("malformed client in the request")
+		}
+		maps = append(maps, cm)
 	}
-	return cm, settings, clients, nil
+	return maps, settings, clients, nil
 }
 
-// applyToSettings writes the priced decisions back into the request body.
-//
-// The blob has to be patched before InboundService parses it, and doing the
-// surgery in one place beats repeating it at every call site.
-func applyToSettings(data *model.Inbound, profile *model.ResellerProfile, q ChargeQuote,
-	cm map[string]any, settings map[string]any, clients []any) error {
+func patchClientMap(cm map[string]any, profile *model.ResellerProfile, q ChargeQuote) {
 	// Overwrite rather than validate: the form is the reseller's, and a posted
 	// expiry that disagrees with the factor is not an error to report back, it is
 	// a field they should never have had.
@@ -498,14 +514,15 @@ func applyToSettings(data *model.Inbound, profile *model.ResellerProfile, q Char
 	// down counters, re-enables it, and pushes its deadline forward, on a timer,
 	// forever. Nothing in that job consults a balance.
 	//
-	// Left settable, it is an unlimited-traffic switch: a reseller sells one
-	// gigabyte, sets reset=1, and the account is handed a fresh gigabyte every
-	// day for as long as it exists, charged once. Every other way of giving an
-	// account more traffic goes through Quote; this one bypassed it entirely.
-	//
 	// Resellers top up manually instead, which IS priced, and a reset they ask
 	// for by hand is priced too (PrepareClientReset).
 	delete(cm, "reset")
+}
+
+// applyToSettings writes the priced decisions back into the request body for a single-client request.
+func applyToSettings(data *model.Inbound, profile *model.ResellerProfile, q ChargeQuote,
+	cm map[string]any, settings map[string]any, clients []any) error {
+	patchClientMap(cm, profile, q)
 	clients[0] = cm
 	settings["clients"] = clients
 	patched, err := json.Marshal(settings)
@@ -516,13 +533,12 @@ func applyToSettings(data *model.Inbound, profile *model.ResellerProfile, q Char
 	return nil
 }
 
-// PrepareClientCreate prices a new account, rewrites the posted client to match
-// the reseller's limits, and RESERVES the balance.
+// PrepareClientCreate prices 1..N new accounts, rewrites the posted clients to
+// match the reseller's limits, and RESERVES the total batch balance atomically.
 //
 // The reservation happens before the client is written on purpose. A crash
 // between the two loses the reseller balance an admin can recharge; the reverse
-// order loses the panel real traffic with no record of it. Both directions of
-// failure exist, and this is the one an operator can fix.
+// order loses the panel real traffic with no record of it.
 //
 // Returns an inactive ticket for an admin or super admin: they have no balance,
 // so there is nothing to price and nothing to roll back.
@@ -534,49 +550,152 @@ func (s *ResellerService) PrepareClientCreate(user *model.User, data *model.Inbo
 	if err != nil {
 		return ChargeTicket{}, err
 	}
-	cm, settings, clients, err := postedClient(data)
+	clientMaps, settings, clients, err := postedClients(data)
 	if err != nil {
 		return ChargeTicket{}, err
 	}
-	email, _ := cm["email"].(string)
-	if email == "" {
-		return ChargeTicket{}, errors.New("client email is required")
+
+	seenBatch := make(map[string]struct{}, len(clientMaps))
+	checkList := make([]model.Client, 0, len(clientMaps))
+	for _, cm := range clientMaps {
+		email, _ := cm["email"].(string)
+		trimmed := strings.TrimSpace(email)
+		if trimmed == "" {
+			return ChargeTicket{}, errors.New("client email is required")
+		}
+		key := strings.ToLower(trimmed)
+		if _, dup := seenBatch[key]; dup {
+			return ChargeTicket{}, duplicateEmailError(trimmed)
+		}
+		seenBatch[key] = struct{}{}
+		checkList = append(checkList, model.Client{Email: email})
 	}
 
-	// SECURITY: refuse an email that already belongs to someone, BEFORE reserving.
-	//
-	// AddInboundClient rejects duplicate emails too, but it runs after this, and
-	// the reservation writes a ResellerClient row keyed on the email in between.
-	// That row is what OwnsClientEmail answers from, so for the width of the
-	// failed create the reseller genuinely owned an ADMIN's account: long enough
-	// for a second, concurrent request to edit or delete it. Rollback closes the
-	// window afterwards, and "afterwards" is not a security boundary.
-	//
-	// The same check the create path itself uses, so the two cannot disagree
-	// about what "taken" means.
+	// SECURITY: refuse any email that already belongs to someone BEFORE reserving.
 	var inboundService InboundService
-	if taken, terr := inboundService.checkEmailsExistForClients([]model.Client{{Email: email}}); terr != nil {
+	if taken, terr := inboundService.checkEmailsExistForClients(checkList); terr != nil {
 		return ChargeTicket{}, terr
 	} else if taken != "" {
 		return ChargeTicket{}, duplicateEmailError(taken, inboundService.emailHolders(taken)...)
 	}
 
-	q, err := Quote(QuoteInput{
-		Profile:   *profile,
-		Create:    true,
-		NewTotal:  jsonInt64(cm["totalGB"]),
-		NowMillis: time.Now().UnixMilli(),
-	})
+	nowMs := time.Now().UnixMilli()
+	items := make([]clientChargeItem, 0, len(clientMaps))
+	emails := make([]string, 0, len(clientMaps))
+	var totalDeltaSpent int64
+	var totalNewCharged int64
+	var lastQuote ChargeQuote
+	for i, cm := range clientMaps {
+		email, _ := cm["email"].(string)
+		q, qerr := Quote(QuoteInput{
+			Profile:   *profile,
+			Create:    true,
+			NewTotal:  jsonInt64(cm["totalGB"]),
+			NowMillis: nowMs,
+		})
+		if qerr != nil {
+			return ChargeTicket{}, qerr
+		}
+		if q.DeltaSpent > 0 && totalDeltaSpent > math.MaxInt64-q.DeltaSpent {
+			return ChargeTicket{}, ErrInvalidQuota
+		}
+		if q.NewCharged > 0 && totalNewCharged > math.MaxInt64-q.NewCharged {
+			return ChargeTicket{}, ErrInvalidQuota
+		}
+		totalDeltaSpent += q.DeltaSpent
+		totalNewCharged += q.NewCharged
+		lastQuote = q
+
+		patchClientMap(cm, profile, q)
+		clients[i] = cm
+		items = append(items, clientChargeItem{Email: email, Quote: q})
+		emails = append(emails, email)
+	}
+
+	settings["clients"] = clients
+	patched, err := json.Marshal(settings)
 	if err != nil {
 		return ChargeTicket{}, err
 	}
-	if err := applyToSettings(data, profile, q, cm, settings, clients); err != nil {
-		return ChargeTicket{}, err
+	data.Settings = string(patched)
+
+	if totalDeltaSpent > 0 && !profile.Unlimited && totalDeltaSpent > AvailableBytes(*profile) {
+		return ChargeTicket{}, fmt.Errorf("%w (need %.2f GB for %d client(s), %.2f GB available)",
+			ErrInsufficientBalance,
+			float64(totalDeltaSpent)/float64(oneGB), len(items),
+			float64(AvailableBytes(*profile))/float64(oneGB))
 	}
 
+	aggQuote := lastQuote
+	aggQuote.DeltaSpent = totalDeltaSpent
+	aggQuote.NewCharged = totalNewCharged
+
 	ticket := ChargeTicket{
-		Active: true, UserId: user.Id, Email: email,
-		InboundId: data.Id, Quote: q, Create: true,
+		Active: true, UserId: user.Id, Email: emails[0], Emails: emails,
+		InboundId: data.Id, Quote: aggQuote, Items: items, Create: true,
+	}
+	if err := s.reserve(ticket); err != nil {
+		return ChargeTicket{}, err
+	}
+	return ticket, nil
+}
+
+// PrepareClientCopyBatch prices a slice of copied target clients, enforces reseller
+// limits (ExpiryTime, Reset, ExternalProxy) on each element in copies, and reserves
+// the aggregate credit in a single atomic transaction.
+func (s *ResellerService) PrepareClientCopyBatch(user *model.User, targetInboundId int, copies []model.Client) (ChargeTicket, error) {
+	if user == nil || !user.IsReseller || len(copies) == 0 {
+		return ChargeTicket{}, nil
+	}
+	profile, err := s.ProfileFor(user.Id)
+	if err != nil {
+		return ChargeTicket{}, err
+	}
+	nowMs := time.Now().UnixMilli()
+	items := make([]clientChargeItem, 0, len(copies))
+	emails := make([]string, 0, len(copies))
+	var totalDeltaSpent int64
+	var totalNewCharged int64
+	for i := range copies {
+		q, qerr := Quote(QuoteInput{
+			Profile:   *profile,
+			Create:    true,
+			NewTotal:  copies[i].TotalGB,
+			NowMillis: nowMs,
+		})
+		if qerr != nil {
+			return ChargeTicket{}, qerr
+		}
+		if q.DeltaSpent > 0 && totalDeltaSpent > math.MaxInt64-q.DeltaSpent {
+			return ChargeTicket{}, ErrInvalidQuota
+		}
+		if q.NewCharged > 0 && totalNewCharged > math.MaxInt64-q.NewCharged {
+			return ChargeTicket{}, ErrInvalidQuota
+		}
+		totalDeltaSpent += q.DeltaSpent
+		totalNewCharged += q.NewCharged
+		if q.ForceExpiry {
+			copies[i].ExpiryTime = q.ExpiryTime
+		}
+		copies[i].Reset = 0
+		if !profile.AllowExternalProxy {
+			copies[i].ExternalProxy = nil
+		}
+		items = append(items, clientChargeItem{Email: copies[i].Email, Quote: q})
+		emails = append(emails, copies[i].Email)
+	}
+	if totalDeltaSpent > 0 && !profile.Unlimited && totalDeltaSpent > AvailableBytes(*profile) {
+		return ChargeTicket{}, fmt.Errorf("%w (need %.2f GB for %d copied client(s), %.2f GB available)",
+			ErrInsufficientBalance,
+			float64(totalDeltaSpent)/float64(oneGB), len(items),
+			float64(AvailableBytes(*profile))/float64(oneGB))
+	}
+	ticket := ChargeTicket{
+		Active: true, UserId: user.Id, Email: emails[0], Emails: emails,
+		InboundId: targetInboundId,
+		Quote:     ChargeQuote{DeltaSpent: totalDeltaSpent, NewCharged: totalNewCharged},
+		Items:     items,
+		Create:    true,
 	}
 	if err := s.reserve(ticket); err != nil {
 		return ChargeTicket{}, err
@@ -786,7 +905,7 @@ func (s *ResellerService) storedClientEmail(inboundId int, clientId string) (str
 	return "", ErrClientNotOwned
 }
 
-// reserve applies the quote: the balance move and the ownership row, in one
+// reserve applies the quote: the balance move and the ownership row(s), in one
 // transaction so no state exists where one landed and the other did not.
 func (s *ResellerService) reserve(t ChargeTicket) error {
 	if !t.Active {
@@ -797,31 +916,40 @@ func (s *ResellerService) reserve(t ChargeTicket) error {
 			return err
 		}
 		if t.Create {
-			// A same-email account may have existed before and been deleted; its
-			// ClientTraffic row is what AllTimeBase must start from, so consumption
-			// is never counted twice.
-			var base int64
-			ct := &xray.ClientTraffic{}
-			if err := tx.Model(&xray.ClientTraffic{}).Where("email = ?", t.Email).First(ct).Error; err == nil {
-				base = ct.AllTime
+			items := t.Items
+			if len(items) == 0 && t.Email != "" {
+				items = []clientChargeItem{{Email: t.Email, Quote: t.Quote}}
 			}
-			return tx.Create(&model.ResellerClient{
-				Email:        t.Email,
-				InboundId:    t.InboundId,
-				UserId:       t.UserId,
-				ChargedBytes: t.Quote.NewCharged,
-				AllTimeBase:  base,
-			}).Error
+			for _, item := range items {
+				var takenCount int64
+				if err := tx.Model(&model.ResellerClient{}).
+					Where("LOWER(email) = LOWER(?)", item.Email).
+					Count(&takenCount).Error; err != nil {
+					return err
+				}
+				if takenCount > 0 {
+					return duplicateEmailError(item.Email)
+				}
+				// A same-email account may have existed before; its ClientTraffic
+				// row is what AllTimeBase must start from if still present, so
+				// historical consumption is never counted twice.
+				var base int64
+				ct := &xray.ClientTraffic{}
+				if err := tx.Model(&xray.ClientTraffic{}).Where("LOWER(email) = LOWER(?)", item.Email).First(ct).Error; err == nil {
+					base = ct.AllTime
+				}
+				if err := tx.Create(&model.ResellerClient{
+					Email:        item.Email,
+					InboundId:    t.InboundId,
+					UserId:       t.UserId,
+					ChargedBytes: item.Quote.NewCharged,
+					AllTimeBase:  base,
+				}).Error; err != nil {
+					return err
+				}
+			}
+			return nil
 		}
-		// charged_bytes alone, and InboundId deliberately left where the create put
-		// it: it is the HOME inbound, a display value, and an edit does not move an
-		// account's home. There is nothing to keep in step here because nothing
-		// decides by that column any more; the questions it used to answer ("which
-		// inbound is this on") are resolved from the memberships instead, since one
-		// account is served on N of them and this row can only hold one. Writing the
-		// edited inbound here would be strictly worse than leaving it: the value
-		// would swing to whichever membership was edited last while still describing
-		// only one of them.
 		return tx.Model(&model.ResellerClient{}).Where("email = ?", t.Email).
 			Update("charged_bytes", t.Quote.NewCharged).Error
 	})
@@ -837,7 +965,27 @@ func (s *ResellerService) Rollback(t ChargeTicket) error {
 			return err
 		}
 		if t.Create {
-			return tx.Where("email = ?", t.Email).Delete(&model.ResellerClient{}).Error
+			var keys []string
+			seen := make(map[string]bool)
+			addKey := func(em string) {
+				k := strings.ToLower(strings.TrimSpace(em))
+				if k != "" && !seen[k] {
+					seen[k] = true
+					keys = append(keys, k)
+				}
+			}
+			for _, item := range t.Items {
+				addKey(item.Email)
+			}
+			for _, em := range t.Emails {
+				addKey(em)
+			}
+			addKey(t.Email)
+			if len(keys) == 0 {
+				return nil
+			}
+			return tx.Where("user_id = ? AND LOWER(email) IN ?", t.UserId, keys).
+				Delete(&model.ResellerClient{}).Error
 		}
 		return tx.Model(&model.ResellerClient{}).Where("email = ?", t.Email).
 			Update("charged_bytes", t.PrevCharged).Error

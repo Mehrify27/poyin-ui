@@ -64,6 +64,7 @@ var ControlCommands = []string{
 	"xray.start",
 	"xray.stop",
 	"xray.restart",
+	"cores.restart:<name>",
 	"cores.restart-all",
 	"cores.status",
 }
@@ -237,6 +238,16 @@ func handleControlCommand(cmd string) ControlResponse {
 
 	case "":
 		return ControlResponse{Error: "empty command (known: " + strings.Join(ControlCommands, ", ") + ")"}
+	}
+	if strings.HasPrefix(cmd, "cores.restart:") {
+		coreName := strings.TrimSpace(strings.TrimPrefix(cmd, "cores.restart:"))
+		if coreName == "" {
+			return ControlResponse{Cmd: cmd, Error: "core name is required"}
+		}
+		if err := coreService.RestartCore(coreName); err != nil {
+			return ControlResponse{Cmd: cmd, Error: err.Error()}
+		}
+		return ControlResponse{OK: true, Cmd: cmd, Msg: fmt.Sprintf("core %s restarted", coreName)}
 	}
 	return ControlResponse{Cmd: cmd, Error: fmt.Sprintf("unknown command %q (known: %s)", cmd, strings.Join(ControlCommands, ", "))}
 }
