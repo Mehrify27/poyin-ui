@@ -75,8 +75,9 @@ func TestBackupPanelDBForUpdateValidatesSnapshot(t *testing.T) {
 	if _, err := os.Stat(dst); err != nil {
 		t.Fatalf("backup file missing at %s: %v", dst, err)
 	}
-	if filepath.Dir(dst) != filepath.Dir(config.GetDBPath()) {
-		t.Fatalf("backup dir %q != DB dir %q", filepath.Dir(dst), filepath.Dir(config.GetDBPath()))
+	wantDir := filepath.Join(filepath.Dir(config.GetDBPath()), "backups")
+	if filepath.Dir(dst) != wantDir {
+		t.Fatalf("backup dir %q != expected %q", filepath.Dir(dst), wantDir)
 	}
 	if err := database.ValidateSQLiteDB(dst); err != nil {
 		t.Fatalf("ValidateSQLiteDB on CLI backup failed: %v", err)

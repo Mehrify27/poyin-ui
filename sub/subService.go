@@ -39,14 +39,14 @@ type SubService struct {
 	// copy forResponse returns; every reader of it is nil-safe, so a caller that
 	// generates a single link without going through GetSubs (the tests, the panel's
 	// own link buttons) keeps working unchanged.
-	scope          *subScope
-	inboundService service.InboundService
-	settingService service.SettingService
-	sshService     service.SshService
-	wgcService     service.WgcService
-	awgService     service.AwgService
-	greService     service.GreService
-	openvpnService service.OpenVpnService
+	scope            *subScope
+	inboundService   service.InboundService
+	settingService   service.SettingService
+	sshService       service.SshService
+	wgcService       service.WgcService
+	awgService       service.AwgService
+	greService       service.GreService
+	openvpnService   service.OpenVpnService
 	hysteria2Service service.Hysteria2Service
 }
 
@@ -1358,7 +1358,8 @@ func unmarshalStreamSettings(streamSettings string) map[string]any {
 }
 
 func applyPathAndHostParams(settings map[string]any, params map[string]string) {
-	params["path"] = settings["path"].(string)
+	path, _ := settings["path"].(string)
+	params["path"] = path
 	if host, ok := settings["host"].(string); ok && len(host) > 0 {
 		params["host"] = host
 	} else {
@@ -1368,7 +1369,8 @@ func applyPathAndHostParams(settings map[string]any, params map[string]string) {
 }
 
 func applyPathAndHostObj(settings map[string]any, obj map[string]any) {
-	obj["path"] = settings["path"].(string)
+	path, _ := settings["path"].(string)
+	obj["path"] = path
 	if host, ok := settings["host"].(string); ok && len(host) > 0 {
 		obj["host"] = host
 	} else {
@@ -1384,11 +1386,13 @@ func applyShareNetworkParams(stream map[string]any, streamNetwork string, params
 		header, _ := tcp["header"].(map[string]any)
 		typeStr, _ := header["type"].(string)
 		if typeStr == "http" {
-			request := header["request"].(map[string]any)
-			requestPath, _ := request["path"].([]any)
-			params["path"] = requestPath[0].(string)
-			headers, _ := request["headers"].(map[string]any)
-			params["host"] = searchHost(headers)
+			if request, ok := header["request"].(map[string]any); ok {
+				if requestPath, _ := request["path"].([]any); len(requestPath) > 0 {
+					params["path"], _ = requestPath[0].(string)
+				}
+				headers, _ := request["headers"].(map[string]any)
+				params["host"] = searchHost(headers)
+			}
 			params["headerType"] = "http"
 		}
 	case "kcp":
@@ -1398,9 +1402,9 @@ func applyShareNetworkParams(stream map[string]any, streamNetwork string, params
 		applyPathAndHostParams(ws, params)
 	case "grpc":
 		grpc, _ := stream["grpcSettings"].(map[string]any)
-		params["serviceName"] = grpc["serviceName"].(string)
+		params["serviceName"], _ = grpc["serviceName"].(string)
 		params["authority"], _ = grpc["authority"].(string)
-		if grpc["multiMode"].(bool) {
+		if multi, _ := grpc["multiMode"].(bool); multi {
 			params["mode"] = "multi"
 		}
 	case "httpupgrade":
@@ -1439,11 +1443,13 @@ func applyVmessNetworkParams(stream map[string]any, network string, obj map[stri
 		typeStr, _ := header["type"].(string)
 		obj["type"] = typeStr
 		if typeStr == "http" {
-			request := header["request"].(map[string]any)
-			requestPath, _ := request["path"].([]any)
-			obj["path"] = requestPath[0].(string)
-			headers, _ := request["headers"].(map[string]any)
-			obj["host"] = searchHost(headers)
+			if request, ok := header["request"].(map[string]any); ok {
+				if requestPath, _ := request["path"].([]any); len(requestPath) > 0 {
+					obj["path"], _ = requestPath[0].(string)
+				}
+				headers, _ := request["headers"].(map[string]any)
+				obj["host"] = searchHost(headers)
+			}
 		}
 	case "kcp":
 		applyKcpShareObj(stream, obj)
@@ -1452,9 +1458,9 @@ func applyVmessNetworkParams(stream map[string]any, network string, obj map[stri
 		applyPathAndHostObj(ws, obj)
 	case "grpc":
 		grpc, _ := stream["grpcSettings"].(map[string]any)
-		obj["path"] = grpc["serviceName"].(string)
-		obj["authority"] = grpc["authority"].(string)
-		if grpc["multiMode"].(bool) {
+		obj["path"], _ = grpc["serviceName"].(string)
+		obj["authority"], _ = grpc["authority"].(string)
+		if multi, _ := grpc["multiMode"].(bool); multi {
 			obj["type"] = "multi"
 		}
 	case "httpupgrade":
@@ -1486,7 +1492,9 @@ func applyShareTLSParams(stream map[string]any, params map[string]string) {
 	alpns, _ := tlsSetting["alpn"].([]any)
 	var alpn []string
 	for _, a := range alpns {
-		alpn = append(alpn, a.(string))
+		if s, ok := a.(string); ok {
+			alpn = append(alpn, s)
+		}
 	}
 	if len(alpn) > 0 {
 		params["alpn"] = strings.Join(alpn, ",")
@@ -1509,9 +1517,13 @@ func applyVmessTLSParams(stream map[string]any, obj map[string]any) {
 	if len(alpns) > 0 {
 		var alpn []string
 		for _, a := range alpns {
-			alpn = append(alpn, a.(string))
+			if s, ok := a.(string); ok {
+				alpn = append(alpn, s)
+			}
 		}
-		obj["alpn"] = strings.Join(alpn, ",")
+		if len(alpn) > 0 {
+			obj["alpn"] = strings.Join(alpn, ",")
+		}
 	}
 	if sniValue, ok := searchKey(tlsSetting, "serverName"); ok {
 		obj["sni"], _ = sniValue.(string)
@@ -2362,16 +2374,17 @@ func searchHost(headers any) string {
 	data, _ := headers.(map[string]any)
 	for k, v := range data {
 		if strings.EqualFold(k, "host") {
-			switch v.(type) {
+			switch val := v.(type) {
 			case []any:
-				hosts, _ := v.([]any)
-				if len(hosts) > 0 {
-					return hosts[0].(string)
-				} else {
-					return ""
+				if len(val) > 0 {
+					s, _ := val[0].(string)
+					return s
 				}
-			case any:
-				return v.(string)
+				return ""
+			case string:
+				return val
+			default:
+				return ""
 			}
 		}
 	}

@@ -166,11 +166,7 @@ func TestRadiusAccountingFoldOnAcceptEvictionAndLateStop(t *testing.T) {
 	backend.setBytes("pptp", "10.1.0.2", 12345, 67890)
 
 	// New device (or churned NAS-Port) evicts oldest session on User-Limit=1 "accept".
-	nftAcctMu.Lock()
-	s.mu.Lock()
 	assignedIP, rejected := s.allocateBlockIP(7, 0, []string{"10.1.0.2"}, "pptp", "accept", "198.51.100.10", 12, "user1@t")
-	s.mu.Unlock()
-	nftAcctMu.Unlock()
 
 	if rejected || assignedIP == nil || assignedIP.String() != "10.1.0.2" {
 		t.Fatalf("allocateBlockIP = (%v, %v), want (10.1.0.2, false)", assignedIP, rejected)
@@ -259,13 +255,9 @@ func TestRadiusAccountingIdempotentRedialKeepsRuleAcrossStop(t *testing.T) {
 	backend.setBytes("pptp", "10.1.0.5", 4000, 8000)
 
 	// Same station + same NAS-Port re-authenticates (CHAP flap / idempotent redial).
-	nftAcctMu.Lock()
-	s.mu.Lock()
 	ip1, _ := s.allocateBlockIP(2, 0, []string{"10.1.0.5"}, "pptp", "reject", "203.0.113.9", 5, "redial@t")
 	// Refresh redial claim once already recorded:
 	ip2, rej2 := s.allocateBlockIP(2, 0, []string{"10.1.0.5"}, "pptp", "reject", "203.0.113.9", 5, "redial@t")
-	s.mu.Unlock()
-	nftAcctMu.Unlock()
 	if ip1 == nil || ip2 == nil || rej2 || ip2.String() != "10.1.0.5" {
 		t.Fatalf("redial failed: (%v, %v, %v)", ip1, ip2, rej2)
 	}
@@ -314,12 +306,10 @@ func TestRadiusAccountingReclaimStaleOpenConnectFoldsBytes(t *testing.T) {
 	}
 	backend.setBytes("openconnect", "10.4.1.2", 1111, 2222)
 
-	nftAcctMu.Lock()
-	s.mu.Lock()
 	ip, rejected := s.allocateBlockIP(9, 0, []string{"10.4.1.2"}, "openconnect", "reject", "198.51.100.7", 0, "oc@t")
+	s.mu.Lock()
 	sess := s.sessions[ocSessionKey("10.4.1.2")]
 	s.mu.Unlock()
-	nftAcctMu.Unlock()
 
 	if rejected || ip == nil || ip.String() != "10.4.1.2" {
 		t.Fatalf("stale reclaim returned (%v, %v)", ip, rejected)

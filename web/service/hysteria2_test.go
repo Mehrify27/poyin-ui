@@ -125,9 +125,12 @@ func TestHysteria2ConfigGenerationAndCertFallback(t *testing.T) {
 		t.Fatalf("self-signed cert pin must be idempotent: %s vs %s", pin1, pin2)
 	}
 
-	certBytes, err := os.ReadFile(filepath.Join(svc.configDir(inb.Id), "cert.pem"))
+	certBytes, err := os.ReadFile(filepath.Join(svc.configDir(inb.Id), "selfsigned.crt"))
 	if err != nil {
-		t.Fatalf("expected cert.pem to exist: %v", err)
+		t.Fatalf("expected selfsigned.crt to exist: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(svc.configDir(inb.Id), "selfsigned.key")); err != nil {
+		t.Fatalf("expected selfsigned.key to exist: %v", err)
 	}
 	block, _ := pem.Decode(certBytes)
 	if block == nil {

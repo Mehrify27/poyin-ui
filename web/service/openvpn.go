@@ -822,7 +822,7 @@ func splitOpenVpnCustomSections(settingsCustom string) (serverLines []string, cl
 		switch trimmed {
 		case userCustomBeginMarker, userCustomEndMarker:
 			continue
-		case clientCustomBeginMarker:
+		case clientCustomBeginMarker, "# CLIENT_CUSTOM":
 			inClient = true
 			continue
 		case clientCustomEndMarker:
@@ -889,25 +889,25 @@ func dedupeCustomLines(groups ...[]string) []string {
 
 var (
 	ovpnMandatoryDirectives = map[string]bool{
-		"port":                  true,
-		"proto":                 true,
-		"dev":                   true,
-		"dev-type":              true,
-		"topology":              true,
-		"server":                true,
-		"client-config-dir":     true,
-		"ca":                    true,
-		"cert":                  true,
-		"key":                   true,
-		"tls-crypt":             true,
-		"script-security":       true,
-		"auth-user-pass-verify": true,
-		"client-connect":        true,
-		"client-disconnect":     true,
-		"status":                true,
-		"status-version":        true,
-		"management":            true,
-		"verify-client-cert":    true,
+		"port":                    true,
+		"proto":                   true,
+		"dev":                     true,
+		"dev-type":                true,
+		"topology":                true,
+		"server":                  true,
+		"client-config-dir":       true,
+		"ca":                      true,
+		"cert":                    true,
+		"key":                     true,
+		"tls-crypt":               true,
+		"script-security":         true,
+		"auth-user-pass-verify":   true,
+		"client-connect":          true,
+		"client-disconnect":       true,
+		"status":                  true,
+		"status-version":          true,
+		"management":              true,
+		"verify-client-cert":      true,
 		"username-as-common-name": true,
 	}
 	ovpnUiControlledDirectives = map[string]bool{

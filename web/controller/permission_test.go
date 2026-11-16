@@ -45,6 +45,8 @@ func runGuarded(t *testing.T, user *model.User, guard gin.HandlerFunc, ajax bool
 	req := httptest.NewRequest(http.MethodGet, "/guarded", nil)
 	if ajax {
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	} else {
+		req.Header.Set("Accept", "text/html,application/xhtml+xml")
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -118,6 +120,16 @@ func TestDenyShapeMatchesRequestKind(t *testing.T) {
 	}
 	if !strings.Contains(body, `"success":false`) || !strings.Contains(body, "forbidden") {
 		t.Errorf("xhr denial must carry success:false and a reason; got %s", body)
+	}
+	// GET without Accept: text/html and without X-Requested-With is treated as data, not navigation.
+	r := gin.New()
+	r.GET("/guarded", withUser(limited), requirePerm(model.PermAccessInbounds), func(c *gin.Context) {
+		c.String(http.StatusOK, "reached")
+	})
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/guarded", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"success":false`) {
+		t.Errorf("non-HTML non-XHR denial = (%d, %s); want (200, success:false)", rec.Code, rec.Body.String())
 	}
 }
 

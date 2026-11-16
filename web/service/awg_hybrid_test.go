@@ -25,7 +25,7 @@ func TestAwgBackwardCompatAndClientRendering(t *testing.T) {
 		"h2": "223456",
 		"h3": "323456",
 		"h4": "423456",
-		"ipRanges": ["10.66.0.0/24"],
+		"ipRanges": ["10.66.0.2-10.66.0.254"],
 		"userLimit": 1,
 		"clients": [
 			{
@@ -91,7 +91,7 @@ func TestAwgBackwardCompatAndClientRendering(t *testing.T) {
 		"h1": "100000-200000", "h2": "200001-300000", "h3": "300001-400000", "h4": "400001-500000",
 		"i1": "<b 0x16030100><c><t><r 12>",
 		"i2": "<rc 8>",
-		"ipRanges": ["10.66.0.0/24"],
+		"ipRanges": ["10.66.0.2-10.66.0.254"],
 		"userLimit": 1,
 		"clients": [
 			{

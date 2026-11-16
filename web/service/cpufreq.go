@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -222,7 +223,7 @@ const (
 )
 
 // cpuSpinSink keeps the compiler from deciding the loop below has no effect.
-var cpuSpinSink uint64
+var cpuSpinSink atomic.Uint64
 
 // spinXorshift runs a strictly dependent chain of shifts and xors: every round needs
 // the previous round's result, so the loop advances at the core's own pace and not at
@@ -258,7 +259,7 @@ func estimatedCpuMhz(ratedMhz float64) float64 {
 	rate := 0.0
 	for i := 0; i < cpuSpinBursts; i++ {
 		start := time.Now()
-		cpuSpinSink += spinXorshift(iters)
+		cpuSpinSink.Add(spinXorshift(iters))
 		elapsed := time.Since(start)
 		if elapsed <= 0 {
 			continue

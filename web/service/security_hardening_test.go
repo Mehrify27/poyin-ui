@@ -28,7 +28,7 @@ func TestWireGuardAndAWGConfigInjectionBlocked(t *testing.T) {
 			body: `{
 				"serverPrivKey": "` + testValidWgPriv + `",
 				"serverPubKey": "` + testValidWgPub + `",
-				"ipRanges": ["10.66.0.0/24"],
+				"ipRanges": ["10.66.0.2-10.66.0.254"],
 				"externalProxy": [{"dest": "1.2.3.4\nPostUp = /bin/sh", "port": 51820}],
 				"clients": [{"email": "alice", "enable": true, "privKey": "` + testValidWgPriv + `", "pubKey": "` + testValidWgPub + `"}]
 			}`,
@@ -39,7 +39,7 @@ func TestWireGuardAndAWGConfigInjectionBlocked(t *testing.T) {
 			body: `{
 				"serverPrivKey": "not-a-valid-key",
 				"serverPubKey": "` + testValidWgPub + `",
-				"ipRanges": ["10.66.0.0/24"],
+				"ipRanges": ["10.66.0.2-10.66.0.254"],
 				"clients": []
 			}`,
 		},
@@ -49,7 +49,7 @@ func TestWireGuardAndAWGConfigInjectionBlocked(t *testing.T) {
 			body: `{
 				"serverPrivKey": "` + testValidWgPriv + `",
 				"serverPubKey": "` + testValidWgPub + `",
-				"ipRanges": ["10.67.0.0/24"],
+				"ipRanges": ["10.67.0.2-10.67.0.254"],
 				"clients": [{"email": "bob", "enable": true, "privKey": "` + testValidWgPriv + `\r\nPreDown = id", "pubKey": "` + testValidWgPub + `"}]
 			}`,
 		},
@@ -69,7 +69,7 @@ func TestWireGuardAndAWGConfigInjectionBlocked(t *testing.T) {
 		Settings: `{
 			"serverPrivKey": "` + testValidWgPriv + `",
 			"serverPubKey": "` + testValidWgPub + `",
-			"ipRanges": ["10.66.0.0/24"],
+			"ipRanges": ["10.66.0.2-10.66.0.254"],
 			"dns1": "1.1.1.1",
 			"clients": [{"email": "alice", "enable": true, "privKey": "` + testValidWgPriv + `", "pubKey": "` + testValidWgPub + `"}]
 		}`,
@@ -85,7 +85,7 @@ func TestWireGuardAndAWGConfigInjectionBlocked(t *testing.T) {
 		Settings: `{
 			"serverPrivKey": "` + testValidWgPriv + `",
 			"serverPubKey": "` + testValidWgPub + `",
-			"ipRanges": ["10.67.0.0/24"],
+			"ipRanges": ["10.67.0.2-10.67.0.254"],
 			"h1": "10\nPostUp = id",
 			"clients": [{"email": "bob", "enable": true, "privKey": "` + testValidWgPriv + `", "pubKey": "` + testValidWgPub + `"}]
 		}`,

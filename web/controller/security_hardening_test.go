@@ -36,7 +36,7 @@ func TestSettingControllerDisablesSystemdUnitEditRoute(t *testing.T) {
 	}
 	r := gin.New()
 	r.Use(withUser(super))
-	NewSettingController(r.Group("/panel/setting"))
+	NewSettingController(r.Group("/panel"))
 
 	// POST /panel/setting/service (arbitrary systemd unit edit / root RCE vector) must not exist.
 	postReq := httptest.NewRequest(

@@ -262,12 +262,14 @@ func TestEstimatedCpuMhzFallsWhenTheCpuIsContended(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			var localSink uint64
 			for {
 				select {
 				case <-stop:
+					cpuSpinSink.Add(localSink)
 					return
 				default:
-					cpuSpinSink += spinXorshift(200_000)
+					localSink += spinXorshift(200_000)
 				}
 			}
 		}()

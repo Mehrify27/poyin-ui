@@ -249,9 +249,11 @@ func (s *SubJsonService) streamData(stream string) map[string]any {
 	security, _ := streamSettings["security"].(string)
 	switch security {
 	case "tls":
-		streamSettings["tlsSettings"] = s.tlsData(streamSettings["tlsSettings"].(map[string]any))
+		tlsMap, _ := streamSettings["tlsSettings"].(map[string]any)
+		streamSettings["tlsSettings"] = s.tlsData(tlsMap)
 	case "reality":
-		streamSettings["realitySettings"] = s.realityData(streamSettings["realitySettings"].(map[string]any))
+		rltyMap, _ := streamSettings["realitySettings"].(map[string]any)
+		streamSettings["realitySettings"] = s.realityData(rltyMap)
 	}
 	delete(streamSettings, "sockopt")
 
@@ -305,13 +307,13 @@ func (s *SubJsonService) realityData(rData map[string]any) map[string]any {
 	rltyData["spiderX"] = "/" + random.Seq(15)
 	shortIds, ok := rData["shortIds"].([]any)
 	if ok && len(shortIds) > 0 {
-		rltyData["shortId"] = shortIds[random.Num(len(shortIds))].(string)
+		rltyData["shortId"], _ = shortIds[random.Num(len(shortIds))].(string)
 	} else {
 		rltyData["shortId"] = ""
 	}
 	serverNames, ok := rData["serverNames"].([]any)
 	if ok && len(serverNames) > 0 {
-		rltyData["serverName"] = serverNames[random.Num(len(serverNames))].(string)
+		rltyData["serverName"], _ = serverNames[random.Num(len(serverNames))].(string)
 	} else {
 		rltyData["serverName"] = ""
 	}

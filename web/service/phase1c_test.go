@@ -349,7 +349,7 @@ func TestInboundServiceBotMultiInboundAndParkedHelpers(t *testing.T) {
 		{"id": "44444444-4444-4444-4444-444444444444", "email": "alice@example.com", "enable": false, "totalGB": float64(5 << 30)},
 	})
 	ib2 := seedInboundWithClients(t, model.VMESS, 48302, []map[string]any{})
-	parkSource := seedInboundWithClients(t, model.VLESS, 48303, []map[string]any{
+	parkSource := seedTaggedInbound(t, model.VLESS, 48303, []map[string]any{
 		{"id": "55555555-5555-5555-5555-555555555555", "email": "parked@example.com", "enable": false, "totalGB": float64(2 << 30), "subId": "park-sub"},
 	})
 	acctSvc.MigrationAccounts()
