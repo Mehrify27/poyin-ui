@@ -53,7 +53,7 @@ var (
 	engineSemverRe = regexp.MustCompile(`v?(\d+\.\d+(?:\.\d+)*(?:-[0-9A-Za-z.-]+)?)`)
 )
 
-// engineProbeOps allows unit tests to simulate Linux kernel/binary state cleanly on any OS.
+// engineProbeDeps allows unit tests to simulate Linux kernel/binary state cleanly on any OS.
 type engineProbeDeps struct {
 	runVersionCmd func(binPath string, args []string) (string, error)
 	lookPath      func(name string) (string, error)
@@ -61,6 +61,7 @@ type engineProbeDeps struct {
 	statPath      func(path string) (os.FileInfo, error)
 	moduleAvail   func(name string) bool
 	moduleLoaded  func(name string) bool
+	getInventory  func() []CoreBinaryInfo
 	goos          string
 }
 
@@ -175,13 +176,19 @@ func extractDaemonBannerAndVersion(raw string) (token, firstLine string) {
 //   - Category B: in-process Go & kernel-netlink engines (ssh, wireguard-c, gre)
 //   - Category C: C/musl system daemons (l2tp, pptp, openvpn, openconnect, sstp, ikev2)
 func (s *CoreService) GetDaemonVersions() []ProtocolEngineInfo {
-	return s.collectDaemonVersions(defaultEngineProbeDeps())
+	deps := defaultEngineProbeDeps()
+	deps.getInventory = s.GetCoreBinaryInventory
+	return s.collectDaemonVersions(deps)
 }
 
 func (s *CoreService) collectDaemonVersions(deps engineProbeDeps) []ProtocolEngineInfo {
 	kernelRel := readKernelRelease(deps)
 	invByTarget := map[string]CoreBinaryInfo{}
-	for _, item := range s.GetCoreBinaryInventory() {
+	invFn := deps.getInventory
+	if invFn == nil {
+		invFn = s.GetCoreBinaryInventory
+	}
+	for _, item := range invFn() {
 		invByTarget[item.Core] = item
 	}
 

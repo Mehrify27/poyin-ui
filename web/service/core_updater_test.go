@@ -165,7 +165,8 @@ func TestUpdateCoreZipAndTargetedRestart(t *testing.T) {
 	var restarted []string
 	svc := &CoreService{}
 	results, err := svc.UpdateCore(CoreUpdateOptions{
-		Target: "xray",
+		Target:         "xray",
+		AllowUnpatched: true,
 		RestartFunc: func(core string) error {
 			restarted = append(restarted, core)
 			return nil

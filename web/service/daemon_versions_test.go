@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/mhsanaei/3x-ui/v2/util/binutil"
 )
 
 func TestDaemonVersionExtractionHandlesSubcommandsAndNonZeroExits(t *testing.T) {
@@ -53,8 +55,25 @@ func TestDaemonVersionExtractionHandlesSubcommandsAndNonZeroExits(t *testing.T) 
 }
 
 func TestGetDaemonVersionsCoversAllProtocolCategoriesSafely(t *testing.T) {
+	t.Setenv("VPNUI_BIN_FOLDER", t.TempDir())
+	t.Setenv(binutil.CustomBinDirEnv, t.TempDir())
+
 	deps := engineProbeDeps{
 		goos: "linux",
+		getInventory: func() []CoreBinaryInfo {
+			return []CoreBinaryInfo{
+				{
+					Core:             "xray",
+					ServiceCore:      "xray",
+					ActivePath:       "/usr/local/vpn-ui/bin/xray-linux-amd64",
+					Source:           "bundled",
+					InstalledVersion: "26.11.9",
+					Version:          "Xray 26.11.9",
+					CustomPatched:    true,
+					PatchSet:         append([]string(nil), XrayPatchList...),
+				},
+			}
+		},
 		readFile: func(path string) ([]byte, error) {
 			switch path {
 			case "/proc/sys/kernel/osrelease":
@@ -158,6 +177,7 @@ func TestGetDaemonVersionsCoversAllProtocolCategoriesSafely(t *testing.T) {
 
 	// Ensure missing binaries never panic and degrade cleanly.
 	missingDeps := deps
+	missingDeps.getInventory = func() []CoreBinaryInfo { return nil }
 	missingDeps.lookPath = func(string) (string, error) { return "", os.ErrNotExist }
 	missingDeps.moduleAvail = func(string) bool { return false }
 	missingDeps.statPath = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
