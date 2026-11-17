@@ -45,6 +45,9 @@ var htmlFS embed.FS
 //go:embed translation/*
 var i18nFS embed.FS
 
+//go:embed all:frontend/dist
+var spaDistFS embed.FS
+
 var startTime = time.Now()
 
 type wrapAssetsFS struct {
@@ -98,10 +101,13 @@ type Server struct {
 	httpServer *http.Server
 	listener   net.Listener
 
-	index *controller.IndexController
-	panel *controller.XUIController
-	api   *controller.APIController
-	ws    *controller.WebSocketController
+	index     *controller.IndexController
+	panel     *controller.XUIController
+	api       *controller.APIController
+	ws        *controller.WebSocketController
+	bootstrap *controller.BootstrapController
+	pwa       *controller.PWAController
+	spa       *controller.SPAController
 
 	xrayService        service.XrayService
 	settingService     service.SettingService
@@ -324,10 +330,19 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	engine.Use(middleware.RedirectMiddleware(basePath))
 
 	g := engine.Group(basePath)
+	g.Use(controller.JSONBodyPreserver())
 
 	s.index = controller.NewIndexController(g)
 	s.panel = controller.NewXUIController(g)
 	s.api = controller.NewAPIController(g, s.customGeoService)
+	s.bootstrap = controller.NewBootstrapController(g)
+	s.pwa = controller.NewPWAController(g)
+
+	spaSubFS, subErr := fs.Sub(spaDistFS, "frontend/dist")
+	if subErr != nil {
+		spaSubFS = spaDistFS
+	}
+	s.spa = controller.NewSPAController(g, spaSubFS, "web/frontend/dist")
 
 	// Initialize WebSocket hub
 	s.wsHub = websocket.NewHub()
@@ -503,25 +518,6 @@ func (s *Server) startTask() {
 		select {
 		case <-time.After(job.SSLRenewStartupDelay):
 			sslRenewJob.Run()
-		case <-s.ctx.Done():
-		}
-	}()
-
-	// Refresh the built-in geo data files. Registered unconditionally and gated
-	// INSIDE the job rather than here, so flipping the switch in the overview's
-	// Geofiles dialog takes effect on the next tick instead of on the next panel
-	// restart. Placed above the Telegram block for the same reason the SSL job is:
-	// that block returns early on a bad tgbot cron string.
-	geofileJob := job.NewUpdateGeofileJob()
-	s.cron.AddJob(job.GeofileUpdateSchedule, geofileJob)
-
-	go func() {
-		// Same reasoning as the SSL startup run above: cron's first "@every" tick is a
-		// whole interval away, and the context binding keeps a SIGHUP restart from
-		// firing this into the next Server.
-		select {
-		case <-time.After(job.GeofileUpdateStartupDelay):
-			geofileJob.Run()
 		case <-s.ctx.Done():
 		}
 	}()

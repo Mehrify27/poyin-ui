@@ -2,6 +2,7 @@ package controller
 
 import (
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/database/model"
@@ -153,7 +154,7 @@ func (a *SettingController) updateSetting(c *gin.Context) {
 // (assets/js/util/index.js stringifies each body), so the flag arrives as a
 // string and "true" is the only value that turns it on.
 func (a *SettingController) setLegacyInboundForm(c *gin.Context) {
-	enabled := c.PostForm("enabled") == "true"
+	enabled := strings.EqualFold(strings.TrimSpace(postParam(c, "enabled")), "true")
 	err := a.settingService.SetLegacyInboundForm(enabled)
 	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
 }

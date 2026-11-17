@@ -262,6 +262,99 @@
             </a-card>
           </a-col>
 
+          <!-- Linux BBR & Network Stack Tuning -->
+          <a-col :span="24" v-if="loaded && netTuning.supported">
+            <a-card hoverable :loading="netTuningLoading">
+              <template #title>
+                <a-icon type="dashboard"></a-icon>
+                <span :style="{ marginLeft: '8px' }">Network Stack &amp; BBR Tuning</span>
+                <a-tag :color="netTuning.bbrActive ? 'green' : (netTuning.bbrAvailable ? 'orange' : 'default')"
+                  :style="{ marginInlineStart: '8px' }">
+                  [[ netTuning.bbrActive ? ('BBR On (' + (netTuning.bbrVariant || netTuning.congestionControl) + ')') : ('BBR Off (' + (netTuning.congestionControl || 'unknown') + ')') ]]
+                </a-tag>
+              </template>
+              <template #extra>
+                <a-space :size="8" :style="{ flexWrap: 'wrap' }">
+                  <a-button size="small" @click="loadNetworkTuning">
+                    <a-icon type="reload"></a-icon>{{ i18n "pages.core.refresh" }}
+                  </a-button>
+                  <a-popconfirm v-if="netTuning.hasBackup || netTuning.persistPresent"
+                    title="Restore pre-tuning sysctl snapshot and remove managed tuning config?"
+                    ok-text="{{ i18n "confirm" }}" cancel-text="{{ i18n "cancel" }}"
+                    @confirm="revertNetworkTuning">
+                    <a-button size="small" type="danger" ghost :loading="netTuningApplying">
+                      <a-icon type="rollback"></a-icon>Revert Backup
+                    </a-button>
+                  </a-popconfirm>
+                </a-space>
+              </template>
+
+              <a-alert v-if="netTuning.readOnlySysctl || !netTuning.bbrAvailable"
+                type="warning" show-icon :style="{ marginBottom: '12px' }"
+                :message="netTuning.message || ('BBR is unavailable on kernel ' + (netTuning.kernelRelease || 'unknown') + ' (available: ' + ((netTuning.availableCongestions || []).join(', ') || 'none') + ')')">
+              </a-alert>
+
+              <a-row :gutter="[12, 12]" :style="{ marginBottom: '12px' }">
+                <a-col :xs="24" :sm="12" :md="6">
+                  <div class="sys-tile" :class="netTuning.bbrActive ? 'sys-tile-ok' : 'sys-tile-bad'">
+                    <a-icon class="sys-tile-icon" theme="filled"
+                      :type="netTuning.bbrActive ? 'check-circle' : 'info-circle'"></a-icon>
+                    <div>
+                      <div class="sys-tile-name">Congestion Control</div>
+                      <div class="sys-tile-state">
+                        [[ netTuning.congestionControl || '—' ]]
+                        <span v-if="netTuning.bestBBRVariant && !netTuning.bbrActive"> (best: [[ netTuning.bestBBRVariant ]])</span>
+                      </div>
+                    </div>
+                  </div>
+                </a-col>
+                <a-col :xs="24" :sm="12" :md="6">
+                  <div class="sys-tile sys-tile-ok">
+                    <a-icon class="sys-tile-icon" theme="filled" type="swap"></a-icon>
+                    <div>
+                      <div class="sys-tile-name">Default / Interface Qdisc</div>
+                      <div class="sys-tile-state">
+                        [[ netTuning.defaultQdisc || '—' ]]
+                        <span v-if="netTuning.primaryInterface"> / [[ netTuning.primaryInterface ]]: [[ netTuning.primaryQdisc || '—' ]]</span>
+                      </div>
+                    </div>
+                  </div>
+                </a-col>
+                <a-col :xs="24" :sm="12" :md="6">
+                  <div class="sys-tile sys-tile-ok">
+                    <a-icon class="sys-tile-icon" theme="filled" type="sliders"></a-icon>
+                    <div>
+                      <div class="sys-tile-name">Socket Buffers (rmem / wmem)</div>
+                      <div class="sys-tile-state">[[ formatSysctlBytes(netTuning.rmemMax) ]] / [[ formatSysctlBytes(netTuning.wmemMax) ]]</div>
+                    </div>
+                  </div>
+                </a-col>
+                <a-col :xs="24" :sm="12" :md="6">
+                  <div class="sys-tile sys-tile-ok">
+                    <a-icon class="sys-tile-icon" theme="filled" type="safety-certificate"></a-icon>
+                    <div>
+                      <div class="sys-tile-name">Active Profile</div>
+                      <div class="sys-tile-state">[[ netTuningProfileLabel(netTuning.activeProfile) ]] (kernel [[ netTuning.kernelRelease || 'linux' ]])</div>
+                    </div>
+                  </div>
+                </a-col>
+              </a-row>
+
+              <div :style="{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap', padding: '10px 12px', borderRadius: '8px', border: '1px solid rgba(128,128,128,0.2)' }">
+                <a-radio-group v-model="netTuningSelectedProfile" button-style="solid" size="small">
+                  <a-radio-button value="default">Default (OS)</a-radio-button>
+                  <a-radio-button value="bbr" :disabled="!netTuning.bbrAvailable || netTuning.readOnlySysctl">Standard BBR (fq)</a-radio-button>
+                  <a-radio-button value="vpn-performance" :disabled="!netTuning.bbrAvailable || netTuning.readOnlySysctl">VPN High-Throughput + Low-Latency</a-radio-button>
+                </a-radio-group>
+                <a-button type="primary" size="small" :loading="netTuningApplying"
+                  :disabled="netTuning.readOnlySysctl || (!netTuning.bbrAvailable && netTuningSelectedProfile !== 'default')"
+                  @click="applyNetworkTuning">
+                  <a-icon type="check"></a-icon>Apply Tuning Profile
+                </a-button>
+              </div>
+            </a-card>
+          </a-col>
+
           <!-- Sidecar / Core Binaries (decoupled overrides & independent updates) -->
           <a-col :span="24" v-if="loaded && binaryInventory.length">
             <a-card hoverable :loading="binaryLoading">
@@ -274,11 +367,11 @@
                   <a-button size="small" @click="loadBinaries">
                     <a-icon type="reload"></a-icon>{{ i18n "pages.core.refresh" }}
                   </a-button>
-                  <a-popconfirm title="Download &amp; install the latest official release for all auto-updatable cores?"
+                  <a-popconfirm title="Download &amp; install the latest official release for supported unpatched cores? (Custom-patched Xray-core is skipped for safety)"
                     ok-text="{{ i18n "confirm" }}" cancel-text="{{ i18n "cancel" }}"
                     @confirm="updateAllCores">
                     <a-button size="small" type="primary" :loading="coreUpdateModal.submitting">
-                      <a-icon type="sync"></a-icon>Update All to Latest
+                      <a-icon type="sync"></a-icon>Update Supported Cores
                     </a-button>
                   </a-popconfirm>
                 </a-space>
@@ -289,8 +382,12 @@
                     <div :style="{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', gap: '6px', flexWrap: 'wrap' }">
                       <strong>[[ bin.core ]]</strong>
                       <a-space :size="4">
+                        <a-tooltip v-if="bin.customPatched && bin.patchSet && bin.patchSet.length"
+                          :title="bin.patchSet.join(' · ')">
+                          <a-tag color="purple"><a-icon type="safety-certificate"></a-icon> Patched</a-tag>
+                        </a-tooltip>
                         <a-tag :color="bin.autoUpdatable ? 'cyan' : 'orange'">
-                          [[ bin.autoUpdatable ? 'Auto-Update' : 'Versions / Custom' ]]
+                          [[ bin.autoUpdatable ? 'Official Release' : 'Source / Custom' ]]
                         </a-tag>
                         <a-tag :color="binarySourceColor(bin.source)">[[ bin.source ]]</a-tag>
                       </a-space>
@@ -315,7 +412,7 @@
                         :title="bin.activePath || bin.customPath">[[ bin.activePath || 'not found' ]]</span>
                     </div>
                     <div :style="{ marginTop: '10px', display: 'flex', gap: '8px', flexWrap: 'wrap' }">
-                      <a-popconfirm v-if="bin.autoUpdatable"
+                      <a-popconfirm v-if="bin.autoUpdatable && !bin.customPatched"
                         :title="'Download & install latest official release of ' + bin.core + '?'"
                         ok-text="{{ i18n "confirm" }}" cancel-text="{{ i18n "cancel" }}"
                         @confirm="quickUpdateCoreLatest(bin.core)">
@@ -323,7 +420,7 @@
                           <a-icon type="rocket"></a-icon>Latest
                         </a-button>
                       </a-popconfirm>
-                      <a-button size="small" :type="bin.autoUpdatable ? 'default' : 'primary'" @click="openCoreUpdateModal(bin)">
+                      <a-button size="small" :type="(bin.autoUpdatable && !bin.customPatched) ? 'default' : 'primary'" @click="openCoreUpdateModal(bin)">
                         <a-icon type="bars"></a-icon>Versions / Choose
                       </a-button>
                       <a-popconfirm v-if="bin.hasBackup || bin.source === 'custom-override'"
@@ -338,6 +435,45 @@
                   </div>
                 </a-col>
               </a-row>
+
+              <div v-if="protocolEngines.length" :style="{ marginTop: '16px' }">
+                <div class="sys-section-title">All Protocol Engines (12 VPN + Xray Runtime Inventory)</div>
+                <a-table :data-source="protocolEngines" :pagination="false" size="small" :row-key="r => r.id" :scroll="{ x: 640 }">
+                  <a-table-column title="Protocol" key="title">
+                    <template slot-scope="rec">
+                      <strong>[[ rec.title ]]</strong>
+                      <div :style="{ fontSize: '11px', opacity: 0.65 }">[[ rec.protocols ]]</div>
+                    </template>
+                  </a-table-column>
+                  <a-table-column title="Category" key="category">
+                    <template slot-scope="rec">
+                      <a-tag :color="engineCategoryColor(rec.category)">[[ engineCategoryLabel(rec.category) ]]</a-tag>
+                    </template>
+                  </a-table-column>
+                  <a-table-column title="Engine / Kernel" key="engineName">
+                    <template slot-scope="rec">
+                      <span>[[ rec.engineName ]]</span>
+                      <a-tag v-if="rec.customPatched" color="purple" :style="{ marginInlineStart: '4px' }">Patched</a-tag>
+                      <div v-if="rec.kernelModule" :style="{ fontSize: '11px', opacity: 0.7 }">
+                        kmod: [[ rec.kernelModule ]] ([[ rec.kernelLoaded ? 'ok' : 'off' ]])
+                      </div>
+                      <div v-if="rec.helperTools && rec.helperTools.length" :style="{ fontSize: '11px', opacity: 0.65 }">
+                        tools: [[ rec.helperTools.join(', ') ]]
+                      </div>
+                    </template>
+                  </a-table-column>
+                  <a-table-column title="Version" key="version">
+                    <template slot-scope="rec">
+                      <span :title="rec.banner || rec.detail || ''">[[ rec.version || '—' ]]</span>
+                    </template>
+                  </a-table-column>
+                  <a-table-column title="Source" key="source">
+                    <template slot-scope="rec">
+                      <a-tag :color="binarySourceColor(rec.source)">[[ rec.source ]]</a-tag>
+                    </template>
+                  </a-table-column>
+                </a-table>
+              </div>
             </a-card>
           </a-col>
 
@@ -686,6 +822,21 @@
       </template>
     </a-alert>
 
+    <a-alert v-if="coreUpdateModal.customPatched" type="error" show-icon :style="{ marginBottom: '12px' }"
+      message="Custom-Patched Core Protection">
+      <template #description>
+        <div>[[ coreUpdateModal.upstreamWarning || 'This binary carries custom vpn-ui patches.' ]]</div>
+        <div v-if="coreUpdateModal.patchSet && coreUpdateModal.patchSet.length" :style="{ marginTop: '6px', fontSize: '12px' }">
+          <strong>Active patches:</strong> [[ coreUpdateModal.patchSet.join(' · ') ]]
+        </div>
+        <div v-if="!coreUpdateModal.url" :style="{ marginTop: '8px' }">
+          <a-checkbox v-model="coreUpdateModal.allowUnpatched">
+            I understand: replace custom-patched core with unpatched upstream [[ coreUpdateModal.upstreamRepo ]] (keeps .bak for instant Rollback)
+          </a-checkbox>
+        </div>
+      </template>
+    </a-alert>
+
     <a-alert v-if="!coreUpdateModal.autoUpdatable" type="warning" show-icon :style="{ marginBottom: '12px' }"
       :message="coreUpdateModal.updateMode === 'source-go'
         ? 'Upstream publishes source tags only (no Go toolchain detected on host for auto-build). Pick a version to inspect or pass a Custom binary URL below.'
@@ -850,8 +1001,13 @@
       // on top of the first.
       cfgCm: null,
       binaryInventory: [],
+      protocolEngines: [],
       binaryLoading: false,
       quickUpdatingCore: '',
+      netTuning: { supported: false, availableCongestions: [] },
+      netTuningSelectedProfile: 'bbr',
+      netTuningLoading: false,
+      netTuningApplying: false,
       coreUpdateModal: {
         visible: false,
         submitting: false,
@@ -863,6 +1019,10 @@
         upstreamUrl: '',
         updateMode: 'prebuilt',
         autoUpdatable: true,
+        customPatched: false,
+        patchSet: [],
+        upstreamWarning: '',
+        allowUnpatched: false,
         showAdvanced: false,
         filter: '',
         releases: [],
@@ -1455,12 +1615,64 @@
         this.binaryLoading = true;
         const msg = await HttpUtil.get('/panel/core/versions');
         this.binaryLoading = false;
-        if (msg && msg.success && msg.obj && msg.obj.binaries) {
-          this.binaryInventory = msg.obj.binaries;
+        if (msg && msg.success && msg.obj) {
+          if (msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
+          if (msg.obj.engines) this.protocolEngines = msg.obj.engines;
         }
       },
+      async loadNetworkTuning() {
+        this.netTuningLoading = true;
+        const msg = await HttpUtil.get('/panel/core/network-tuning');
+        this.netTuningLoading = false;
+        if (msg && msg.success && msg.obj) {
+          this.netTuning = msg.obj;
+          if (msg.obj.activeProfile) {
+            this.netTuningSelectedProfile = msg.obj.activeProfile === 'custom' ? 'bbr' : msg.obj.activeProfile;
+          }
+        }
+      },
+      async applyNetworkTuning() {
+        this.netTuningApplying = true;
+        const msg = await HttpUtil.post('/panel/core/network-tuning/apply', {
+          profile: this.netTuningSelectedProfile || 'bbr',
+        });
+        this.netTuningApplying = false;
+        if (msg && msg.obj && msg.obj.status) {
+          this.netTuning = msg.obj.status;
+          if (msg.obj.status.activeProfile) this.netTuningSelectedProfile = msg.obj.status.activeProfile;
+        } else {
+          await this.loadNetworkTuning();
+        }
+      },
+      async revertNetworkTuning() {
+        this.netTuningApplying = true;
+        const msg = await HttpUtil.post('/panel/core/network-tuning/revert', {});
+        this.netTuningApplying = false;
+        if (msg && msg.obj && msg.obj.status) {
+          this.netTuning = msg.obj.status;
+          if (msg.obj.status.activeProfile) this.netTuningSelectedProfile = msg.obj.status.activeProfile;
+        } else {
+          await this.loadNetworkTuning();
+        }
+      },
+      netTuningProfileLabel(p) {
+        return ({ default: 'Default (OS)', bbr: 'Standard BBR', 'vpn-performance': 'VPN Performance' })[p] || (p || 'Default');
+      },
+      formatSysctlBytes(v) {
+        const n = Number(v);
+        if (!n || Number.isNaN(n)) return v || '—';
+        if (n >= 1048576) return Math.round(n / 1048576) + ' MB';
+        if (n >= 1024) return Math.round(n / 1024) + ' KB';
+        return String(n) + ' B';
+      },
+      engineCategoryLabel(cat) {
+        return ({ 'userspace-sidecar': 'Cat A · Userspace', 'in-process-kernel': 'Cat B · Go / Kernel', daemon: 'Cat C · Daemon' })[cat] || cat;
+      },
+      engineCategoryColor(cat) {
+        return ({ 'userspace-sidecar': 'cyan', 'in-process-kernel': 'geekblue', daemon: 'blue' })[cat] || 'default';
+      },
       binarySourceColor(src) {
-        return ({ 'custom-override': 'blue', bundled: 'green', 'host-path': 'cyan', missing: 'default' })[src] || 'default';
+        return ({ 'custom-override': 'blue', bundled: 'green', 'host-path': 'cyan', 'in-process': 'purple', kernel: 'geekblue', missing: 'default' })[src] || 'default';
       },
       coreBinaryTarget(coreName) {
         return ({
@@ -1486,6 +1698,9 @@
           upstreamUrl: '',
           updateMode: 'prebuilt',
           autoUpdatable: true,
+          customPatched: target === 'xray',
+          patchSet: [],
+          upstreamWarning: '',
         });
       },
       async openCoreUpdateModal(bin) {
@@ -1500,6 +1715,10 @@
           upstreamUrl: bin.upstreamUrl || '',
           updateMode: bin.updateMode || 'prebuilt',
           autoUpdatable: bin.autoUpdatable !== false,
+          customPatched: !!bin.customPatched && bin.core === 'xray',
+          patchSet: bin.patchSet || [],
+          upstreamWarning: bin.upstreamWarning || '',
+          allowUnpatched: false,
           showAdvanced: false,
           filter: '',
           releases: [],
@@ -1521,6 +1740,9 @@
           if (msg.obj.upstreamRepo) this.coreUpdateModal.upstreamRepo = msg.obj.upstreamRepo;
           if (msg.obj.upstreamUrl) this.coreUpdateModal.upstreamUrl = msg.obj.upstreamUrl;
           if (msg.obj.updateMode) this.coreUpdateModal.updateMode = msg.obj.updateMode;
+          if (typeof msg.obj.customPatched === 'boolean' && core === 'xray') this.coreUpdateModal.customPatched = msg.obj.customPatched;
+          if (msg.obj.patchSet) this.coreUpdateModal.patchSet = msg.obj.patchSet;
+          if (msg.obj.upstreamWarning) this.coreUpdateModal.upstreamWarning = msg.obj.upstreamWarning;
           if (!this.coreUpdateModal.version) {
             const latest = this.coreUpdateModal.releases.find((r) => r.latest) || this.coreUpdateModal.releases[0];
             if (latest && latest.tag && this.coreUpdateModal.autoUpdatable) {
@@ -1538,7 +1760,10 @@
         this.quickUpdatingCore = core;
         const msg = await HttpUtil.post('/panel/core/update/' + encodeURIComponent(core), {});
         this.quickUpdatingCore = '';
-        if (msg && msg.obj && msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
+        if (msg && msg.obj) {
+          if (msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
+          if (msg.obj.engines) this.protocolEngines = msg.obj.engines;
+        }
         await this.loadStatus(false);
       },
       async submitCoreUpdate() {
@@ -1547,9 +1772,13 @@
           version: (this.coreUpdateModal.version || '').trim(),
           url: (this.coreUpdateModal.url || '').trim(),
           sha256: (this.coreUpdateModal.sha256 || '').trim(),
+          allowUnpatched: !!this.coreUpdateModal.allowUnpatched,
         });
         this.coreUpdateModal.submitting = false;
-        if (msg && msg.obj && msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
+        if (msg && msg.obj) {
+          if (msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
+          if (msg.obj.engines) this.protocolEngines = msg.obj.engines;
+        }
         if (msg && msg.success) {
           this.coreUpdateModal.visible = false;
         }
@@ -1559,14 +1788,20 @@
         this.coreUpdateModal.submitting = true;
         const msg = await HttpUtil.post('/panel/core/update/all', {});
         this.coreUpdateModal.submitting = false;
-        if (msg && msg.obj && msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
+        if (msg && msg.obj) {
+          if (msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
+          if (msg.obj.engines) this.protocolEngines = msg.obj.engines;
+        }
         await this.loadStatus(false);
       },
       async rollbackCoreBinary(core) {
         this.binaryLoading = true;
         const msg = await HttpUtil.post('/panel/core/rollback/' + encodeURIComponent(core), {});
         this.binaryLoading = false;
-        if (msg && msg.obj && msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
+        if (msg && msg.obj) {
+          if (msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
+          if (msg.obj.engines) this.protocolEngines = msg.obj.engines;
+        }
         await this.loadStatus(false);
       },
     },
@@ -1588,6 +1823,7 @@
       canSubmitCoreUpdate() {
         if (this.coreUpdateModal.submitting) return false;
         if ((this.coreUpdateModal.url || '').trim()) return true;
+        if (this.coreUpdateModal.customPatched && !this.coreUpdateModal.allowUnpatched) return false;
         return !!this.coreUpdateModal.autoUpdatable;
       },
       coreUpdateOkText() {
@@ -1641,6 +1877,7 @@
       this.loadStatus(true);
       this.loadCatalog();
       this.loadBinaries();
+      this.loadNetworkTuning();
       this.pollTimer = setInterval(() => this.loadStatus(false), 5000);
     },
     beforeDestroy() {

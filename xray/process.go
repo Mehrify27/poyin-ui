@@ -1,7 +1,6 @@
 package xray
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -295,14 +295,14 @@ func (p *process) refreshVersion() {
 	data, err := cmd.Output()
 	if err != nil {
 		p.version = "Unknown"
-	} else {
-		datas := bytes.Split(data, []byte(" "))
-		if len(datas) <= 1 {
-			p.version = "Unknown"
-		} else {
-			p.version = string(datas[1])
-		}
+		return
 	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 2 {
+		p.version = "Unknown"
+		return
+	}
+	p.version = fields[1]
 }
 
 // Start launches the Xray process with the current configuration.

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 196 56" fill="none" role="img" aria-label="VPN-UI">
+  <defs>
+    <linearGradient id="vpnui-bg" x1="6" y1="6" x2="50" y2="50" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#008771"/>
+      <stop offset="100%" stop-color="#1bbf9f"/>
+    </linearGradient>
+    <linearGradient id="vpnui-word" x1="60" y1="18" x2="184" y2="38" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0f9f85"/>
+      <stop offset="100%" stop-color="#1fd1ad"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="6" width="44" height="44" rx="12" fill="url(#vpnui-bg)"/>
+  <rect x="4.75" y="6.75" width="42.5" height="42.5" rx="11.25" stroke="#ffffff" stroke-opacity="0.28" stroke-width="1.5"/>
+  <path d="M15.5 20.5L26 14.5L36.5 20.5V29C36.5 34.8 31.6 38.9 26 41.2C20.4 38.9 15.5 34.8 15.5 29V20.5Z" fill="#ffffff" fill-opacity="0.14" stroke="#ffffff" stroke-width="2.2" stroke-linejoin="round"/>
+  <path d="M21.2 27.8L26 23L30.8 27.8M26 23.2V34" stroke="#ffffff" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/>
+  <g stroke="url(#vpnui-word)" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M62 19L69 37L76 19"/>
+    <path d="M84 37V19H91.5C95.8 19 95.8 28.2 91.5 28.2H84"/>
+    <path d="M104 37V19L118 37V19"/>
+    <path d="M126 28.2H134"/>
+    <path d="M142 19V30.5C142 34.6 144.8 37 149 37C153.2 37 156 34.6 156 30.5V19"/>
+    <path d="M166 19V37"/>
+  </g>
+  <circle cx="177" cy="21" r="3.2" fill="#1fd1ad"/>
+</svg>

@@ -910,11 +910,13 @@ item_ssl() {
 }
 
 # --------------------------------------------------------------------------- #
-#  Item 18: BBR (Enable / Disable / Status)
+#  Item 18: BBR & Network Stack Tuning (Status / Standard / VPN Performance / Revert)
 # --------------------------------------------------------------------------- #
 
+BBR_TUNING_SYSCTL_FILE="/etc/sysctl.d/99-vpn-ui-tuning.conf"
 BBR_SYSCTL_FILE="/etc/sysctl.d/99-vpn-ui-bbr.conf"
 BBR_MODULES_FILE="/etc/modules-load.d/vpn-ui-bbr.conf"
+BBR_TUNING_MODULES_FILE="/etc/modules-load.d/vpn-ui-tuning.conf"
 
 _bbr_state() {
     local val=""
@@ -924,6 +926,13 @@ _bbr_state() {
         val="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | tr -d '[:space:]' || true)"
     fi
     printf '%s' "${val:-unknown}"
+}
+
+_bbr_is_enabled() {
+    case "$1" in
+        bbr|bbr2|bbr3) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 _bbr_qdisc() {
@@ -941,25 +950,28 @@ _bbr_strip_file_keys() {
     [[ -f "$file" && ! -L "$file" ]] || return 0
     grep -qE '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' "$file" 2>/dev/null || return 0
     tmp="$(mktemp "${file}.XXXXXX")"
-    grep -vE '^[[:space:]]*(# Managed by vpn-ui \(BBR congestion control\)|net\.core\.default_qdisc[[:space:]]*=|net\.ipv4\.tcp_congestion_control[[:space:]]*=)' "$file" > "$tmp" || true
+    grep -vE '^[[:space:]]*(# Managed by vpn-ui \(|net\.core\.default_qdisc[[:space:]]*=|net\.ipv4\.tcp_congestion_control[[:space:]]*=)' "$file" > "$tmp" || true
     chmod --reference="$file" "$tmp" 2>/dev/null || chmod 0644 "$tmp"
     mv -f "$tmp" "$file"
 }
 
 _bbr_cleanup_sysctl_files() {
-    rm -f "$BBR_SYSCTL_FILE" "$BBR_MODULES_FILE"
+    rm -f "$BBR_TUNING_SYSCTL_FILE" "$BBR_SYSCTL_FILE" "$BBR_MODULES_FILE" "$BBR_TUNING_MODULES_FILE"
     _bbr_strip_file_keys /etc/sysctl.conf
     _bbr_strip_file_keys /etc/sysctl.d/99-sysctl.conf
 }
 
 bbr_status() {
+    if [[ -x "${BIN:-}" ]]; then
+        "$BIN" bbr status && return 0 || true
+    fi
     local cc qdisc avail
     cc="$(_bbr_state)"
     qdisc="$(_bbr_qdisc)"
     avail="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)"
-    msg "BBR Status"
+    msg "BBR & Network Stack Status"
     act "kernel:             $(uname -r 2>/dev/null || echo unknown)"
-    if [[ "$cc" == "bbr" ]]; then
+    if _bbr_is_enabled "$cc"; then
         ok "congestion control: ${cc} (enabled)"
     else
         act "congestion control: ${YELLOW}${cc}${R} (BBR disabled)"
@@ -968,15 +980,39 @@ bbr_status() {
     [[ -n "$avail" ]] && act "available algos:    ${avail}"
 }
 
+bbr_apply_profile() {
+    local profile="${1:-bbr}"
+    if [[ -x "${BIN:-}" ]]; then
+        "$BIN" bbr "$profile"
+        return $?
+    fi
+    if [[ "$profile" == "default" || "$profile" == "disable" || "$profile" == "revert" ]]; then
+        bbr_disable
+        return $?
+    fi
+    bbr_enable "$profile"
+}
+
 bbr_enable() {
+    local profile="${1:-bbr}"
+    if [[ -x "${BIN:-}" ]]; then
+        "$BIN" bbr "$profile"
+        return $?
+    fi
     command -v sysctl >/dev/null 2>&1 || { warn "'sysctl' command not found; cannot configure BBR."; return 1; }
     if command -v modprobe >/dev/null 2>&1; then
         modprobe tcp_bbr 2>/dev/null || true
     fi
 
-    local avail
+    local avail algo="bbr"
     avail="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-    if ! printf '%s' "$avail" | grep -qw 'bbr'; then
+    for cand in bbr3 bbr2 bbr; do
+        if printf '%s' "$avail" | grep -qw "$cand"; then
+            algo="$cand"
+            break
+        fi
+    done
+    if ! printf '%s' "$avail" | grep -qw "$algo"; then
         warn "BBR is not available in this kernel ($(uname -r 2>/dev/null || echo unknown)); Linux 4.9+ with tcp_bbr is required."
         return 1
     fi
@@ -986,16 +1022,37 @@ bbr_enable() {
     fi
 
     _bbr_cleanup_sysctl_files
+    local body="# Managed by vpn-ui (network & BBR tuning profile: ${profile})
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = ${algo}
+"
+    if [[ "$profile" == "vpn-performance" ]]; then
+        body="${body}net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.core.netdev_max_backlog = 16384
+net.core.somaxconn = 8192
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_fastopen = 3
+"
+    fi
     if [[ -d /etc/sysctl.d ]]; then
-        printf '# Managed by vpn-ui (BBR congestion control)\nnet.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' > "$BBR_SYSCTL_FILE"
+        printf '%s' "$body" > "$BBR_TUNING_SYSCTL_FILE"
     elif [[ -f /etc/sysctl.conf ]]; then
-        printf '\n# Managed by vpn-ui (BBR congestion control)\nnet.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' >> /etc/sysctl.conf
+        printf '\n%s' "$body" >> /etc/sysctl.conf
     fi
     if [[ -d /etc/modules-load.d ]] && modprobe -n tcp_bbr >/dev/null 2>&1; then
-        printf 'tcp_bbr\n' > "$BBR_MODULES_FILE"
+        printf 'tcp_bbr\n' > "$BBR_TUNING_MODULES_FILE"
     fi
 
-    if ! sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || ! sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+    if ! sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || ! sysctl -w "net.ipv4.tcp_congestion_control=${algo}" >/dev/null 2>&1; then
         _bbr_cleanup_sysctl_files
         warn "failed to apply BBR via sysctl."
         return 1
@@ -1005,7 +1062,7 @@ bbr_enable() {
     local now_cc now_qdisc
     now_cc="$(_bbr_state)"
     now_qdisc="$(_bbr_qdisc)"
-    if [[ "$now_cc" == "bbr" ]]; then
+    if _bbr_is_enabled "$now_cc"; then
         ok "BBR is now enabled (congestion=${now_cc}, qdisc=${now_qdisc})."
         return 0
     fi
@@ -1014,6 +1071,10 @@ bbr_enable() {
 }
 
 bbr_disable() {
+    if [[ -x "${BIN:-}" ]]; then
+        "$BIN" bbr disable
+        return $?
+    fi
     command -v sysctl >/dev/null 2>&1 || { warn "'sysctl' command not found; cannot configure BBR."; return 1; }
     if [[ -e /proc/sys/net/ipv4/tcp_congestion_control && ! -w /proc/sys/net/ipv4/tcp_congestion_control ]]; then
         warn "/proc/sys/net/ipv4/tcp_congestion_control is read-only on this host/container."
@@ -1034,14 +1095,14 @@ bbr_disable() {
         return 1
     fi
     sysctl --system >/dev/null 2>&1 || sysctl -p >/dev/null 2>&1 || true
-    if [[ "$(_bbr_state)" == "bbr" ]]; then
+    if _bbr_is_enabled "$(_bbr_state)"; then
         sysctl -w "net.ipv4.tcp_congestion_control=${fallback_cc}" >/dev/null 2>&1 || true
     fi
 
     local now_cc now_qdisc
     now_cc="$(_bbr_state)"
     now_qdisc="$(_bbr_qdisc)"
-    if [[ "$now_cc" != "bbr" ]]; then
+    if ! _bbr_is_enabled "$now_cc"; then
         ok "BBR is now disabled (congestion=${now_cc}, qdisc=${now_qdisc})."
         return 0
     fi
@@ -1056,16 +1117,20 @@ item_bbr() {
         hr
         bbr_status
         hr
-        printf '    %s1)%s  Enable BBR\n'  "$GREEN" "$R"
-        printf '    %s2)%s  Disable BBR\n' "$GREEN" "$R"
+        printf '    %s1)%s  Enable Standard BBR (fq + bbr)\n' "$GREEN" "$R"
+        printf '    %s2)%s  Enable VPN High-Throughput + Low-Latency Profile\n' "$GREEN" "$R"
+        printf '    %s3)%s  Disable BBR (default congestion control)\n' "$GREEN" "$R"
+        printf '    %s4)%s  Revert to Pre-Tuning Backup\n' "$GREEN" "$R"
         printf '    %s0)%s  Back to main menu\n' "$GREEN" "$R"
         hr
-        printf '  choose [0-2]: '
+        printf '  choose [0-4]: '
         read -r sub || { printf '\n'; return 0; }
         printf '\n'
         case "$sub" in
-            1) bbr_enable  || true; pause ;;
-            2) bbr_disable || true; pause ;;
+            1) bbr_apply_profile bbr             || true; pause ;;
+            2) bbr_apply_profile vpn-performance || true; pause ;;
+            3) bbr_apply_profile disable         || true; pause ;;
+            4) bbr_apply_profile revert          || true; pause ;;
             0) return 0 ;;
             "") continue ;;
             *) warn "invalid choice: '${sub}'" ;;
@@ -1084,8 +1149,8 @@ show_menu() {
     panel="stopped"
     [[ "$(info_get panelRunning)" == "true" ]] && panel="running"
     bbr_cc="$(_bbr_state)"
-    if [[ "$bbr_cc" == "bbr" ]]; then
-        bbr_badge="${GREEN}[on]${R}"
+    if _bbr_is_enabled "$bbr_cc"; then
+        bbr_badge="${GREEN}[${bbr_cc}]${R}"
     else
         bbr_badge="${YELLOW}[off]${R}"
     fi
@@ -1155,8 +1220,8 @@ usage: ${0##*/}            open the management menu
        ${0##*/} update     update panel (supports --local <path>, --mirror <url>, --repo <o/r>, --force)
        ${0##*/} ssl        issue/install a Let's Encrypt certificate (non-interactive
                            with DEPLOY_DOMAIN=... DEPLOY_EMAIL=...)
-       ${0##*/} bbr [enable|disable|status]
-                           enable, disable or inspect TCP BBR congestion control
+       ${0##*/} bbr [status|enable|vpn-performance|disable|revert]
+                           inspect or configure TCP BBR / VPN network stack tuning
        ${0##*/} --help     this message
 
 environment:
@@ -1212,10 +1277,12 @@ main() {
             ;;
         bbr)
             case "${2:-status}" in
-                enable|on)   require_root "$@"; bbr_enable  ; return $? ;;
-                disable|off) require_root "$@"; bbr_disable ; return $? ;;
-                status|"")   bbr_status; return 0 ;;
-                *)           die "unknown bbr subcommand '${2}'. Use: enable, disable, or status." ;;
+                enable|on|bbr)           require_root "$@"; bbr_apply_profile bbr             ; return $? ;;
+                vpn-performance|perf|hi) require_root "$@"; bbr_apply_profile vpn-performance ; return $? ;;
+                disable|off|default)     require_root "$@"; bbr_apply_profile disable         ; return $? ;;
+                revert)                  require_root "$@"; bbr_apply_profile revert          ; return $? ;;
+                status|"")               bbr_status; return 0 ;;
+                *)                       die "unknown bbr subcommand '${2}'. Use: status, enable, vpn-performance, disable, or revert." ;;
             esac
             ;;
         "") ;;

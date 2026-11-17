@@ -12,7 +12,8 @@ import (
 // CoreController exposes status and control for the backend "cores"
 // (Xray, L2TP/IPsec, PPTP, OpenVPN, RADIUS) shown in the Core Settings panel.
 type CoreController struct {
-	coreService service.CoreService
+	coreService          service.CoreService
+	networkTuningService service.NetworkTuningService
 }
 
 // NewCoreController creates a new CoreController and initializes its routes.
@@ -52,6 +53,9 @@ func (a *CoreController) initRouter(g *gin.RouterGroup) {
 	g.GET("/upstream/:core", a.upstreamVersions)
 	g.POST("/update/:core", requireSuperAdmin(), a.updateCore)
 	g.POST("/rollback/:core", requireSuperAdmin(), a.rollbackCore)
+	g.GET("/network-tuning", a.networkTuningStatus)
+	g.POST("/network-tuning/apply", requireSuperAdmin(), a.networkTuningApply)
+	g.POST("/network-tuning/revert", requireSuperAdmin(), a.networkTuningRevert)
 }
 
 // status returns the status of all cores plus the host/kernel system status and
@@ -78,15 +82,22 @@ func (a *CoreController) catalog(c *gin.Context) {
 	}, nil)
 }
 
-// selectedCores reads the `cores` form field, a comma-separated list of core
-// names. Absent or empty means "every installable core", which is what the
-// legacy all-in-one setup button sent and what the CLI still wants.
+// selectedCores reads the `cores` field from JSON or form bodies: accepts either a
+// comma-separated string or a JSON/form array of core names. Absent or empty means
+// "every installable core", matching both legacy callers and modern JSON SPA clients.
 func selectedCores(c *gin.Context) []string {
-	raw := c.PostForm("cores")
+	var parts []string
+	if arr := postParamArray(c, "cores"); len(arr) > 0 {
+		parts = arr
+	} else if raw := postParam(c, "cores"); raw != "" {
+		parts = []string{raw}
+	}
 	var out []string
-	for _, p := range strings.Split(raw, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
+	for _, entry := range parts {
+		for _, p := range strings.Split(entry, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
 		}
 	}
 	return out
@@ -135,7 +146,7 @@ func (a *CoreController) uninstallCores(c *gin.Context) {
 	// inbounds": "delete" removes them with the core, "keep" strands them on
 	// purpose. Absent means the question was never asked, and the service still
 	// refuses - so an old client cannot strand inbounds by omission.
-	started, err := a.coreService.StartCoreUninstall(cores, c.PostForm("inbounds"))
+	started, err := a.coreService.StartCoreUninstall(cores, postParam(c, "inbounds"))
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.core.toasts.uninstalled"), err)
 		return
@@ -260,17 +271,19 @@ func (a *CoreController) saveCoreConfig(c *gin.Context) {
 }
 
 type coreBinaryUpdateForm struct {
-	Version string `form:"version" json:"version"`
-	URL     string `form:"url" json:"url"`
-	File    string `form:"file" json:"file"`
-	SHA256  string `form:"sha256" json:"sha256"`
+	Version        string `form:"version" json:"version"`
+	URL            string `form:"url" json:"url"`
+	File           string `form:"file" json:"file"`
+	SHA256         string `form:"sha256" json:"sha256"`
+	AllowUnpatched bool   `form:"allowUnpatched" json:"allowUnpatched"`
 }
 
 // versions returns active paths, sources (custom-override vs bundled), versions,
-// SHA-256 checksums, and backup availability for all managed sidecar binaries.
+// SHA-256 checksums, backup availability, and full 12-protocol engine diagnostics.
 func (a *CoreController) versions(c *gin.Context) {
 	jsonObj(c, gin.H{
 		"binaries": a.coreService.GetCoreBinaryInventory(),
+		"engines":  a.coreService.GetDaemonVersions(),
 	}, nil)
 }
 
@@ -284,14 +297,17 @@ func (a *CoreController) upstreamVersions(c *gin.Context) {
 		return
 	}
 	jsonObj(c, gin.H{
-		"core":          spec.Target,
-		"serviceCore":   spec.ServiceCore,
-		"protocols":     spec.Protocols,
-		"upstreamRepo":  spec.GithubRepo,
-		"upstreamUrl":   spec.UpstreamURL,
-		"updateMode":    spec.UpdateMode,
-		"autoUpdatable": service.CanAutoUpdateTarget(spec.Target),
-		"releases":      releases,
+		"core":            spec.Target,
+		"serviceCore":     spec.ServiceCore,
+		"protocols":       spec.Protocols,
+		"upstreamRepo":    spec.GithubRepo,
+		"upstreamUrl":     spec.UpstreamURL,
+		"updateMode":      spec.UpdateMode,
+		"autoUpdatable":   service.CanAutoUpdateTarget(spec.Target),
+		"customPatched":   spec.CustomPatched,
+		"patchSet":        spec.PatchSet,
+		"upstreamWarning": spec.UpstreamWarning,
+		"releases":        releases,
 	}, nil)
 }
 
@@ -302,15 +318,17 @@ func (a *CoreController) updateCore(c *gin.Context) {
 	var form coreBinaryUpdateForm
 	_ = c.ShouldBind(&form)
 	results, err := a.coreService.UpdateCore(service.CoreUpdateOptions{
-		Target:  c.Param("core"),
-		Version: form.Version,
-		URL:     form.URL,
-		File:    form.File,
-		SHA256:  form.SHA256,
+		Target:         c.Param("core"),
+		Version:        form.Version,
+		URL:            form.URL,
+		File:           form.File,
+		SHA256:         form.SHA256,
+		AllowUnpatched: form.AllowUnpatched,
 	})
 	jsonMsgObj(c, "Core binary update", gin.H{
 		"results":  results,
 		"binaries": a.coreService.GetCoreBinaryInventory(),
+		"engines":  a.coreService.GetDaemonVersions(),
 	}, err)
 }
 
@@ -321,5 +339,29 @@ func (a *CoreController) rollbackCore(c *gin.Context) {
 	jsonMsgObj(c, "Core binary rollback", gin.H{
 		"result":   res,
 		"binaries": a.coreService.GetCoreBinaryInventory(),
+		"engines":  a.coreService.GetDaemonVersions(),
 	}, err)
+}
+
+type networkTuningApplyForm struct {
+	Profile string `form:"profile" json:"profile"`
+}
+
+// networkTuningStatus reports live BBR/qdisc/sysctl stack state and container writability.
+func (a *CoreController) networkTuningStatus(c *gin.Context) {
+	jsonObj(c, a.networkTuningService.GetStatus(), nil)
+}
+
+// networkTuningApply applies the selected BBR / network stack tuning profile.
+func (a *CoreController) networkTuningApply(c *gin.Context) {
+	var form networkTuningApplyForm
+	_ = c.ShouldBind(&form)
+	res, err := a.networkTuningService.ApplyProfile(form.Profile)
+	jsonMsgObj(c, "Network stack tuning", res, err)
+}
+
+// networkTuningRevert restores sysctls captured before vpn-ui network tuning.
+func (a *CoreController) networkTuningRevert(c *gin.Context) {
+	res, err := a.networkTuningService.Revert()
+	jsonMsgObj(c, "Network stack revert", res, err)
 }

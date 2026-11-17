@@ -201,9 +201,10 @@ var (
 	daemonVersionMu    sync.Mutex
 )
 
-// daemonVersion returns a short version string (e.g. "2.6.12") for a bundled or
-// host daemon by running `<bin> --version` and grabbing the first version-shaped
-// token. Output is read regardless of exit code (some daemons exit non-zero on
+// daemonVersion returns a short version string (e.g. "2.6.23") for a bundled or
+// host daemon using per-binary version flags (`version` for sing-box, `-v` for
+// pptpd, `-version` for xray, `--version`/`-v` for xl2tpd, etc.) with a bounded
+// timeout. Output is read regardless of exit code (some daemons exit non-zero on
 // --version). Successful lookups are cached; "" is returned (and not cached) when
 // the daemon isn't available, so it retries once it's installed.
 func daemonVersion(name string) string {
@@ -214,25 +215,11 @@ func daemonVersion(name string) string {
 	}
 	daemonVersionMu.Unlock()
 
-	bin := ""
-	if p := backend.DaemonPath(name); p != "" {
-		bin = p
-	} else if p := backend.AccelBinPath(name); p != "" {
-		// accel-ppp (SSTP) ships as a relocatable tree bundle, not a flat BinDir
-		// binary, so its launchers resolve here — mirrors daemonBin().
-		bin = p
-	} else if p := backend.StrongswanBinPath(name); p != "" {
-		// strongSwan (IKEv2) also ships as a relocatable tree bundle, so the bundled
-		// charon launcher resolves here — otherwise `charon --version` (a "strongSwan
-		// 5.9.14" line) is never run and the IKEv2 core version shows as "—".
-		bin = p
-	} else if p, err := exec.LookPath(name); err == nil {
-		bin = p
-	} else {
+	bin := resolveDaemonExecutablePath(name)
+	if bin == "" {
 		return ""
 	}
-	out, _ := exec.Command(bin, "--version").CombinedOutput()
-	v := daemonVersionRe.FindString(string(out))
+	v, _ := probeDaemonBinaryVersion(name, bin)
 	if v != "" {
 		daemonVersionMu.Lock()
 		daemonVersionCache[name] = v

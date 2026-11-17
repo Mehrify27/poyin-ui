@@ -1,8 +1,12 @@
 package controller
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/mhsanaei/3x-ui/v2/config"
@@ -15,6 +19,143 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/web/session"
 )
+
+const jsonBodyCacheKey = "_vpnui_cached_json_body"
+
+const maxJSONParamBodyBytes = 4 << 20 // 4 MiB guard for request parameter parsing
+
+// JSONBodyPreserver caches and rewinds JSON request bodies so handlers that mix
+// ShouldBind and form-style parameter lookups work transparently for both
+// application/json and application/x-www-form-urlencoded callers.
+func JSONBodyPreserver() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		cacheJSONBody(c)
+		c.Next()
+	}
+}
+
+func isJSONContentType(c *gin.Context) bool {
+	if c == nil || c.Request == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(c.GetHeader("Content-Type")), "application/json")
+}
+
+// cacheJSONBody reads an application/json body once (if not already cached),
+// stores its decoded map on the Gin context, and restores c.Request.Body so
+// subsequent c.ShouldBind calls continue to read the untouched JSON payload.
+func cacheJSONBody(c *gin.Context) map[string]any {
+	if c == nil || c.Request == nil || c.Request.Body == nil || !isJSONContentType(c) {
+		return nil
+	}
+	if cached, ok := c.Get(jsonBodyCacheKey); ok {
+		if m, ok2 := cached.(map[string]any); ok2 {
+			return m
+		}
+		return nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(c.Request.Body, maxJSONParamBodyBytes))
+	c.Request.Body = io.NopCloser(bytes.NewReader(raw))
+	if err != nil || len(bytes.TrimSpace(raw)) == 0 {
+		c.Set(jsonBodyCacheKey, map[string]any(nil))
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var parsed map[string]any
+	if err := dec.Decode(&parsed); err != nil {
+		c.Set(jsonBodyCacheKey, map[string]any(nil))
+		return nil
+	}
+	c.Set(jsonBodyCacheKey, parsed)
+	return parsed
+}
+
+// bindRequest binds either JSON or form/query parameters after ensuring any
+// JSON payload is preserved for postParam / postParamArray lookups.
+func bindRequest(c *gin.Context, dst any) error {
+	cacheJSONBody(c)
+	return c.ShouldBind(dst)
+}
+
+func stringifyJSONScalar(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case json.Number:
+		return t.String()
+	case bool:
+		return strconv.FormatBool(t)
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case int:
+		return strconv.Itoa(t)
+	case int64:
+		return strconv.FormatInt(t, 10)
+	default:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	}
+}
+
+// postParamExists reads a field from JSON body (if Content-Type is
+// application/json) or from Gin's form/urlencoded parser otherwise.
+func postParamExists(c *gin.Context, key string) (string, bool) {
+	if isJSONContentType(c) {
+		if m := cacheJSONBody(c); m != nil {
+			if val, exists := m[key]; exists {
+				return stringifyJSONScalar(val), true
+			}
+		}
+		return "", false
+	}
+	return c.GetPostForm(key)
+}
+
+// postParam reads a string parameter from either JSON or form-encoded requests.
+func postParam(c *gin.Context, key string) string {
+	v, _ := postParamExists(c, key)
+	return v
+}
+
+// postParamArray reads an array parameter from either JSON arrays/strings or
+// repeated form-encoded keys (c.PostFormArray).
+func postParamArray(c *gin.Context, key string) []string {
+	if isJSONContentType(c) {
+		m := cacheJSONBody(c)
+		if m == nil {
+			return nil
+		}
+		val, exists := m[key]
+		if !exists || val == nil {
+			return nil
+		}
+		switch arr := val.(type) {
+		case []any:
+			out := make([]string, 0, len(arr))
+			for _, item := range arr {
+				out = append(out, stringifyJSONScalar(item))
+			}
+			return out
+		case string:
+			if arr == "" {
+				return nil
+			}
+			return []string{arr}
+		default:
+			if s := stringifyJSONScalar(arr); s != "" {
+				return []string{s}
+			}
+			return nil
+		}
+	}
+	return c.PostFormArray(key)
+}
 
 // getRemoteIp extracts the client IP safely from the request, trusting forwarded
 // headers only when the immediate peer matches the configured trusted proxies.

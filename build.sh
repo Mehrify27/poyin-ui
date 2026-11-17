@@ -34,6 +34,7 @@ Skip work (iterating on Go code):
       --skip-submodules   don't touch third_party/*, build whatever is checked out
       --skip-core         reuse the cached Xray core AND geo files
       --skip-bundle       reuse the VPN daemon bundle even when it looks stale
+      --skip-frontend     reuse built web/frontend/dist assets without running npm build
 
 Force work (picking up new upstream):
       --latest            move the submodules to their tracked branch TIPS and rebuild
@@ -98,6 +99,7 @@ SUBMODULES_LATEST="${SUBMODULES_LATEST:-0}"
 SUBMODULES_UPDATE="${SUBMODULES_UPDATE:-0}"
 SKIP_BUNDLE=0
 FORCE_BUNDLE=0
+SKIP_FRONTEND="${SKIP_FRONTEND:-0}"
 DRY_RUN=0
 SKIP_DEPS="${SKIP_DEPS:-0}"
 STATIC="${STATIC:-1}"
@@ -113,6 +115,7 @@ while (( $# )); do
         --skip-submodules)   SKIP_SUBMODULES=1 ;;
         --skip-core)         SKIP_CORE=1 ;;
         --skip-bundle)       SKIP_BUNDLE=1 ;;
+        --skip-frontend)     SKIP_FRONTEND=1 ;;
         --skip-deps)         SKIP_DEPS=1 ;;
         --static)            STATIC=1 ;;
         --dynamic)           STATIC=0 ;;
@@ -508,6 +511,36 @@ build_panel_static() {
     fi
     ok "verified static ELF: ${file_desc}"
 }
+
+build_frontend_spa() {
+    if (( SKIP_FRONTEND )); then
+        step "frontend SPA bundle (skipped via --skip-frontend)"
+        if [[ ! -f "$REPO_ROOT/web/frontend/dist/index.html" ]]; then
+            warn "web/frontend/dist/index.html missing; Go binary will serve a build-required notice on /app/"
+        fi
+        return 0
+    fi
+    step "frontend SPA bundle (web/frontend)"
+    if (( DRY_RUN )); then
+        info "would run: (cd web/frontend && npm ci --no-audit --no-fund && npm run build)"
+        return 0
+    fi
+    if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+        err "node and npm are required to build web/frontend (install Node >= 20 or pass --skip-frontend)"
+        exit 1
+    fi
+    (
+        cd "$REPO_ROOT/web/frontend"
+        if [[ -f package-lock.json ]]; then
+            npm ci --no-audit --no-fund
+        else
+            npm install --no-audit --no-fund
+        fi
+        npm run build
+    )
+}
+
+build_frontend_spa
 
 step "compiling vpn-ui v${BUILD_VERSION}$( (( STATIC )) && printf ' [static/musl]' || printf ' [dynamic/host]' )"
 if (( DRY_RUN )); then

@@ -836,44 +836,23 @@ func (s *ServerService) sampleCPUUtilization() (float64, error) {
 }
 
 func (s *ServerService) GetXrayVersions() ([]string, error) {
-	const (
-		XrayURL    = "https://api.github.com/repos/XTLS/Xray-core/releases"
-		bufferSize = 8192
-	)
-
-	resp, err := http.Get(XrayURL)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	// Check HTTP status code - GitHub API returns object instead of array on error
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		var errorResponse struct {
-			Message string `json:"message"`
-		}
-		if json.Unmarshal(bodyBytes, &errorResponse) == nil && errorResponse.Message != "" {
-			return nil, fmt.Errorf("GitHub API error: %s", errorResponse.Message)
-		}
-		return nil, fmt.Errorf("GitHub API returned status %d: %s", resp.StatusCode, resp.Status)
-	}
-
-	buffer := bytes.NewBuffer(make([]byte, bufferSize))
-	buffer.Reset()
-	if _, err := buffer.ReadFrom(resp.Body); err != nil {
-		return nil, err
-	}
-
+	base := strings.TrimRight(githubReleaseAPIBase, "/")
+	xrayURL := fmt.Sprintf("%s/repos/XTLS/Xray-core/releases?per_page=100", base)
 	var releases []Release
-	if err := json.Unmarshal(buffer.Bytes(), &releases); err != nil {
+	headers := map[string]string{
+		"Accept":     "application/vnd.github+json",
+		"User-Agent": "vpn-ui/" + config.GetVersion(),
+	}
+	if err := fetchValidatedJSON(xrayURL, 20*time.Second, headers, &releases); err != nil {
 		return nil, err
 	}
 
 	var versions []string
 	for _, release := range releases {
 		tagVersion := strings.TrimPrefix(release.TagName, "v")
-		tagParts := strings.Split(tagVersion, ".")
+		// Strip prerelease/build metadata before comparing major.minor.patch.
+		baseVer := strings.SplitN(tagVersion, "-", 2)[0]
+		tagParts := strings.Split(baseVer, ".")
 		if len(tagParts) != 3 {
 			continue
 		}

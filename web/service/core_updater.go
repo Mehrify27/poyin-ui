@@ -50,6 +50,18 @@ var (
 	shortVersionTokenRe   = regexp.MustCompile(`\bv?\d+\.\d+(?:\.\d+)*(?:-[0-9A-Za-z.-]+)?`)
 )
 
+// XrayPatchList enumerates the custom patches baked into vpn-ui's bundled
+// Xray-core binary (patches/xray/01..06). Installing an unpatched upstream
+// XTLS/Xray-core release disables these features until rolled back.
+var XrayPatchList = []string{
+	"Shadowsocks per-user cipher fallback",
+	"Per-account rate limiter",
+	"Per-account IP limit enforcement",
+	"CanSpliceCopy=3 speedlimit splice disable",
+	"AnyTLS / TUIC / NaiveProxy protocols",
+	"Legacy reverse proxy support",
+}
+
 // CoreUpdateSpec describes a sidecar core/daemon binary that can be inspected,
 // updated independently of vpn-ui, and rolled back atomically.
 type CoreUpdateSpec struct {
@@ -61,6 +73,9 @@ type CoreUpdateSpec struct {
 	UpstreamURL             string
 	UpdateMode              string // "prebuilt" | "source-go" | "custom"
 	GoSourcePackage         string
+	CustomPatched           bool
+	PatchSet                []string
+	UpstreamWarning         string
 	AllowNonZeroVersionExit bool
 	VersionArgs             []string
 	ArchiveBinaryNames      []string
@@ -72,22 +87,25 @@ type CoreUpdateSpec struct {
 // CoreBinaryInfo reports active/bundled/override paths and metadata for one
 // managed binary.
 type CoreBinaryInfo struct {
-	Core             string `json:"core"`
-	ServiceCore      string `json:"serviceCore"`
-	Protocols        string `json:"protocols,omitempty"`
-	ActivePath       string `json:"activePath"`
-	BundledPath      string `json:"bundledPath"`
-	CustomPath       string `json:"customPath"`
-	CustomDir        string `json:"customDir"`
-	Source           string `json:"source"` // custom-override | bundled | host-path | missing
-	Version          string `json:"version"`
-	InstalledVersion string `json:"installedVersion,omitempty"`
-	SHA256           string `json:"sha256,omitempty"`
-	HasBackup        bool   `json:"hasBackup"`
-	UpstreamRepo     string `json:"upstreamRepo,omitempty"`
-	UpstreamURL      string `json:"upstreamUrl,omitempty"`
-	UpdateMode       string `json:"updateMode"`
-	AutoUpdatable    bool   `json:"autoUpdatable"`
+	Core             string   `json:"core"`
+	ServiceCore      string   `json:"serviceCore"`
+	Protocols        string   `json:"protocols,omitempty"`
+	ActivePath       string   `json:"activePath"`
+	BundledPath      string   `json:"bundledPath"`
+	CustomPath       string   `json:"customPath"`
+	CustomDir        string   `json:"customDir"`
+	Source           string   `json:"source"` // custom-override | bundled | host-path | missing
+	Version          string   `json:"version"`
+	InstalledVersion string   `json:"installedVersion,omitempty"`
+	SHA256           string   `json:"sha256,omitempty"`
+	HasBackup        bool     `json:"hasBackup"`
+	UpstreamRepo     string   `json:"upstreamRepo,omitempty"`
+	UpstreamURL      string   `json:"upstreamUrl,omitempty"`
+	UpdateMode       string   `json:"updateMode"`
+	AutoUpdatable    bool     `json:"autoUpdatable"`
+	CustomPatched    bool     `json:"customPatched"`
+	PatchSet         []string `json:"patchSet,omitempty"`
+	UpstreamWarning  string   `json:"upstreamWarning,omitempty"`
 }
 
 // CoreReleaseOption describes one upstream version available from the official repository.
@@ -112,6 +130,7 @@ type CoreUpdateOptions struct {
 	File             string
 	Version          string
 	SHA256           string
+	AllowUnpatched   bool
 	RestartFunc      func(serviceCore string) error
 	VerifyHealthFunc func(spec CoreUpdateSpec, destPath string) error
 }
@@ -140,6 +159,9 @@ var managedCoreUpdateSpecs = []CoreUpdateSpec{
 		GithubRepo:         "XTLS/Xray-core",
 		UpstreamURL:        "https://github.com/XTLS/Xray-core/releases",
 		UpdateMode:         "prebuilt",
+		CustomPatched:      true,
+		PatchSet:           XrayPatchList,
+		UpstreamWarning:    "Bundled Xray-core carries custom vpn-ui patches (CanSpliceCopy=3 speedlimit disable, AnyTLS, TUIC, NaiveProxy, Shadowsocks cipher fallback, legacy reverse). Installing unpatched upstream XTLS/Xray-core disables those patches.",
 		VersionArgs:        []string{"-version"},
 		ArchiveBinaryNames: []string{"xray"},
 		CustomFileFunc:     corebundle.XrayBinaryName,
@@ -166,6 +188,8 @@ var managedCoreUpdateSpecs = []CoreUpdateSpec{
 		GithubRepo:         "telemt/telemt",
 		UpstreamURL:        "https://github.com/telemt/telemt/releases",
 		UpdateMode:         "prebuilt",
+		PatchSet:           []string{"[access.user_modes]", "socks_user_from_account", "[general.modes] hot-reload"},
+		UpstreamWarning:    "Bundled telemt is built from Sir-MmD/telemt fork with [access.user_modes] per-account mode enforcement.",
 		VersionArgs:        []string{"--version"},
 		ArchiveBinaryNames: []string{"telemt"},
 		CustomFileFunc:     func() string { return "telemt" },
@@ -301,8 +325,39 @@ func SupportedCoreUpdateTargets() []string {
 	return out
 }
 
+type coreOverrideMeta struct {
+	CustomPatched  bool   `json:"customPatched"`
+	Source         string `json:"source,omitempty"`
+	Version        string `json:"version,omitempty"`
+	AllowUnpatched bool   `json:"allowUnpatched,omitempty"`
+}
+
+func coreMetaPath(destPath string) string {
+	return destPath + ".meta.json"
+}
+
+func readCoreOverrideMeta(destPath string) (coreOverrideMeta, bool) {
+	raw, err := os.ReadFile(coreMetaPath(destPath))
+	if err != nil {
+		return coreOverrideMeta{}, false
+	}
+	var m coreOverrideMeta
+	if json.Unmarshal(raw, &m) != nil {
+		return coreOverrideMeta{}, false
+	}
+	return m, true
+}
+
+func writeCoreOverrideMeta(destPath string, m coreOverrideMeta) {
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(coreMetaPath(destPath), raw, 0o644)
+}
+
 // GetCoreBinaryInventory reports active paths, bundled paths, override status,
-// backups, and detected versions for all managed sidecar binaries.
+// backups, patch metadata, and detected versions for all managed sidecar binaries.
 func (s *CoreService) GetCoreBinaryInventory() []CoreBinaryInfo {
 	customDir := binutil.CustomBinDir()
 	out := make([]CoreBinaryInfo, 0, len(managedCoreUpdateSpecs))
@@ -324,25 +379,44 @@ func (s *CoreService) GetCoreBinaryInventory() []CoreBinaryInfo {
 			}
 		}
 
+		isCustomPatched := spec.CustomPatched
+		if spec.Target == "telemt" && source == "bundled" {
+			isCustomPatched = true
+		}
+		if source == "custom-override" {
+			if meta, ok := readCoreOverrideMeta(customPath); ok {
+				isCustomPatched = meta.CustomPatched
+			}
+		} else if source == "host-path" && spec.CustomPatched {
+			isCustomPatched = false
+		}
+
 		_, bakErr := os.Stat(customPath + ".bak")
 		info := CoreBinaryInfo{
-			Core:          spec.Target,
-			ServiceCore:   spec.ServiceCore,
-			Protocols:     spec.Protocols,
-			ActivePath:    activePath,
-			BundledPath:   bundledPath,
-			CustomPath:    customPath,
-			CustomDir:     customDir,
-			Source:        source,
-			HasBackup:     bakErr == nil,
-			UpstreamRepo:  spec.GithubRepo,
-			UpstreamURL:   spec.UpstreamURL,
-			UpdateMode:    spec.UpdateMode,
-			AutoUpdatable: canAutoUpdateSpec(spec),
+			Core:            spec.Target,
+			ServiceCore:     spec.ServiceCore,
+			Protocols:       spec.Protocols,
+			ActivePath:      activePath,
+			BundledPath:     bundledPath,
+			CustomPath:      customPath,
+			CustomDir:       customDir,
+			Source:          source,
+			HasBackup:       bakErr == nil,
+			UpstreamRepo:    spec.GithubRepo,
+			UpstreamURL:     spec.UpstreamURL,
+			UpdateMode:      spec.UpdateMode,
+			AutoUpdatable:   canAutoUpdateSpec(spec),
+			CustomPatched:   isCustomPatched,
+			PatchSet:        append([]string(nil), spec.PatchSet...),
+			UpstreamWarning: spec.UpstreamWarning,
 		}
 		if activePath != "" {
-			info.Version = probeBinaryVersion(activePath, spec.VersionArgs)
-			info.InstalledVersion = extractVersionToken(info.Version)
+			tok, banner := probeDaemonBinaryVersion(spec.Target, activePath)
+			info.Version = firstNonEmptyString(banner, probeBinaryVersion(activePath, spec.VersionArgs))
+			info.InstalledVersion = firstNonEmptyString(tok, extractVersionToken(info.Version))
+			if meta, ok := readCoreOverrideMeta(customPath); ok && source == "custom-override" && info.InstalledVersion == "" {
+				info.InstalledVersion = meta.Version
+			}
 			if sum, err := binutil.FileSHA256(activePath); err == nil {
 				info.SHA256 = sum
 			}
@@ -443,6 +517,15 @@ func (s *CoreService) UpdateCore(opts CoreUpdateOptions) ([]CoreUpdateResult, er
 			})
 			continue
 		}
+		if norm == "all" && spec.CustomPatched && !opts.AllowUnpatched {
+			results = append(results, CoreUpdateResult{
+				Target:      spec.Target,
+				ServiceCore: spec.ServiceCore,
+				Status:      "skipped",
+				Message:     "custom-patched core protected from bulk vanilla upstream replacement (update individually with allowUnpatched or supply a patched build)",
+			})
+			continue
+		}
 		res, err := s.updateSingleCore(spec, opts, restartFn, verifyFn)
 		results = append(results, res)
 		if err != nil && firstErr == nil {
@@ -492,6 +575,10 @@ func (s *CoreService) updateSingleCore(
 		if spec.UpdateMode == "custom" || spec.GithubRepo == "" {
 			return res, fmt.Errorf("%s (%s) has no prebuilt upstream binary releases; choose a Custom URL or local binary file", spec.Target, spec.Protocols)
 		}
+		if spec.CustomPatched && !opts.AllowUnpatched {
+			return res, fmt.Errorf("%s carries custom vpn-ui patches (%s); refusing silent overwrite with unpatched upstream %s — pass allowUnpatched=true (--allow-unpatched) to confirm replacement or provide a custom-patched URL/file",
+				spec.Target, strings.Join(spec.PatchSet, ", "), spec.GithubRepo)
+		}
 		dlURL, ghDigest, resolvedTag, err := resolveGithubReleaseAsset(spec, opts.Version)
 		if err == nil && dlURL != "" {
 			sourceLabel = dlURL
@@ -511,7 +598,7 @@ func (s *CoreService) updateSingleCore(
 			if _, gerr := exec.LookPath("go"); gerr != nil {
 				return res, fmt.Errorf("%s (%s) publishes source tags only (no prebuilt Linux binaries); install Go toolchain on host to build %s or supply Custom URL/file", spec.Target, spec.GithubRepo, tag)
 			}
-			if berr := buildGoSourceBinary(spec, tarballURL, stagedExec); berr != nil {
+			if berr := buildGoSourceBinary(spec, tag, tarballURL, stagedExec); berr != nil {
 				return res, fmt.Errorf("build %s (%s) from source: %w", spec.Target, tag, berr)
 			}
 			sourceLabel = tarballURL
@@ -581,6 +668,17 @@ func (s *CoreService) updateSingleCore(
 		return rollbackWithReason(err)
 	}
 
+	isPatchedResult := spec.CustomPatched
+	if strings.TrimSpace(opts.URL) == "" && strings.TrimSpace(opts.File) == "" && spec.CustomPatched {
+		isPatchedResult = false
+	}
+	writeCoreOverrideMeta(dest, coreOverrideMeta{
+		CustomPatched:  isPatchedResult,
+		Source:         sourceLabel,
+		Version:        res.Version,
+		AllowUnpatched: opts.AllowUnpatched,
+	})
+
 	res.Status = "updated"
 	res.Message = fmt.Sprintf("%s updated at %s and %s restarted cleanly", spec.Target, dest, spec.ServiceCore)
 	logger.Infof("core-updater: %s", res.Message)
@@ -618,6 +716,7 @@ func (s *CoreService) RollbackCore(target string, restartFn func(string) error) 
 		if err := binutil.RestoreBinary(dest, "", false); err != nil {
 			return res, fmt.Errorf("remove custom override %s: %w", dest, err)
 		}
+		_ = os.Remove(coreMetaPath(dest))
 		invalidateDaemonVersionCache(spec.CustomFileFunc())
 		res.Source = "bundled-fallback"
 		res.Message = fmt.Sprintf("removed custom override %s; reverted to bundled binary", dest)
@@ -776,26 +875,108 @@ func markLatestUpstreamOption(items []CoreReleaseOption) {
 }
 
 func doJSONGet(rawURL string, out any) error {
-	client := &http.Client{Timeout: 25 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, config.ApplyGHProxy(rawURL), nil)
+	headers := map[string]string{
+		"Accept":     "application/vnd.github+json, application/json",
+		"User-Agent": "vpn-ui-core-updater/" + config.GetVersion(),
+	}
+	return fetchValidatedJSON(rawURL, 25*time.Second, headers, out)
+}
+
+// fetchValidatedJSON downloads rawURL (applying any configured GH proxy), enforces
+// HTTP 200, detects HTML proxy/challenge pages or GitHub API JSON error objects
+// before calling json.Unmarshal, and returns crisp human-readable errors.
+func fetchValidatedJSON(rawURL string, timeout time.Duration, headers map[string]string, out any) error {
+	targetURL := config.ApplyGHProxy(rawURL)
+	client := &http.Client{Timeout: timeout}
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "vpn-ui-core-updater")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	body, rerr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || rerr != nil {
-		if rerr != nil {
-			return rerr
+	if rerr != nil {
+		return fmt.Errorf("read response from %s: %w", rawURL, rerr)
+	}
+
+	trimmed := trimUTF8BOMAndSpace(body)
+	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+
+	if resp.StatusCode != http.StatusOK {
+		if msg := extractJSONErrorMessage(trimmed); msg != "" {
+			return fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, rawURL, msg)
+		}
+		if looksLikeHTMLPayload(contentType, trimmed) {
+			return fmt.Errorf("HTTP %d from %s returned HTML instead of JSON (mirror/proxy error or rate-limit page)", resp.StatusCode, rawURL)
 		}
 		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, rawURL)
 	}
-	return json.Unmarshal(body, out)
+
+	if len(trimmed) == 0 {
+		return fmt.Errorf("empty JSON response from %s", rawURL)
+	}
+	if looksLikeHTMLPayload(contentType, trimmed) {
+		return fmt.Errorf("upstream %s returned HTML instead of JSON (content-type: %s — check mirror, proxy, or firewall)", rawURL, firstNonEmptyString(contentType, "unknown"))
+	}
+	if !json.Valid(trimmed) {
+		if msg := extractJSONErrorMessage(trimmed); msg != "" {
+			return fmt.Errorf("API error from %s: %s", rawURL, msg)
+		}
+		return fmt.Errorf("invalid JSON response from %s (content-type: %s)", rawURL, firstNonEmptyString(contentType, "unknown"))
+	}
+	if err := json.Unmarshal(trimmed, out); err != nil {
+		if msg := extractJSONErrorMessage(trimmed); msg != "" {
+			return fmt.Errorf("API error from %s: %s", rawURL, msg)
+		}
+		return fmt.Errorf("decode response from %s: %w", rawURL, err)
+	}
+	return nil
+}
+
+func trimUTF8BOMAndSpace(b []byte) []byte {
+	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+	return bytes.TrimSpace(b)
+}
+
+func looksLikeHTMLPayload(contentType string, trimmed []byte) bool {
+	if strings.Contains(contentType, "text/html") || strings.Contains(contentType, "application/xhtml") {
+		return true
+	}
+	if len(trimmed) == 0 {
+		return false
+	}
+	if trimmed[0] == '<' {
+		return true
+	}
+	head := strings.ToLower(string(trimmed[:min(len(trimmed), 128)]))
+	return strings.HasPrefix(head, "<!doctype") || strings.HasPrefix(head, "<html")
+}
+
+func extractJSONErrorMessage(trimmed []byte) string {
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return ""
+	}
+	var errObj struct {
+		Message          string `json:"message"`
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+	}
+	if json.Unmarshal(trimmed, &errObj) != nil {
+		return ""
+	}
+	for _, msg := range []string{errObj.Message, errObj.ErrorDescription, errObj.Error} {
+		msg = strings.TrimSpace(msg)
+		if msg != "" {
+			return msg
+		}
+	}
+	return ""
 }
 
 func fetchGithubReleasesOrTags(spec CoreUpdateSpec) ([]CoreReleaseOption, error) {
@@ -946,7 +1127,7 @@ func resolveGoTagTarball(spec CoreUpdateSpec, requestedVersion string) (tag stri
 	return "", "", fmt.Errorf("version %q not found in upstream tags for %s", ver, spec.GithubRepo)
 }
 
-func buildGoSourceBinary(spec CoreUpdateSpec, tarballURL, destExec string) error {
+func buildGoSourceBinary(spec CoreUpdateSpec, versionTag, tarballURL, destExec string) error {
 	srcArchive := destExec + ".src.tar.gz"
 	if err := downloadArtifact(tarballURL, srcArchive); err != nil {
 		return err
@@ -962,9 +1143,14 @@ func buildGoSourceBinary(spec CoreUpdateSpec, tarballURL, destExec string) error
 	if err != nil {
 		return err
 	}
+	ldflags := "-s -w"
+	if spec.Target == "amneziawg-go" && strings.TrimSpace(versionTag) != "" {
+		ver := strings.TrimPrefix(strings.TrimSpace(versionTag), "v")
+		ldflags = fmt.Sprintf("-X main.Version=%s -s -w", ver)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags=-s -w", "-o", destExec, spec.GoSourcePackage)
+	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags="+ldflags, "-o", destExec, spec.GoSourcePackage)
 	cmd.Dir = modDir
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
 	out, err := cmd.CombinedOutput()
@@ -1104,6 +1290,26 @@ func resolveGithubReleaseAsset(spec CoreUpdateSpec, requestedVersion string) (do
 		lastErr = nil
 		break
 	}
+	if lastErr != nil && ver == "" {
+		// Some repos have pre-releases only where /releases/latest returns 404.
+		var rels []githubReleasePayload
+		if rerr := doJSONGet(fmt.Sprintf("%s/repos/%s/releases?per_page=10", base, spec.GithubRepo), &rels); rerr == nil && len(rels) > 0 {
+			for _, cand := range rels {
+				if cand.Draft || cand.TagName == "" {
+					continue
+				}
+				if !cand.Prerelease {
+					rel = cand
+					lastErr = nil
+					break
+				}
+				if rel.TagName == "" {
+					rel = cand
+					lastErr = nil
+				}
+			}
+		}
+	}
 	if lastErr != nil {
 		return "", "", "", lastErr
 	}
@@ -1148,7 +1354,12 @@ func scoreReleaseAsset(target, filename, goarch string) int {
 		if strings.Contains(lower, "arm64") || strings.Contains(lower, "aarch64") {
 			return -1
 		}
-		archTokens = []string{"armv7", "arm-v7", "armv6", "arm"}
+		archTokens = []string{"armv7", "arm-v7", "arm32-v7a", "armv6", "arm"}
+	case "386":
+		if strings.Contains(lower, "x86_64") || strings.Contains(lower, "amd64") || strings.Contains(lower, "linux-64") {
+			return -1
+		}
+		archTokens = []string{"linux-32", "386", "i386", "x86"}
 	default:
 		archTokens = []string{goarch}
 	}
@@ -1258,6 +1469,9 @@ func downloadArtifact(rawURL, destPath string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d downloading %s", resp.StatusCode, rawURL)
 	}
+	if ct := strings.ToLower(resp.Header.Get("Content-Type")); strings.Contains(ct, "text/html") {
+		return fmt.Errorf("download %s returned HTML page instead of binary/archive (content-type: %s)", rawURL, ct)
+	}
 
 	out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -1282,7 +1496,7 @@ func extractExecutableFromArtifact(artifactPath, destPath string, wantedNames []
 	if err != nil {
 		return err
 	}
-	hdr := make([]byte, 4)
+	hdr := make([]byte, 32)
 	n, _ := io.ReadFull(f, hdr)
 	_ = f.Close()
 	if n < 2 {
@@ -1296,6 +1510,8 @@ func extractExecutableFromArtifact(artifactPath, destPath string, wantedNames []
 		return extractFromZip(artifactPath, destPath, wantedNames)
 	case hdr[0] == 0x1f && hdr[1] == 0x8b:
 		return extractFromGzipOrTarGz(artifactPath, destPath, wantedNames)
+	case len(bytes.TrimSpace(hdr[:n])) > 0 && bytes.TrimSpace(hdr[:n])[0] == '<':
+		return errors.New("downloaded artifact appears to be HTML/XML instead of an ELF binary or archive")
 	default:
 		// Allow other archive extensions or fail clearly if non-ELF.
 		if strings.HasSuffix(strings.ToLower(artifactPath), ".zip") {
@@ -1385,7 +1601,7 @@ func extractFromGzipOrTarGz(gzPath, destPath string, wantedNames []string) error
 			_ = f.Close()
 			return extractPlainGzip(gzPath, destPath)
 		}
-		if hdr.Typeflag != tar.TypeReg {
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
 			continue
 		}
 		if !matchesBinaryCandidate(hdr.Name, wantedNames) {

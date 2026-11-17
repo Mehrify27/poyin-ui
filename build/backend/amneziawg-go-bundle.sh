@@ -9,7 +9,7 @@ case "$GOARCH_TARGET" in
     aarch64) GOARCH_TARGET=arm64 ;;
 esac
 
-AWG_GO_VERSION="${AWG_GO_VERSION:-v0.2.16}"
+AWG_GO_VERSION="${AWG_GO_VERSION:-v3.1.20261116}"
 AWG_GO_REPO="${AWG_GO_REPO:-https://github.com/amnezia-vpn/amneziawg-go.git}"
 
 apk add --no-cache git >/dev/null 2>&1 || true
@@ -25,5 +25,5 @@ fi
 
 cd "$WORK/src"
 CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH_TARGET" \
-    go build -trimpath -ldflags="-s -w" -o /out/amneziawg-go .
+    go build -trimpath -ldflags="-X main.Version=${AWG_GO_VERSION#v} -s -w" -o /out/amneziawg-go .
 chmod 0755 /out/amneziawg-go

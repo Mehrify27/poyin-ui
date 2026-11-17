@@ -58,6 +58,11 @@ corebundle/core/*
 backend/bin/*
 !backend/bin/.gitkeep
 
+# Built Vite Vue 3 SPA bundle (built by build.sh / CI / npm run build)
+!web/frontend/dist/
+web/frontend/dist/*
+!web/frontend/dist/.gitkeep
+
 # Runtime state + local working dirs (regenerate on run/test — never commit).
 # vpn-ui.db holds panel credentials; the old x-ui.db rule missed it post-rebrand.
 /vpn-ui.db

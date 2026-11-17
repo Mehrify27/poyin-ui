@@ -8,7 +8,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -126,30 +125,12 @@ func (s *ServerService) CheckPanelUpdate() (*PanelUpdateInfo, error) {
 	cur := config.GetVersion()
 	info := &PanelUpdateInfo{Current: cur, Latest: cur}
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	apiURL := PanelLatestAPIURL()
-	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
-	if err != nil {
-		return info, err
-	}
-	req.Header.Set("User-Agent", "vpn-ui") // GitHub API rejects requests without a UA
-	req.Header.Set("Accept", "application/vnd.github+json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return info, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return info, fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return info, err
-	}
 	var rel Release
-	if err := json.Unmarshal(body, &rel); err != nil {
+	headers := map[string]string{
+		"Accept":     "application/vnd.github+json",
+		"User-Agent": "vpn-ui/" + cur,
+	}
+	if err := fetchValidatedJSON("https://api.github.com/repos/"+PanelRepo()+"/releases/latest", 10*time.Second, headers, &rel); err != nil {
 		return info, err
 	}
 

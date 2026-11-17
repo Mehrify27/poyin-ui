@@ -7,8 +7,8 @@ func TestGetVersionStrictlyAbove194(t *testing.T) {
 	if !IsNewerSemVer(v, "1.9.4") {
 		t.Fatalf("GetVersion() = %q; want strictly newer than 1.9.4", v)
 	}
-	if v != "2.0.1" {
-		t.Fatalf("GetVersion() = %q; want 2.0.1", v)
+	if v != "2.0.2" {
+		t.Fatalf("GetVersion() = %q; want 2.0.2", v)
 	}
 
 	origLD := ldVersion

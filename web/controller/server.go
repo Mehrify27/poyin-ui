@@ -26,9 +26,10 @@ var filenameRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-.]+$`)
 type ServerController struct {
 	BaseController
 
-	serverService  service.ServerService
-	settingService service.SettingService
-	inboundService service.InboundService
+	serverService    service.ServerService
+	settingService   service.SettingService
+	inboundService   service.InboundService
+	bootstrapCtrl    BootstrapController
 
 	lastStatus *service.Status
 
@@ -56,6 +57,8 @@ func NewServerController(g *gin.RouterGroup) *ServerController {
 func (a *ServerController) initRouter(g *gin.RouterGroup) {
 
 	g.GET("/status", a.status)
+	g.GET("/bootstrap", a.bootstrapCtrl.GetBootstrap)
+	g.GET("/capabilities", a.bootstrapCtrl.GetCapabilities)
 	g.GET("/userStats", a.userStats)
 	g.GET("/serverName", a.getServerName)
 	g.GET("/panelLocation", a.panelLocation)
@@ -125,8 +128,6 @@ func (a *ServerController) initRouter(g *gin.RouterGroup) {
 	// consulted, and where the Xray permission is the right question.
 	g.POST("/updateGeofile", requireOverviewManage(), a.updateGeofile)
 	g.POST("/updateGeofile/:fileName", requireOverviewManage(), a.updateGeofile)
-	// Whether the panel refreshes the geo data on its own. Same dialog, same bit.
-	g.POST("/geofileAutoUpdate", requireOverviewManage(), a.setGeofileAutoUpdate)
 	// Panel and Xray logs name other admins' inbounds, clients and IPs.
 	g.POST("/logs/:count", requireOverviewManage(), a.getLogs)
 	g.POST("/xraylogs/:count", requireOverviewManage(), a.getXrayLogs)
@@ -186,7 +187,7 @@ func (a *ServerController) getServerName(c *gin.Context) {
 // setServerName persists the operator's label for this server. Posting an empty
 // value clears it and returns the overview to the host name.
 func (a *ServerController) setServerName(c *gin.Context) {
-	name := strings.TrimSpace(c.PostForm("serverName"))
+	name := strings.TrimSpace(postParam(c, "serverName"))
 	if len([]rune(name)) > 64 {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"),
 			errors.New("server name is limited to 64 characters"))
@@ -435,7 +436,7 @@ func (a *ServerController) uploadPanelBinary(c *gin.Context) {
 // feature is a box on a slow or restricted link), so the service bounds it rather than
 // leaving it to the client giving up.
 func (a *ServerController) fetchPanelBinary(c *gin.Context) {
-	info, err := service.StagePanelBinaryFromURL(c.PostForm("url"))
+	info, err := service.StagePanelBinaryFromURL(postParam(c, "url"))
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.index.panelUpdate"), err)
 		return
@@ -450,7 +451,7 @@ func (a *ServerController) fetchPanelBinary(c *gin.Context) {
 // Ordinary form-urlencoded: only the token travels here, the bytes arrived at
 // uploadPanelBinary.
 func (a *ServerController) applyPanelBinary(c *gin.Context) {
-	if err := service.ApplyStagedPanelBinary(c.PostForm("token")); err != nil {
+	if err := service.ApplyStagedPanelBinary(postParam(c, "token")); err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.index.panelUpdate"), err)
 		return
 	}
@@ -530,13 +531,6 @@ func (a *ServerController) geofileProgress(c *gin.Context) {
 	jsonObj(c, a.serverService.GeofileRunState(), nil)
 }
 
-// setGeofileAutoUpdate turns the periodic geo data refresh on or off.
-func (a *ServerController) setGeofileAutoUpdate(c *gin.Context) {
-	enabled := c.PostForm("enabled") == "true"
-	err := a.settingService.SetGeofileAutoUpdate(enabled)
-	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
-}
-
 // stopXrayService stops the Xray service.
 func (a *ServerController) stopXrayService(c *gin.Context) {
 	err := a.serverService.StopXrayService()
@@ -574,8 +568,8 @@ func (a *ServerController) restartXrayService(c *gin.Context) {
 // getLogs retrieves the application logs based on count, level, and syslog filters.
 func (a *ServerController) getLogs(c *gin.Context) {
 	count := c.Param("count")
-	level := c.PostForm("level")
-	syslog := c.PostForm("syslog")
+	level := postParam(c, "level")
+	syslog := postParam(c, "syslog")
 	logs := a.serverService.GetLogs(count, level, syslog)
 	jsonObj(c, logs, nil)
 }
@@ -583,10 +577,10 @@ func (a *ServerController) getLogs(c *gin.Context) {
 // getXrayLogs retrieves Xray logs with filtering options for direct, blocked, and proxy traffic.
 func (a *ServerController) getXrayLogs(c *gin.Context) {
 	count := c.Param("count")
-	filter := c.PostForm("filter")
-	showDirect := c.PostForm("showDirect")
-	showBlocked := c.PostForm("showBlocked")
-	showProxy := c.PostForm("showProxy")
+	filter := postParam(c, "filter")
+	showDirect := postParam(c, "showDirect")
+	showBlocked := postParam(c, "showBlocked")
+	showProxy := postParam(c, "showProxy")
 
 	var freedoms []string
 	var blackholes []string
@@ -761,7 +755,7 @@ func (a *ServerController) getNewmldsa65(c *gin.Context) {
 
 // getNewEchCert generates a new ECH certificate for the given SNI.
 func (a *ServerController) getNewEchCert(c *gin.Context) {
-	sni := c.PostForm("sni")
+	sni := postParam(c, "sni")
 	cert, err := a.serverService.GetNewEchCert(sni)
 	if err != nil {
 		jsonMsg(c, "get ech certificate", err)

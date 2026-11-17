@@ -159,6 +159,31 @@ func (m *sshManager) startServer(svc *SshService, inbound *model.Inbound) (*sshS
 	}
 
 	cfg := &ssh.ServerConfig{
+		Config: ssh.Config{
+			// Prioritize modern AEAD ciphers and post-quantum / Curve25519 KEX for fast
+			// mobile/desktop handshakes while retaining CTR/NIST/SHA2 fallbacks so legacy
+			// Android/desktop SSH tunnel apps continue connecting cleanly.
+			KeyExchanges: []string{
+				ssh.KeyExchangeMLKEM768X25519,
+				ssh.KeyExchangeCurve25519,
+				ssh.KeyExchangeECDHP256,
+				ssh.KeyExchangeECDHP384,
+			},
+			Ciphers: []string{
+				ssh.CipherAES128GCM,
+				ssh.CipherAES256GCM,
+				ssh.CipherChaCha20Poly1305,
+				ssh.CipherAES128CTR,
+				ssh.CipherAES192CTR,
+				ssh.CipherAES256CTR,
+			},
+			MACs: []string{
+				ssh.HMACSHA256ETM,
+				ssh.HMACSHA512ETM,
+				ssh.HMACSHA256,
+				ssh.HMACSHA512,
+			},
+		},
 		MaxAuthTries: 6,
 		// Password only for v1. The callback reads the DB live (lookupAccount), so a
 		// client add/edit/disable takes effect with no restart.
@@ -203,9 +228,10 @@ func (m *sshManager) acceptLoop(srv *sshServer) {
 // handleConn runs the SSH handshake, enforces the User Limit, then serves the
 // permitted channels. It is the whole per-connection lifecycle.
 func (m *sshManager) handleConn(srv *sshServer, nConn net.Conn) {
-	// TCP keepalive so a peer that dies without a FIN is detected and its session (and
-	// its User-Limit slot) is released rather than lingering until the OS TCP timeout.
+	// TCP keepalive + nodelay so a peer that dies without a FIN is detected and
+	// small interactive control frames flush immediately without Nagle delay.
 	if tcp, ok := nConn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
 		_ = tcp.SetKeepAlive(true)
 		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 	}
@@ -366,9 +392,18 @@ func (m *sshManager) handleDirectTCPIP(srv *sshServer, sess *sshSession, nc ssh.
 	upstream.Close()
 }
 
+var sshRelayBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 64*1024)
+		return &b
+	},
+}
+
 // copyCount copies src into dst, adding the number of bytes moved to ctr as they flow.
 func copyCount(dst io.Writer, src io.Reader, ctr *atomic.Int64) {
-	buf := make([]byte, 32*1024)
+	bp := sshRelayBufPool.Get().(*[]byte)
+	defer sshRelayBufPool.Put(bp)
+	buf := *bp
 	for {
 		n, rerr := src.Read(buf)
 		if n > 0 {

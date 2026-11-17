@@ -116,10 +116,9 @@
   font-size:var(--fs-sm); font-weight:var(--fw-bold);
   color:var(--text); letter-spacing:.01em;
 }
-/* logo.png is 1456x368, a 3.96:1 wordmark. Sizing it by HEIGHT overflows the
-   rail (40px tall needs 158px of width against a 124px rail), and max-width
-   then squashed it horizontally because the height stayed fixed. Size by
-   width and let the height follow, so it can never distort. */
+/* logo.svg is a 3.5:1 vector wordmark. Sizing it by HEIGHT overflows the
+   rail (40px tall needs ~140px of width against a 124px rail), and max-width
+   then squashes it if height stays fixed. Size by width and let height follow. */
 .bo-rail-brand img { display:block; width:100%; max-width:88px; height:auto; }
 
 .bo-rail-nav {

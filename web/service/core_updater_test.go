@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/util/binutil"
 )
@@ -514,10 +515,21 @@ func TestListUpstreamCoreVersionsAndInstallSelectedTag(t *testing.T) {
 		t.Fatalf("expected second cached lookup not to hit HTTP, calls=%d", xrayListCalls)
 	}
 
-	// Install the explicitly picked older tag v26.10.1.
+	// Refuses silent overwrite of custom-patched Xray-core without AllowUnpatched.
+	if _, err := svc.UpdateCore(CoreUpdateOptions{
+		Target:           "xray",
+		Version:          "v26.10.1",
+		RestartFunc:      func(string) error { return nil },
+		VerifyHealthFunc: func(CoreUpdateSpec, string) error { return nil },
+	}); err == nil || !strings.Contains(err.Error(), "custom vpn-ui patches") {
+		t.Fatalf("expected custom-patched Xray protection error without AllowUnpatched, got err=%v", err)
+	}
+
+	// Install the explicitly picked older tag v26.10.1 when AllowUnpatched is explicitly acknowledged.
 	results, err := svc.UpdateCore(CoreUpdateOptions{
 		Target:           "xray",
 		Version:          "v26.10.1",
+		AllowUnpatched:   true,
 		RestartFunc:      func(string) error { return nil },
 		VerifyHealthFunc: func(CoreUpdateSpec, string) error { return nil },
 	})
@@ -527,6 +539,11 @@ func TestListUpstreamCoreVersionsAndInstallSelectedTag(t *testing.T) {
 	gotBytes, err := os.ReadFile(results[0].DestPath)
 	if err != nil || !bytes.Equal(gotBytes, oldELF) {
 		t.Fatalf("selected v26.10.1 binary mismatch")
+	}
+	for _, item := range svc.GetCoreBinaryInventory() {
+		if item.Core == "xray" && item.CustomPatched {
+			t.Fatalf("expected xray CustomPatched=false after installing vanilla upstream release")
+		}
 	}
 
 	// Verify GitHub tag fallback for amneziawg-go and GitLab releases for ocserv.
@@ -601,14 +618,73 @@ func TestUpdateCoreAllSkipsNonPrebuiltCleanly(t *testing.T) {
 	for _, r := range results {
 		byTarget[r.Target] = r.Status
 	}
-	for _, wantUpd := range []string{"xray", "telemt", "sing-box"} {
+	for _, wantUpd := range []string{"telemt", "sing-box"} {
 		if byTarget[wantUpd] != "updated" {
 			t.Fatalf("target %s status = %q, want updated (all=%v)", wantUpd, byTarget[wantUpd], byTarget)
 		}
 	}
-	for _, wantSkip := range []string{"amneziawg-go", "ocserv", "openvpn", "xl2tpd"} {
+	for _, wantSkip := range []string{"xray", "amneziawg-go", "ocserv", "openvpn", "xl2tpd"} {
 		if byTarget[wantSkip] != "skipped" {
 			t.Fatalf("target %s status = %q, want skipped (all=%v)", wantSkip, byTarget[wantSkip], byTarget)
 		}
+	}
+}
+
+func TestFetchValidatedJSONHandlesHTMLRateLimitsAndBOM(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.EscapedPath() {
+		case "/html200":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte("<!DOCTYPE html><html><body>Cloudflare Challenge</body></html>"))
+		case "/ratelimit403":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"API rate limit exceeded for 1.2.3.4"}`))
+		case "/bom-releases", "/repos/XTLS/Xray-core/releases":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(append([]byte{0xEF, 0xBB, 0xBF}, []byte(`[{"tag_name":"v26.11.9","name":"Xray 26.11.9","assets":[]}]`)...))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	var out any
+	err := fetchValidatedJSON(srv.URL+"/html200", 5*time.Second, nil, &out)
+	if err == nil || !strings.Contains(err.Error(), "HTML instead of JSON") || strings.Contains(err.Error(), "invalid character '<'") {
+		t.Fatalf("expected clean HTML detection error, got %v", err)
+	}
+
+	err = fetchValidatedJSON(srv.URL+"/ratelimit403", 5*time.Second, nil, &out)
+	if err == nil || !strings.Contains(err.Error(), "API rate limit exceeded") {
+		t.Fatalf("expected parsed GitHub message on 403, got %v", err)
+	}
+
+	prevGH := githubReleaseAPIBase
+	githubReleaseAPIBase = srv.URL
+	defer func() { githubReleaseAPIBase = prevGH }()
+
+	var serverSvc ServerService
+	versions, err := serverSvc.GetXrayVersions()
+	if err != nil {
+		t.Fatalf("GetXrayVersions with BOM failed: %v", err)
+	}
+	if len(versions) != 1 || versions[0] != "v26.11.9" {
+		t.Fatalf("unexpected GetXrayVersions result: %v", versions)
+	}
+}
+
+func TestScoreReleaseAssetHandles386AndArmv7(t *testing.T) {
+	assets := []githubReleaseAsset{
+		{Name: "Xray-linux-64.zip", BrowserDownloadURL: "https://example.com/64"},
+		{Name: "Xray-linux-32.zip", BrowserDownloadURL: "https://example.com/32"},
+		{Name: "Xray-linux-arm64-v8a.zip", BrowserDownloadURL: "https://example.com/arm64"},
+		{Name: "Xray-linux-arm32-v7a.zip", BrowserDownloadURL: "https://example.com/armv7"},
+	}
+	if name, _, _, _ := pickReleaseAsset("xray", assets, "386"); name != "Xray-linux-32.zip" {
+		t.Fatalf("386 picked %q, want Xray-linux-32.zip", name)
+	}
+	if name, _, _, _ := pickReleaseAsset("xray", assets, "arm"); name != "Xray-linux-arm32-v7a.zip" {
+		t.Fatalf("arm picked %q, want Xray-linux-arm32-v7a.zip", name)
 	}
 }

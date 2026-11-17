@@ -214,6 +214,11 @@ func Uninstall(opts UninstallOptions) *UninstallReport {
 			"/etc/ppp/radius", // panel-owned subdir of the host /etc/ppp
 			"/etc/swanctl/conf.d/l2tp.conf",
 			"/etc/modules-load.d/vpn-ui.conf",
+			"/etc/sysctl.d/99-vpn-ui-tuning.conf",
+			"/etc/sysctl.d/99-vpn-ui-bbr.conf",
+			"/etc/modules-load.d/vpn-ui-tuning.conf",
+			"/etc/modules-load.d/vpn-ui-bbr.conf",
+			"/etc/vpn-ui-network-tuning.backup.json",
 		} {
 			removePath(r, p)
 		}

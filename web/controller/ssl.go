@@ -82,7 +82,7 @@ type sslStartForm struct {
 // sslOperationRequest builds the service request from the form.
 func sslOperationRequest(c *gin.Context) (service.SSLOperationRequest, error) {
 	var f sslStartForm
-	if err := c.ShouldBind(&f); err != nil {
+	if err := bindRequest(c, &f); err != nil {
 		return service.SSLOperationRequest{}, err
 	}
 	req := service.SSLOperationRequest{
@@ -98,7 +98,7 @@ func sslOperationRequest(c *gin.Context) (service.SSLOperationRequest, error) {
 			// Read out of the form directly and never bound into the struct above,
 			// so it cannot ride along into a log line, a response body or a debug
 			// dump of the form. See the file comment.
-			CloudflareToken: c.PostForm("cloudflareToken"),
+			CloudflareToken: postParam(c, "cloudflareToken"),
 		},
 		FanOut:  service.SSLFanOutOptions{ApplyDisruptive: f.ApplyDisruptive},
 		Profile: strings.TrimSpace(f.Profile),
@@ -215,7 +215,7 @@ func (a *SettingController) sslStart(c *gin.Context) {
 // is not usable yet" on a host with no certificate. Refusing at the edge answers the
 // question that was actually wrong.
 func (a *SettingController) sslUseManaged(c *gin.Context) {
-	targets := c.PostFormArray("targets")
+	targets := postParamArray(c, "targets")
 	if len(targets) == 0 {
 		jsonMsg(c, I18nWeb(c, "pages.settings.ssl.toasts.useManaged"),
 			errors.New("name the listener to point at this certificate: the panel, the subscription server, or both"))
@@ -236,7 +236,7 @@ func (a *SettingController) sslUseManaged(c *gin.Context) {
 // it, and reading one here would invite a caller to clear the panel by naming a
 // certificate the panel was never pointed at.
 func (a *SettingController) sslUnassign(c *gin.Context) {
-	targets := c.PostFormArray("targets")
+	targets := postParamArray(c, "targets")
 	err := a.sslService.Unassign(targets)
 	jsonMsg(c, I18nWeb(c, "pages.settings.ssl.toasts.unassign"), err)
 }
@@ -249,7 +249,7 @@ func (a *SettingController) sslUnassign(c *gin.Context) {
 // present, and the sentence it returns is what the operator reads in the one
 // confirmation before anything metered happens.
 func (a *SettingController) sslSuggest(c *gin.Context) {
-	jsonObj(c, a.sslService.Suggest(c.PostFormArray("identifiers")), nil)
+	jsonObj(c, a.sslService.Suggest(postParamArray(c, "identifiers")), nil)
 }
 
 // sslNickname sets or clears the operator's own label for a certificate.
@@ -258,7 +258,7 @@ func (a *SettingController) sslSuggest(c *gin.Context) {
 // writes no certificate material: it is a label in the certificate's own store
 // directory, and the store is where the private keys live.
 func (a *SettingController) sslNickname(c *gin.Context) {
-	err := service.SetSSLNickname(sslProfileParam(c), c.PostForm("nickname"))
+	err := service.SetSSLNickname(sslProfileParam(c), postParam(c, "nickname"))
 	jsonMsg(c, I18nWeb(c, "pages.settings.ssl.toasts.nickname"), err)
 }
 
@@ -272,8 +272,8 @@ func (a *SettingController) sslNickname(c *gin.Context) {
 func (a *SettingController) sslAdopt(c *gin.Context) {
 	res, err := a.sslService.AdoptCertificate(
 		sslProfileParam(c),
-		c.PostForm("certPath"),
-		c.PostForm("keyPath"),
+		postParam(c, "certPath"),
+		postParam(c, "keyPath"),
 	)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.settings.ssl.toasts.adopt"), err)
@@ -302,7 +302,7 @@ func (a *SettingController) sslSync(c *gin.Context) {
 // here, so the value is read explicitly rather than bound: a malformed request must
 // not be able to silently stop renewing a live certificate.
 func (a *SettingController) sslAutoRenew(c *gin.Context) {
-	enabled := strings.EqualFold(strings.TrimSpace(c.PostForm("enabled")), "true")
+	enabled := strings.EqualFold(strings.TrimSpace(postParam(c, "enabled")), "true")
 	err := service.SetSSLAutoRenew(sslProfileParam(c), enabled)
 	jsonMsg(c, I18nWeb(c, "pages.settings.ssl.toasts.autoRenew"), err)
 }
@@ -316,13 +316,13 @@ func (a *SettingController) sslDeleteProfile(c *gin.Context) {
 }
 
 // sslProfileParam reads the certificate name off a request, from either the query
-// (the GET reads) or the form (the POSTs), so every handler resolves it the same
+// (the GET reads) or the form/JSON body (the POSTs), so every handler resolves it the same
 // way. An absent name is the default certificate; the service validates the rest.
 func sslProfileParam(c *gin.Context) string {
 	if v := strings.TrimSpace(c.Query("profile")); v != "" {
 		return v
 	}
-	return strings.TrimSpace(c.PostForm("profile"))
+	return strings.TrimSpace(postParam(c, "profile"))
 }
 
 // sslRollback re-points the active link at a stored version.
@@ -332,7 +332,7 @@ func sslProfileParam(c *gin.Context) string {
 // revalidates the pair before activating it, so a rollback cannot be the thing that
 // breaks TLS either. Refusing an empty value here only saves a round trip.
 func (a *SettingController) sslRollback(c *gin.Context) {
-	version := strings.TrimSpace(c.PostForm("version"))
+	version := strings.TrimSpace(postParam(c, "version"))
 	if version == "" {
 		jsonMsg(c, I18nWeb(c, "pages.settings.ssl.toasts.rollback"), errors.New("no version was given"))
 		return

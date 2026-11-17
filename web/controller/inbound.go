@@ -2095,7 +2095,7 @@ func (a *InboundController) resetAllClientTraffics(c *gin.Context) {
 // importInbound imports an inbound configuration from provided data.
 func (a *InboundController) importInbound(c *gin.Context) {
 	inbound := &model.Inbound{}
-	err := json.Unmarshal([]byte(c.PostForm("data")), inbound)
+	err := json.Unmarshal([]byte(postParam(c, "data")), inbound)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
@@ -2859,7 +2859,7 @@ func (a *InboundController) callerOwnsInbound(c *gin.Context, inboundId int) boo
 // re-reading of the old one. Named for what the Clients page calls the state it
 // produces ("No inbounds").
 func postedMembershipIds(c *gin.Context, targetId int) ([]int, bool) {
-	raw := c.PostFormArray("inboundIds")
+	raw := postParamArray(c, "inboundIds")
 	seen := map[int]bool{}
 	out := []int{}
 	if targetId > 0 {
@@ -2887,7 +2887,7 @@ func postedMembershipIds(c *gin.Context, targetId int) ([]int, bool) {
 	if named > 0 {
 		return out, true
 	}
-	if isTruthyForm(c.PostForm("noInbounds")) {
+	if isTruthyForm(postParam(c, "noInbounds")) {
 		return nil, true
 	}
 	if len(raw) == 0 {

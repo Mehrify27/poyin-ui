@@ -1483,15 +1483,17 @@ func runUpdateCore(args ...string) {
 
 	fs := flag.NewFlagSet("update-core", flag.ContinueOnError)
 	var (
-		version      string
-		url          string
-		filePath     string
-		sha256       string
-		rollback     bool
-		listOnly     bool
-		listUpstream bool
-		refresh      bool
-		asJSON       bool
+		version        string
+		url            string
+		filePath       string
+		sha256         string
+		rollback       bool
+		listOnly       bool
+		listEngines    bool
+		listUpstream   bool
+		refresh        bool
+		allowUnpatched bool
+		asJSON         bool
 	)
 	fs.StringVar(&version, "version", "", "target release tag/version (e.g. v26.11.9 or v1.14.4)")
 	fs.StringVar(&url, "url", "", "download archive/binary directly from this URL")
@@ -1499,8 +1501,10 @@ func runUpdateCore(args ...string) {
 	fs.StringVar(&sha256, "sha256", "", "expected SHA-256 hex checksum of the artifact")
 	fs.BoolVar(&rollback, "rollback", false, "roll back target's custom override to .bak or bundled binary")
 	fs.BoolVar(&listOnly, "list", false, "list active, custom, and bundled sidecar binary versions")
+	fs.BoolVar(&listEngines, "engines", false, "list all 12 protocol engine versions across sidecar, kernel, and daemon categories")
 	fs.BoolVar(&listUpstream, "versions", false, "fetch available official upstream versions for target")
 	fs.BoolVar(&refresh, "refresh", false, "bypass upstream version cache when used with --versions")
+	fs.BoolVar(&allowUnpatched, "allow-unpatched", false, "allow replacing custom-patched Xray-core with unpatched vanilla upstream")
 	fs.BoolVar(&asJSON, "json", false, "output JSON")
 	if err := fs.Parse(flagArgs); err != nil {
 		os.Exit(2)
@@ -1512,6 +1516,30 @@ func runUpdateCore(args ...string) {
 	}
 
 	var coreSvc service.CoreService
+	if listEngines {
+		engines := coreSvc.GetDaemonVersions()
+		if asJSON {
+			out, _ := json.MarshalIndent(engines, "", "  ")
+			fmt.Println(string(out))
+			return
+		}
+		fmt.Printf("%-13s %-18s %-14s %-16s %s\n", "PROTOCOL", "CATEGORY", "SOURCE", "VERSION", "ENGINE / NOTES")
+		for _, e := range engines {
+			ver := e.Version
+			if ver == "" {
+				ver = "-"
+			}
+			notes := e.EngineName
+			if e.CustomPatched {
+				notes += " [custom-patched]"
+			}
+			if e.Detail != "" {
+				notes += " (" + e.Detail + ")"
+			}
+			fmt.Printf("%-13s %-18s %-14s %-16s %s\n", e.ID, e.Category, e.Source, ver, notes)
+		}
+		return
+	}
 	if listUpstream {
 		if target == "" {
 			fmt.Fprintf(os.Stderr, "usage: vpn-ui update-core <target> --versions [--refresh] [--json]\n")
@@ -1574,7 +1602,7 @@ func runUpdateCore(args ...string) {
 	}
 
 	if target == "" {
-		fmt.Fprintf(os.Stderr, "usage: vpn-ui update-core <target|all> [--version vX.Y.Z] [--versions] [--url URL] [--file PATH] [--sha256 HEX] [--rollback] [--list] [--json]\n")
+		fmt.Fprintf(os.Stderr, "usage: vpn-ui update-core <target|all> [--version vX.Y.Z] [--versions] [--engines] [--url URL] [--file PATH] [--sha256 HEX] [--allow-unpatched] [--rollback] [--list] [--json]\n")
 		fmt.Fprintf(os.Stderr, "targets: %s, all\n", strings.Join(service.SupportedCoreUpdateTargets(), ", "))
 		os.Exit(2)
 	}
@@ -1632,6 +1660,7 @@ func runUpdateCore(args ...string) {
 		URL:              url,
 		File:             filePath,
 		SHA256:           sha256,
+		AllowUnpatched:   allowUnpatched,
 		RestartFunc:      restartViaSocket,
 		VerifyHealthFunc: verifyViaSocketOrExec,
 	})
@@ -1649,6 +1678,115 @@ func runUpdateCore(args ...string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "update-core finished with errors: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+// runBbrTuning implements `vpn-ui bbr [status|enable|disable|vpn-performance|revert]`
+// and `--profile <default|bbr|vpn-performance> [--json]`.
+func runBbrTuning(args ...string) {
+	var positional []string
+	var flagArgs []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			positional = append(positional, a)
+			continue
+		}
+		flagArgs = append(flagArgs, a)
+		if !strings.Contains(a, "=") && strings.TrimLeft(a, "-") == "profile" && i+1 < len(args) {
+			i++
+			flagArgs = append(flagArgs, args[i])
+		}
+	}
+
+	fs := flag.NewFlagSet("bbr", flag.ContinueOnError)
+	var (
+		profileFlag string
+		asJSON      bool
+	)
+	fs.StringVar(&profileFlag, "profile", "", "tuning profile (default, bbr, vpn-performance)")
+	fs.BoolVar(&asJSON, "json", false, "output JSON")
+	if err := fs.Parse(flagArgs); err != nil {
+		os.Exit(2)
+	}
+
+	action := "status"
+	if len(positional) > 0 {
+		action = strings.ToLower(strings.TrimSpace(positional[0]))
+	}
+	if profileFlag != "" && action == "status" {
+		action = strings.ToLower(strings.TrimSpace(profileFlag))
+	}
+
+	var svc service.NetworkTuningService
+	if action == "status" && profileFlag == "" {
+		st := svc.GetStatus()
+		if asJSON {
+			out, _ := json.MarshalIndent(st, "", "  ")
+			fmt.Println(string(out))
+			return
+		}
+		printNetworkTuningStatus(st)
+		return
+	}
+
+	requireRoot()
+	var (
+		res service.NetworkTuningResult
+		err error
+	)
+	switch action {
+	case "revert":
+		res, err = svc.Revert()
+	default:
+		target := action
+		if profileFlag != "" {
+			target = profileFlag
+		}
+		res, err = svc.ApplyProfile(target)
+	}
+
+	if asJSON {
+		out, _ := json.MarshalIndent(res, "", "  ")
+		fmt.Println(string(out))
+	} else {
+		for _, w := range res.Warnings {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+		}
+		if res.Message != "" {
+			fmt.Println(res.Message)
+		}
+		printNetworkTuningStatus(res.Status)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "network tuning failed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func printNetworkTuningStatus(st service.NetworkTuningStatus) {
+	bbrState := "disabled"
+	if st.BBRActive {
+		bbrState = "enabled (" + st.BBRVariant + ")"
+	} else if st.BBRAvailable {
+		bbrState = "disabled (best available: " + st.BestBBRVariant + ")"
+	} else {
+		bbrState = "unavailable on this kernel"
+	}
+	fmt.Printf("Kernel:             %s\n", st.KernelRelease)
+	fmt.Printf("Active Profile:     %s\n", st.ActiveProfile)
+	fmt.Printf("BBR State:          %s\n", bbrState)
+	fmt.Printf("Congestion Control: %s (available: %s)\n", st.CongestionControl, strings.Join(st.AvailableCongestions, ", "))
+	fmt.Printf("Default Qdisc:      %s\n", st.DefaultQdisc)
+	if st.PrimaryInterface != "" {
+		fmt.Printf("Primary Egress:     %s (qdisc: %s)\n", st.PrimaryInterface, st.PrimaryQdisc)
+	}
+	if st.RmemMax != "" || st.WmemMax != "" {
+		fmt.Printf("Socket Buffers:     rmem_max=%s wmem_max=%s\n", st.RmemMax, st.WmemMax)
+	}
+	fmt.Printf("Persist File:       %s (present=%t, backup=%t)\n", st.PersistFile, st.PersistPresent, st.HasBackup)
+	if st.Message != "" {
+		fmt.Printf("Note:               %s\n", st.Message)
 	}
 }
 
@@ -3360,6 +3498,7 @@ func main() {
 		fmt.Println("                   " + strings.Join(service.ControlCommands, ", "))
 		fmt.Println("    update         install the latest release or --local <path> (backs up DB + .bak rollback)")
 		fmt.Println("    update-core    list versions / update / rollback core binaries (" + strings.Join(service.SupportedCoreUpdateTargets(), ", ") + ", all)")
+		fmt.Println("    bbr            inspect or tune BBR / network stack (status|enable|vpn-performance|disable|revert)")
 		fmt.Println("    install-menu   install the 'vpn-ui' management menu to " + service.MenuScriptPath)
 		fmt.Println("    --systemd      install+enable+start the panel as a systemd service")
 		fmt.Println("    --random       randomize panel port + username + password + web path")
@@ -3472,6 +3611,8 @@ func main() {
 		runUpdate(os.Args[2:]...)
 	case "update-core":
 		runUpdateCore(os.Args[2:]...)
+	case "bbr", "tuning":
+		runBbrTuning(os.Args[2:]...)
 	case "install-menu":
 		installMenuScript(os.Args[2:])
 	case "install-acme":

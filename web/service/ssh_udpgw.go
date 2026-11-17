@@ -102,16 +102,17 @@ func (m *sshManager) handleUdpgw(srv *sshServer, sess *sshSession, ch ssh.Channe
 		}
 	}()
 
-	lenBuf := make([]byte, 2)
+	var lenBuf [2]byte
+	pktBuf := make([]byte, udpgwMaxPacket)
 	for {
-		if _, err := io.ReadFull(ch, lenBuf); err != nil {
+		if _, err := io.ReadFull(ch, lenBuf[:]); err != nil {
 			return
 		}
-		plen := int(binary.LittleEndian.Uint16(lenBuf))
+		plen := int(binary.LittleEndian.Uint16(lenBuf[:]))
 		if plen == 0 || plen > udpgwMaxPacket {
 			return
 		}
-		pkt := make([]byte, plen)
+		pkt := pktBuf[:plen]
 		if _, err := io.ReadFull(ch, pkt); err != nil {
 			return
 		}
@@ -205,6 +206,7 @@ func (m *sshManager) newUdpFlow(srv *sshServer, sess *sshSession, conid [2]byte,
 // in a udpgw reply with this flow's conid and the datagram's source address.
 func (f *udpFlow) readReplies(sess *sshSession, writeFrame func([]byte) error) {
 	buf := make([]byte, udpgwMaxPacket)
+	replyBuf := make([]byte, 0, udpgwMaxPacket)
 	for {
 		n, err := f.uconn.Read(buf)
 		if err != nil {
@@ -214,10 +216,11 @@ func (f *udpFlow) readReplies(sess *sshSession, writeFrame func([]byte) error) {
 		if !ok {
 			continue
 		}
-		reply := buildUdpgwReply(f.conid, srcHost, srcPort, payload)
+		reply := buildUdpgwReplyInto(replyBuf[:0], f.conid, srcHost, srcPort, payload)
 		if reply == nil {
 			continue
 		}
+		replyBuf = reply
 		if err := writeFrame(reply); err != nil {
 			return
 		}
@@ -228,6 +231,10 @@ func (f *udpFlow) readReplies(sess *sshSession, writeFrame func([]byte) error) {
 // buildUdpgwReply frames a server->client udpgw message: flags + conid + source
 // address + payload.
 func buildUdpgwReply(conid [2]byte, srcHost string, srcPort int, payload []byte) []byte {
+	return buildUdpgwReplyInto(nil, conid, srcHost, srcPort, payload)
+}
+
+func buildUdpgwReplyInto(dst []byte, conid [2]byte, srcHost string, srcPort int, payload []byte) []byte {
 	ip := net.ParseIP(srcHost)
 	if ip == nil {
 		return nil
@@ -240,10 +247,15 @@ func buildUdpgwReply(conid [2]byte, srcHost string, srcPort int, payload []byte)
 		flags |= udpgwFlagIPv6
 		addr = ip.To16()
 	}
-	out := make([]byte, 0, 3+len(addr)+2+len(payload))
-	out = append(out, flags, conid[0], conid[1])
-	out = append(out, addr...)
-	out = binary.BigEndian.AppendUint16(out, uint16(srcPort))
-	out = append(out, payload...)
-	return out
+	need := 3 + len(addr) + 2 + len(payload)
+	if cap(dst) < need {
+		dst = make([]byte, 0, need)
+	} else {
+		dst = dst[:0]
+	}
+	dst = append(dst, flags, conid[0], conid[1])
+	dst = append(dst, addr...)
+	dst = binary.BigEndian.AppendUint16(dst, uint16(srcPort))
+	dst = append(dst, payload...)
+	return dst
 }

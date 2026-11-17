@@ -797,24 +797,6 @@
       <a-collapse-panel key="2" header='Geofiles'>
         <a-alert type="info" show-icon class="mb-10"
           message='{{ i18n "pages.index.geofileBundledHint" }}'></a-alert>
-        <!-- Auto-update. On by default, because these files go stale SILENTLY: a
-             routing rule naming a geosite category keeps parsing and the core keeps
-             starting, the categories are just months out of date and the rule
-             quietly stops matching what the operator thinks it matches. -->
-        <div class="mb-10"
-          :style="{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }">
-          <!-- The reason lives in the "?" rather than under the label: it explains a
-               failure mode nobody is looking for, which is worth a sentence when you
-               go looking and worth no vertical space when you do not. -->
-          <span>
-            {{ i18n "pages.index.geofileAutoUpdate" }}
-            <a-tooltip :title="geofileText.autoUpdateDesc">
-              <a-icon type="question-circle" :style="{ marginInlineStart: '4px', opacity: 0.65 }"></a-icon>
-            </a-tooltip>
-          </span>
-          <a-switch :checked="geofileAutoUpdate" :loading="geofileAutoUpdateSaving"
-            @change="toggleGeofileAutoUpdate"></a-switch>
-        </div>
         <a-list class="ant-version-list w-100" bordered>
           <a-list-item class="ant-version-list-item"
             v-for="file in ['geosite.dat', 'geoip.dat', 'geosite_IR.dat', 'geoip_IR.dat', 'geosite_RU.dat', 'geoip_RU.dat']">
@@ -1855,10 +1837,6 @@
       geofileText: {
         installed: '{{ i18n "pages.index.geofileInstalled" }}',
         notInstalled: '{{ i18n "pages.index.geofileNotInstalled" }}',
-        // Emitted here, not into the a-tooltip's :title, for the reason above: a
-        // translation with an apostrophe pasted into a Vue attribute expression
-        // ends the attribute's string and blanks the whole page with an empty console.
-        autoUpdateDesc: '{{ i18n "pages.index.geofileAutoUpdateDesc" }}',
       },
       // The server-side geofile download, mirrored here so the dialog can show a
       // transfer it did not start. Leaving the overview destroys this whole Vue
@@ -1874,10 +1852,6 @@
       // Drives watchPanelUpdate, which follows a self-update this page did not start.
       panelUpdateTimer: null,
       panelUpdateReloadArmed: false,
-      // Whether the panel refreshes the geo data on its own. On by default; the real
-      // value arrives with the defaultSettings call in mounted().
-      geofileAutoUpdate: true,
-      geofileAutoUpdateSaving: false,
       distroModal: { visible: false, pretty: '', tested: '' },
 
       // --- redesign shell + bento tiles ---------------------------------
@@ -3030,21 +3004,6 @@
         if (!total) return 0;
         return Math.round(((r.fetched || []).length / total) * 100);
       },
-      async toggleGeofileAutoUpdate(checked) {
-        const previous = this.geofileAutoUpdate;
-        // Optimistic, then rolled back on refusal: the switch is the only feedback
-        // there is, so it must not sit on the old value while the request is in
-        // flight and then jump.
-        this.geofileAutoUpdate = checked;
-        this.geofileAutoUpdateSaving = true;
-        try {
-          const msg = await HttpUtil.post('/panel/api/server/geofileAutoUpdate', { enabled: checked });
-          if (!msg || !msg.success) this.geofileAutoUpdate = previous;
-        } catch (e) {
-          this.geofileAutoUpdate = previous;
-        }
-        this.geofileAutoUpdateSaving = false;
-      },
       async fetchGeofileStatus() {
         try {
           const msg = await HttpUtil.get('/panel/api/server/geofileStatus');
@@ -3496,9 +3455,6 @@
       if (msg.success) {
         this.ipLimitEnable = msg.obj.ipLimitEnable;
         this.xrayAccessLogEnable = !!msg.obj.xrayAccessLogEnable;
-        if (typeof msg.obj.geofileAutoUpdate === 'boolean') {
-          this.geofileAutoUpdate = msg.obj.geofileAutoUpdate;
-        }
       }
 
       // Initial status fetch
@@ -3521,7 +3477,6 @@
       // panel looked idle while it was still pulling a binary or 74MB of geo data.
       this.resumePanelUpdate();
       this.geofileRunPoll();
-      this.checkForUpdate(false); // best-effort update check on every overview load
       this.announceUpdateResult(); // "Updated to vX" if this load follows a self-update
 
       // Setup WebSocket for real-time updates

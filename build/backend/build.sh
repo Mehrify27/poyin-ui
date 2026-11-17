@@ -65,7 +65,7 @@ build_arch() {
 
         # --- openvpn (static) ---
         cd /tmp
-        OVPN_VER=2.6.12
+        OVPN_VER=2.6.23
         wget -q "https://swupdate.openvpn.org/community/releases/openvpn-${OVPN_VER}.tar.gz"
         tar xf "openvpn-${OVPN_VER}.tar.gz"
         cd "openvpn-${OVPN_VER}"

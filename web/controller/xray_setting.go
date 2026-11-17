@@ -102,12 +102,12 @@ func (a *XraySettingController) getXraySetting(c *gin.Context) {
 
 // updateSetting updates the Xray configuration settings.
 func (a *XraySettingController) updateSetting(c *gin.Context) {
-	xraySetting := c.PostForm("xraySetting")
+	xraySetting := postParam(c, "xraySetting")
 	if err := a.XraySettingService.SaveXraySetting(xraySetting); err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
 		return
 	}
-	outboundTestUrl := c.PostForm("outboundTestUrl")
+	outboundTestUrl := postParam(c, "outboundTestUrl")
 	if outboundTestUrl == "" {
 		outboundTestUrl = "https://www.google.com/generate_204"
 	}
@@ -143,11 +143,11 @@ func (a *XraySettingController) warp(c *gin.Context) {
 	case "config":
 		resp, err = a.WarpService.GetWarpConfig()
 	case "reg":
-		skey := c.PostForm("privateKey")
-		pkey := c.PostForm("publicKey")
+		skey := postParam(c, "privateKey")
+		pkey := postParam(c, "publicKey")
 		resp, err = a.WarpService.RegWarp(skey, pkey)
 	case "license":
-		license := c.PostForm("license")
+		license := postParam(c, "license")
 		resp, err = a.WarpService.SetWarpLicense(license)
 	}
 
@@ -162,7 +162,7 @@ func (a *XraySettingController) warpsocks(c *gin.Context) {
 	action := c.Param("action")
 	switch action {
 	case "install":
-		port, _ := strconv.Atoi(c.PostForm("port"))
+		port, _ := strconv.Atoi(postParam(c, "port"))
 		service.StartWarpSocks("reinstall", port)
 		jsonObj(c, service.WarpSocksState(), nil)
 	case "uninstall":
@@ -179,15 +179,14 @@ func (a *XraySettingController) warpsocks(c *gin.Context) {
 
 // sshoutbound drives operator-configured SSH egress tunnels (list/save/delete/status).
 // Each tunnel is backed by a synthesized tagged `socks` outbound the operator adds to the
-// template, so it is reverse/routing-selectable purely by that tag. Form-urlencoded, per
-// the panel convention (no JSON binding).
+// template, so it is reverse/routing-selectable purely by that tag.
 func (a *XraySettingController) sshoutbound(c *gin.Context) {
 	switch c.Param("action") {
 	case "list":
 		jsonObj(c, a.SshOutboundService.List(), nil)
 	case "save":
 		var cfg service.SshOutboundConfig
-		if err := c.ShouldBind(&cfg); err != nil {
+		if err := bindRequest(c, &cfg); err != nil {
 			jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 			return
 		}
@@ -200,9 +199,9 @@ func (a *XraySettingController) sshoutbound(c *gin.Context) {
 		// synthesized socks outbound has to point at, and only the server knows it.
 		jsonObj(c, gin.H{"socksPort": saved.SocksPort}, nil)
 	case "delete":
-		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.SshOutboundService.Delete(c.PostForm("tag")))
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.SshOutboundService.Delete(postParam(c, "tag")))
 	case "status":
-		up, log := a.SshOutboundService.Status(c.PostForm("tag"))
+		up, log := a.SshOutboundService.Status(postParam(c, "tag"))
 		jsonObj(c, gin.H{"running": up, "log": log}, nil)
 	default:
 		jsonObj(c, a.SshOutboundService.List(), nil)
@@ -216,11 +215,11 @@ func (a *XraySettingController) hy2outbound(c *gin.Context) {
 		jsonObj(c, a.Hy2OutboundService.List(), nil)
 	case "save":
 		var cfg service.Hysteria2OutboundConfig
-		if err := c.ShouldBind(&cfg); err != nil {
+		if err := bindRequest(c, &cfg); err != nil {
 			jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 			return
 		}
-		if rawAlpn := strings.TrimSpace(c.PostForm("alpnStr")); rawAlpn != "" && len(cfg.Alpn) == 0 {
+		if rawAlpn := strings.TrimSpace(postParam(c, "alpnStr")); rawAlpn != "" && len(cfg.Alpn) == 0 {
 			for _, part := range strings.Split(rawAlpn, ",") {
 				if trimmed := strings.TrimSpace(part); trimmed != "" {
 					cfg.Alpn = append(cfg.Alpn, trimmed)
@@ -234,9 +233,9 @@ func (a *XraySettingController) hy2outbound(c *gin.Context) {
 		}
 		jsonObj(c, gin.H{"socksPort": saved.SocksPort}, nil)
 	case "delete":
-		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.Hy2OutboundService.Delete(c.PostForm("tag")))
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.Hy2OutboundService.Delete(postParam(c, "tag")))
 	case "status":
-		up, log := a.Hy2OutboundService.Status(c.PostForm("tag"))
+		up, log := a.Hy2OutboundService.Status(postParam(c, "tag"))
 		jsonObj(c, gin.H{"running": up, "log": log}, nil)
 	default:
 		jsonObj(c, a.Hy2OutboundService.List(), nil)
@@ -253,17 +252,17 @@ func (a *XraySettingController) hy2outbound(c *gin.Context) {
 // blob travels as text and is unmarshalled by hand, the same way importInbound and
 // testOutbound take theirs.
 type vpnOutboundForm struct {
-	Tag    string `form:"tag"`
-	Kind   string `form:"kind"`
-	Remark string `form:"remark"`
-	Enable bool   `form:"enable"`
+	Tag    string `form:"tag" json:"tag"`
+	Kind   string `form:"kind" json:"kind"`
+	Remark string `form:"remark" json:"remark"`
+	Enable bool   `form:"enable" json:"enable"`
 	// Via is the tag of another tunnel that carries this one's outer transport, which the
 	// browser sends straight from the row's Dialer Proxy select: that one control is how
 	// a chain is asked for on every outbound, tunnel or not. Blank is the ordinary case
 	// and blank is also what an older panel posts, which is why it binds as a plain
 	// string rather than through anything that would fail on absence.
-	Via      string `form:"via"`
-	Settings string `form:"settings"`
+	Via      string `form:"via" json:"via"`
+	Settings string `form:"settings" json:"-"`
 }
 
 // vpnOutKindInfo is one entry of the outbound protocol picker.
@@ -316,9 +315,12 @@ func (a *XraySettingController) vpnoutbound(c *gin.Context) {
 		jsonObj(c, vpnOutKindList(), nil)
 	case "save":
 		var f vpnOutboundForm
-		if err := c.ShouldBind(&f); err != nil {
+		if err := bindRequest(c, &f); err != nil {
 			jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 			return
+		}
+		if f.Settings == "" {
+			f.Settings = postParam(c, "settings")
 		}
 		cfg := service.VpnOutboundConfig{
 			Tag:    f.Tag,
@@ -350,9 +352,9 @@ func (a *XraySettingController) vpnoutbound(c *gin.Context) {
 		// the synthesized outbound binds to, and only the server knows it.
 		jsonObj(c, gin.H{"iface": saved.Iface}, nil)
 	case "delete":
-		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.VpnOutboundService.Delete(c.PostForm("tag")))
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.VpnOutboundService.Delete(postParam(c, "tag")))
 	case "status":
-		up, detail := a.VpnOutboundService.Status(c.PostForm("tag"))
+		up, detail := a.VpnOutboundService.Status(postParam(c, "tag"))
 		jsonObj(c, gin.H{"running": up, "detail": detail}, nil)
 	default:
 		jsonObj(c, a.VpnOutboundService.List(), nil)
@@ -368,13 +370,13 @@ func (a *XraySettingController) nord(c *gin.Context) {
 	case "countries":
 		resp, err = a.NordService.GetCountries()
 	case "servers":
-		countryId := c.PostForm("countryId")
+		countryId := postParam(c, "countryId")
 		resp, err = a.NordService.GetServers(countryId)
 	case "reg":
-		token := c.PostForm("token")
+		token := postParam(c, "token")
 		resp, err = a.NordService.GetCredentials(token)
 	case "setKey":
-		key := c.PostForm("key")
+		key := postParam(c, "key")
 		resp, err = a.NordService.SetKey(key)
 	case "data":
 		resp, err = a.NordService.GetNordData()
@@ -397,7 +399,7 @@ func (a *XraySettingController) getOutboundsTraffic(c *gin.Context) {
 
 // resetOutboundsTraffic resets the traffic statistics for the specified outbound tag.
 func (a *XraySettingController) resetOutboundsTraffic(c *gin.Context) {
-	tag := c.PostForm("tag")
+	tag := postParam(c, "tag")
 	err := a.OutboundService.ResetOutboundTraffic(tag)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.resetOutboundTrafficError"), err)
@@ -407,10 +409,10 @@ func (a *XraySettingController) resetOutboundsTraffic(c *gin.Context) {
 }
 
 // testOutbound tests an outbound configuration and returns the delay/response time.
-// Optional form "allOutbounds": JSON array of all outbounds; used to resolve sockopt.dialerProxy dependencies.
+// Optional parameter "allOutbounds": JSON array or text of all outbounds; used to resolve sockopt.dialerProxy dependencies.
 func (a *XraySettingController) testOutbound(c *gin.Context) {
-	outboundJSON := c.PostForm("outbound")
-	allOutboundsJSON := c.PostForm("allOutbounds")
+	outboundJSON := postParam(c, "outbound")
+	allOutboundsJSON := postParam(c, "allOutbounds")
 
 	if outboundJSON == "" {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), common.NewError("outbound parameter is required"))

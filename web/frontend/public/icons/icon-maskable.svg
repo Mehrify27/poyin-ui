@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none" role="img" aria-label="VPN-UI Maskable Icon">
+  <defs>
+    <linearGradient id="vpnui-mask-bg" x1="0" y1="0" x2="128" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#071a16"/>
+      <stop offset="100%" stop-color="#0a1222"/>
+    </linearGradient>
+    <linearGradient id="vpnui-mask-emblem" x1="28" y1="28" x2="100" y2="100" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#008771"/>
+      <stop offset="100%" stop-color="#1bbf9f"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" fill="url(#vpnui-mask-bg)"/>
+  <rect x="24" y="24" width="80" height="80" rx="22" fill="url(#vpnui-mask-emblem)"/>
+  <path d="M43 49L64 37L85 49V65.5C85 77 75.4 85.2 64 89.8C52.6 85.2 43 77 43 65.5V49Z" fill="#ffffff" fill-opacity="0.14" stroke="#ffffff" stroke-width="4.2" stroke-linejoin="round"/>
+  <path d="M53.5 64L64 53.5L74.5 64M64 54V76" stroke="#ffffff" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

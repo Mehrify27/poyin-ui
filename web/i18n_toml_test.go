@@ -53,7 +53,6 @@ var knownMissing = keySet(
 	"pages.index.updateDownloading", "pages.index.updateInstalling", "pages.index.updateRestarting",
 	"pages.index.updateCancel", "pages.index.panelUpdate",
 	"pages.index.updateCancelling", "pages.index.updateFailed",
-	"pages.index.geofileAutoUpdate", "pages.index.geofileAutoUpdateDesc",
 	"pages.index.geofileRestarting", "pages.index.geofileRunDone",
 	"pages.index.geofileRunStarting",
 	"pages.index.geofileRunFailed",

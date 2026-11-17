@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex,nofollow" />
+  <meta name="theme-color" content="#008771" />
+  <base href="/__VPN_UI_APP_BASE__/" />
+  <title>VPN-UI — Offline</title>
+  <link rel="icon" type="image/svg+xml" href="./icons/logo.svg" />
+  <style>
+    :root {
+      --bg: #0a1222;
+      --surface: #151f31;
+      --border: #2c3950;
+      --text: rgba(255, 255, 255, 0.9);
+      --text-2: rgba(255, 255, 255, 0.65);
+      --accent: #1bbf9f;
+      --on-accent: #071a16;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f4f6f8;
+        --surface: #ffffff;
+        --border: #d2dae1;
+        --text: #1b2430;
+        --text-2: #5a6675;
+        --accent: #008771;
+        --on-accent: #ffffff;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    .card {
+      max-width: 420px;
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 32px;
+      text-align: center;
+    }
+    .logo { width: 56px; height: 56px; margin: 0 auto 16px; display: block; }
+    h1 { margin: 0 0 8px; font-size: 20px; font-weight: 600; }
+    p { margin: 0 0 24px; font-size: 14px; line-height: 1.6; color: var(--text-2); }
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 24px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      background: var(--accent);
+      color: var(--on-accent);
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <img class="logo" src="./icons/logo.svg" alt="VPN-UI" />
+    <h1>Connection Offline</h1>
+    <p>The VPN-UI control panel cannot reach your server right now. Check network connectivity and try again.</p>
+    <button type="button" onclick="window.location.reload()">Retry Connection</button>
+  </main>
+</body>
+</html>

@@ -1,0 +1,242 @@
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/inter/700.css";
+@import "@fontsource/vazirmatn/400.css";
+@import "@fontsource/vazirmatn/500.css";
+@import "@fontsource/vazirmatn/600.css";
+@import "@fontsource/vazirmatn/700.css";
+@import "@fontsource-variable/material-symbols-rounded/fill.css";
+
+:root {
+  --font-sans: "Vazirmatn", "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* Material 3 Light System Tokens */
+  --md-sys-color-background: #f4f6f8;
+  --md-sys-color-surface: #ffffff;
+  --md-sys-color-surface-container-low: #f7f9fb;
+  --md-sys-color-surface-container: #eef2f5;
+  --md-sys-color-surface-container-high: #e4e9ee;
+  --md-sys-color-on-surface: #1b2430;
+  --md-sys-color-on-surface-variant: #5a6675;
+  --md-sys-color-outline: #b6c2cf;
+  --md-sys-color-outline-variant: #dde4ec;
+
+  --md-sys-color-primary: #008771;
+  --md-sys-color-on-primary: #ffffff;
+  --md-sys-color-primary-container: #d8f1eb;
+  --md-sys-color-on-primary-container: #00382e;
+
+  --md-sys-color-error: #b3261e;
+  --md-sys-color-error-container: rgba(179, 38, 30, 0.12);
+
+  --status-ok: #1c7a45;
+  --status-ok-bg: rgba(28, 122, 69, 0.12);
+  --status-warn: #8a6008;
+  --status-warn-bg: rgba(138, 96, 8, 0.14);
+  --status-info: #1f6fd0;
+  --status-info-bg: rgba(31, 111, 208, 0.12);
+
+  --md-shape-sm: 10px;
+  --md-shape-md: 14px;
+  --md-shape-lg: 20px;
+  --md-shape-xl: 28px;
+  --md-elevation-1: 0 2px 6px rgba(16, 24, 32, 0.06);
+  --md-elevation-2: 0 12px 32px -12px rgba(16, 24, 32, 0.16);
+  color-scheme: light;
+}
+
+body.dark {
+  /* Material 3 Dark System Tokens */
+  --md-sys-color-background: #0a1222;
+  --md-sys-color-surface: #151f31;
+  --md-sys-color-surface-container-low: #101929;
+  --md-sys-color-surface-container: #1c2740;
+  --md-sys-color-surface-container-high: #23304c;
+  --md-sys-color-on-surface: rgba(255, 255, 255, 0.9);
+  --md-sys-color-on-surface-variant: rgba(255, 255, 255, 0.64);
+  --md-sys-color-outline: #3c4b68;
+  --md-sys-color-outline-variant: #29364f;
+
+  --md-sys-color-primary: #1bbf9f;
+  --md-sys-color-on-primary: #071a16;
+  --md-sys-color-primary-container: rgba(27, 191, 159, 0.16);
+  --md-sys-color-on-primary-container: #9bf2df;
+
+  --md-sys-color-error: #f2726a;
+  --md-sys-color-error-container: rgba(242, 114, 106, 0.15);
+
+  --status-ok: #4fd08d;
+  --status-ok-bg: rgba(79, 208, 141, 0.15);
+  --status-warn: #e0a94a;
+  --status-warn-bg: rgba(224, 169, 74, 0.16);
+  --status-info: #6fa8f5;
+  --status-info-bg: rgba(111, 168, 245, 0.15);
+
+  --md-elevation-1: none;
+  --md-elevation-2: 0 18px 40px -20px rgba(0, 0, 0, 0.72);
+  color-scheme: dark;
+}
+
+html[data-theme="ultra-dark"] body.dark {
+  --md-sys-color-background: #07090d;
+  --md-sys-color-surface: #0e1118;
+  --md-sys-color-surface-container-low: #121620;
+  --md-sys-color-surface-container: #171c28;
+  --md-sys-color-surface-container-high: #202737;
+  --md-sys-color-outline-variant: #232a3a;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--md-sys-color-background);
+  color: var(--md-sys-color-on-surface);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+a {
+  color: var(--md-sys-color-primary);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+.m3-symbol {
+  font-family: "Material Symbols Rounded Variable", sans-serif;
+  font-weight: normal;
+  font-style: normal;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  user-select: none;
+  -webkit-font-feature-settings: "liga";
+  font-feature-settings: "liga";
+  font-variation-settings: "FILL" var(--icon-fill, 0), "wght" var(--icon-wght, 400);
+}
+
+.m3-card {
+  background: var(--md-sys-color-surface);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-shape-lg);
+  box-shadow: var(--md-elevation-1);
+  padding: 20px;
+}
+
+.m3-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.m3-pill--ok {
+  background: var(--status-ok-bg);
+  color: var(--status-ok);
+}
+
+.m3-pill--warn {
+  background: var(--status-warn-bg);
+  color: var(--status-warn);
+}
+
+.m3-pill--error {
+  background: var(--md-sys-color-error-container);
+  color: var(--md-sys-color-error);
+}
+
+.m3-pill--info {
+  background: var(--status-info-bg);
+  color: var(--status-info);
+}
+
+.m3-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 9px 18px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.16s ease, border-color 0.16s ease, opacity 0.16s ease;
+}
+
+.m3-btn:disabled {
+  opacity: 0.52;
+  cursor: not-allowed;
+}
+
+.m3-btn--primary {
+  background: var(--md-sys-color-primary);
+  color: var(--md-sys-color-on-primary);
+}
+
+.m3-btn--tonal {
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-primary);
+}
+
+.m3-btn--outlined {
+  background: transparent;
+  border-color: var(--md-sys-color-outline);
+  color: var(--md-sys-color-on-surface);
+}
+
+.m3-input {
+  width: 100%;
+  background: var(--md-sys-color-surface-container-low);
+  color: var(--md-sys-color-on-surface);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-shape-sm);
+  padding: 10px 14px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.m3-input:focus {
+  outline: none;
+  border-color: var(--md-sys-color-primary);
+  box-shadow: 0 0 0 3px var(--md-sys-color-primary-container);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}

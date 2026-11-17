@@ -35,6 +35,19 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: web/frontend/package-lock.json
+
+      - name: Build & verify frontend SPA bundle
+        run: |
+          cd web/frontend
+          npm ci --no-audit --no-fund
+          npm run build
+
       - name: Go vet
         env:
           CGO_ENABLED: "1"
@@ -42,7 +55,7 @@ jobs:
         run: go vet ./...
 
       - name: Build complete vpn-ui-amd64 binary
-        run: ./build.sh --arch amd64
+        run: ./build.sh --arch amd64 --skip-frontend
 
       - name: Smoke-test static binary across Linux distros
         run: |
