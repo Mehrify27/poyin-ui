@@ -207,6 +207,79 @@ func TestUpdateCoreZipAndTargetedRestart(t *testing.T) {
 	}
 }
 
+func TestUpdateCoreRollsBackWhenVerifyFails(t *testing.T) {
+	customDir := t.TempDir()
+	t.Setenv(binutil.CustomBinDirEnv, customDir)
+
+	prevELF := makeUpdaterTestELF(t, runtime.GOARCH, 0xA1)
+	nextELF := makeUpdaterTestELF(t, runtime.GOARCH, 0xB2)
+	nextZip := makeTestZipArchive(t, "xray", nextELF)
+	sum := sha256HexBytes(nextZip)
+
+	spec, _ := findCoreUpdateSpec("xray")
+	destPath := filepath.Join(customDir, spec.CustomFileFunc())
+	if err := os.WriteFile(destPath, prevELF, 0o755); err != nil {
+		t.Fatalf("seed previous binary: %v", err)
+	}
+
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.EscapedPath() {
+		case "/repos/XTLS/Xray-core/releases/latest":
+			assetName := fmt.Sprintf("Xray-linux-%s.zip", archTokenForTest(runtime.GOARCH))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tag_name": "v26.99.1",
+				"assets": []map[string]any{
+					{
+						"name":                 assetName,
+						"browser_download_url": srv.URL + "/download/" + assetName,
+					},
+				},
+			})
+		case fmt.Sprintf("/download/Xray-linux-%s.zip", archTokenForTest(runtime.GOARCH)):
+			_, _ = w.Write(nextZip)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	prevBase := githubReleaseAPIBase
+	githubReleaseAPIBase = srv.URL
+	defer func() { githubReleaseAPIBase = prevBase }()
+
+	var restarted []string
+	svc := &CoreService{}
+	results, err := svc.UpdateCore(CoreUpdateOptions{
+		Target:         "xray",
+		AllowUnpatched: true,
+		SHA256:         sum,
+		RestartFunc: func(core string) error {
+			restarted = append(restarted, core)
+			return nil
+		},
+		VerifyHealthFunc: func(spec CoreUpdateSpec, dest string) error {
+			return errors.New("xray exited during stability check: exit status 23")
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error when health verification failed")
+	}
+	if len(results) != 1 || !results[0].RolledBack || results[0].Status != "rolled_back" {
+		t.Fatalf("expected rolled_back result, got %+v", results)
+	}
+	if len(restarted) != 2 {
+		t.Fatalf("expected 2 restarts (apply + rollback), got %d (%v)", len(restarted), restarted)
+	}
+	restored, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("read restored binary: %v", err)
+	}
+	if !bytes.Equal(restored, prevELF) {
+		t.Fatalf("binary was not rolled back to previous contents")
+	}
+}
+
 func TestUpdateCoreTarGzRejectsBadSHAAndWrongArch(t *testing.T) {
 	customDir := t.TempDir()
 	t.Setenv(binutil.CustomBinDirEnv, customDir)
@@ -687,5 +760,57 @@ func TestScoreReleaseAssetHandles386AndArmv7(t *testing.T) {
 	}
 	if name, _, _, _ := pickReleaseAsset("xray", assets, "arm"); name != "Xray-linux-arm32-v7a.zip" {
 		t.Fatalf("arm picked %q, want Xray-linux-arm32-v7a.zip", name)
+	}
+}
+
+func TestFetchValidatedJSONSupportsLargeReleasesPayloads(t *testing.T) {
+	// Reproduce XTLS/Xray-core/releases?per_page=100 (~10.5 MB JSON) exceeding the legacy 8 MiB cap.
+	filler := strings.Repeat("x", 9*1024*1024)
+	payload, err := json.Marshal([]map[string]any{
+		{
+			"tag_name": "v26.11.9",
+			"name":     "Xray 26.11.9",
+			"body":     filler,
+			"assets":   []any{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal large payload: %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	var rels []githubReleasePayload
+	if err := fetchValidatedJSON(srv.URL+"/repos/XTLS/Xray-core/releases?per_page=100", 10*time.Second, nil, &rels); err != nil {
+		t.Fatalf("fetchValidatedJSON failed on >8 MiB payload: %v", err)
+	}
+	if len(rels) != 1 || rels[0].TagName != "v26.11.9" {
+		t.Fatalf("unexpected parsed releases: %+v", rels)
+	}
+}
+
+func TestGetCoreBinaryInfoMatchesInventory(t *testing.T) {
+	t.Setenv(binutil.CustomBinDirEnv, t.TempDir())
+	svc := &CoreService{}
+	inv := svc.GetCoreBinaryInventory()
+	var xrayInv *CoreBinaryInfo
+	for i := range inv {
+		if inv[i].Core == "xray" {
+			xrayInv = &inv[i]
+			break
+		}
+	}
+	if xrayInv == nil {
+		t.Fatal("xray missing from GetCoreBinaryInventory")
+	}
+	single, ok := svc.GetCoreBinaryInfo("xray")
+	if !ok {
+		t.Fatal("GetCoreBinaryInfo(\"xray\") returned false")
+	}
+	if single.Core != xrayInv.Core || single.UpstreamRepo != xrayInv.UpstreamRepo || single.CustomPatched != xrayInv.CustomPatched {
+		t.Fatalf("single lookup %+v diverged from inventory %+v", single, *xrayInv)
 	}
 }

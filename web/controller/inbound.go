@@ -21,20 +21,21 @@ import (
 
 // InboundController handles HTTP requests related to Xray inbounds management.
 type InboundController struct {
-	inboundService service.InboundService
-	xrayService    service.XrayService
-	l2tpService    service.L2tpService
-	pptpService    service.PptpService
-	openvpnService service.OpenVpnService
-	ocservService  service.OcservService
-	sstpService    service.SstpService
-	ikev2Service   service.Ikev2Service
-	wgcService     service.WgcService
-	awgService     service.AwgService
-	greService       service.GreService
-	mtprotoService   service.MtprotoService
-	hysteria2Service service.Hysteria2Service
-	sshService       service.SshService
+	inboundService     service.InboundService
+	xrayService        service.XrayService
+	l2tpService        service.L2tpService
+	pptpService        service.PptpService
+	openvpnService     service.OpenVpnService
+	ocservService      service.OcservService
+	sstpService        service.SstpService
+	ikev2Service       service.Ikev2Service
+	wgcService         service.WgcService
+	awgService         service.AwgService
+	greService         service.GreService
+	mtprotoService     service.MtprotoService
+	hysteria2Service   service.Hysteria2Service
+	singboxForkService service.SingboxForkService
+	sshService         service.SshService
 }
 
 // NewInboundController creates a new InboundController and sets up its routes.
@@ -362,6 +363,30 @@ func (a *InboundController) hysteria2Changed(clientOnly bool) {
 		}
 	}
 	a.hysteria2Service.KillDisabledSessions()
+	a.xrayService.SetToNeedRestart()
+}
+
+// onSingboxForkChanged reconciles sing-box sidecar daemons for AnyTLS / TUIC v5 / NaiveProxy
+// whenever those inbounds or their clients change and sing-box engine mode is active.
+func (a *InboundController) onSingboxForkChanged()       { a.singboxForkChanged(false) }
+func (a *InboundController) onSingboxForkClientChanged() { a.singboxForkChanged(true) }
+func (a *InboundController) singboxForkChanged(clientOnly bool) {
+	if !service.ShouldUseSingboxForkEngine() {
+		return
+	}
+	if err := a.singboxForkService.GenerateAllConfigs(); err != nil {
+		logger.Warning("sing-box fork: config generation failed:", err)
+	}
+	if !clientOnly {
+		if err := a.singboxForkService.RestartServices(); err != nil {
+			logger.Warning("sing-box fork: service restart failed:", err)
+		}
+	} else {
+		if err := a.singboxForkService.EnsureServicesRunning(); err != nil {
+			logger.Warning("sing-box fork: ensure-running failed:", err)
+		}
+	}
+	a.singboxForkService.KillDisabledSessions()
 	a.xrayService.SetToNeedRestart()
 }
 
@@ -728,6 +753,12 @@ func (a *InboundController) addInbound(c *gin.Context) {
 		a.onMtprotoChanged()
 	} else if inbound.Protocol == model.Hysteria2 {
 		a.onHysteria2Changed()
+	} else if inbound.Protocol == model.ANYTLS || inbound.Protocol == model.TUIC || inbound.Protocol == model.NAIVE {
+		if service.ShouldUseSingboxForkEngine() {
+			a.onSingboxForkChanged()
+		} else if needRestart {
+			a.xrayService.SetToNeedRestart()
+		}
 	} else if inbound.Protocol == model.SSH {
 		a.onSshChanged()
 	} else if inbound.Protocol == model.WireGuard {
@@ -816,6 +847,13 @@ func (a *InboundController) delInbound(c *gin.Context) {
 	} else if oldInbound != nil && oldInbound.Protocol == model.Hysteria2 {
 		a.hysteria2Service.RemoveInboundConfig(id)
 		a.onHysteria2Changed()
+	} else if oldInbound != nil && (oldInbound.Protocol == model.ANYTLS || oldInbound.Protocol == model.TUIC || oldInbound.Protocol == model.NAIVE) {
+		a.singboxForkService.RemoveInboundConfig(id)
+		if service.ShouldUseSingboxForkEngine() {
+			a.onSingboxForkChanged()
+		} else if needRestart {
+			a.xrayService.SetToNeedRestart()
+		}
 	} else if oldInbound != nil && oldInbound.Protocol == model.SSH {
 		a.onSshChanged()
 	} else if oldInbound != nil && oldInbound.Protocol == model.WireGuard {
@@ -918,6 +956,12 @@ func (a *InboundController) updateInbound(c *gin.Context) {
 		a.onMtprotoChanged()
 	} else if inbound.Protocol == model.Hysteria2 {
 		a.onHysteria2Changed()
+	} else if inbound.Protocol == model.ANYTLS || inbound.Protocol == model.TUIC || inbound.Protocol == model.NAIVE {
+		if service.ShouldUseSingboxForkEngine() {
+			a.onSingboxForkChanged()
+		} else if needRestart {
+			a.xrayService.SetToNeedRestart()
+		}
 	} else if inbound.Protocol == model.SSH {
 		a.onSshChanged()
 	} else if inbound.Protocol == model.WireGuard {
@@ -1356,6 +1400,12 @@ func (a *InboundController) delInboundClient(c *gin.Context) {
 		a.onMtprotoChanged()
 	} else if oldInbound != nil && oldInbound.Protocol == model.Hysteria2 {
 		a.onHysteria2ClientChanged()
+	} else if oldInbound != nil && (oldInbound.Protocol == model.ANYTLS || oldInbound.Protocol == model.TUIC || oldInbound.Protocol == model.NAIVE) {
+		if service.ShouldUseSingboxForkEngine() {
+			a.onSingboxForkClientChanged()
+		} else if needRestart {
+			a.xrayService.SetToNeedRestart()
+		}
 	} else if oldInbound != nil && oldInbound.Protocol == model.SSH {
 		a.onSshChanged()
 	} else if oldInbound != nil && oldInbound.Protocol == model.WireGuard {
@@ -1661,6 +1711,12 @@ func (a *InboundController) bulkUpdateClients(c *gin.Context) {
 			a.onMtprotoClientChanged()
 		case string(model.Hysteria2):
 			a.onHysteria2ClientChanged()
+		case string(model.ANYTLS), string(model.TUIC), string(model.NAIVE):
+			if service.ShouldUseSingboxForkEngine() {
+				a.onSingboxForkClientChanged()
+			} else {
+				xrayRestart = true
+			}
 		case string(model.SSH):
 			a.onSshClientChanged()
 		default:
@@ -1977,6 +2033,7 @@ func (a *InboundController) resetClientTraffic(c *gin.Context) {
 	a.onAwgClientChanged()
 	a.onMtprotoClientChanged()
 	a.onHysteria2ClientChanged()
+	a.onSingboxForkClientChanged()
 	a.onSshClientChanged()
 }
 
@@ -2053,6 +2110,7 @@ func (a *InboundController) resetAllTraffics(c *gin.Context) {
 	a.onAwgClientChanged()
 	a.onMtprotoClientChanged()
 	a.onHysteria2ClientChanged()
+	a.onSingboxForkClientChanged()
 	a.onSshClientChanged()
 }
 
@@ -2089,6 +2147,7 @@ func (a *InboundController) resetAllClientTraffics(c *gin.Context) {
 	a.onAwgClientChanged()
 	a.onMtprotoClientChanged()
 	a.onHysteria2ClientChanged()
+	a.onSingboxForkClientChanged()
 	a.onSshClientChanged()
 }
 
@@ -3077,6 +3136,12 @@ func (a *InboundController) reconcileForInbounds(inboundIds []int, needRestart b
 			a.onMtprotoClientChanged()
 		case model.Hysteria2:
 			a.onHysteria2ClientChanged()
+		case model.ANYTLS, model.TUIC, model.NAIVE:
+			if service.ShouldUseSingboxForkEngine() {
+				a.onSingboxForkClientChanged()
+			} else {
+				xrayOnly = true
+			}
 		case model.SSH:
 			a.onSshClientChanged()
 		case model.WireGuard:

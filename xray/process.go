@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -218,14 +217,17 @@ func (p *process) GetResult() string {
 	p.mu.Lock()
 	exitErr := p.exitErr
 	p.mu.Unlock()
-	if len(p.logWriter.lastLine) == 0 && exitErr != nil {
+	lastLine := p.logWriter.LastLine()
+	if len(lastLine) == 0 && exitErr != nil {
 		return exitErr.Error()
 	}
-	return p.logWriter.lastLine
+	return lastLine
 }
 
 // GetVersion returns the version string of the Xray process.
 func (p *process) GetVersion() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return p.version
 }
 
@@ -244,65 +246,102 @@ func (p *Process) GetAPIPort() int {
 	if p == nil {
 		return 0
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return p.apiPort
 }
 
 // GetConfig returns the configuration used by the Xray process.
-func (p *Process) GetConfig() *Config {
+func (p *process) GetConfig() *Config {
 	return p.config
 }
 
 // GetOnlineClients returns the list of online clients for the Xray process.
-func (p *Process) GetOnlineClients() []string {
-	return p.onlineClients
+func (p *process) GetOnlineClients() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.onlineClients...)
 }
 
 // SetOnlineClients sets the list of online clients for the Xray process.
-func (p *Process) SetOnlineClients(users []string) {
-	p.onlineClients = users
+func (p *process) SetOnlineClients(users []string) {
+	p.mu.Lock()
+	p.onlineClients = append([]string(nil), users...)
+	p.mu.Unlock()
 }
 
 // GetOnlineMemberships returns which (inbound, account) pairs the last tick saw
 // traffic for, as "<inboundId>:<email>".
-func (p *Process) GetOnlineMemberships() []string {
-	return p.onlineMemberships
+func (p *process) GetOnlineMemberships() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.onlineMemberships...)
 }
 
 // SetOnlineMemberships records which (inbound, account) pairs the last tick saw
 // traffic for.
-func (p *Process) SetOnlineMemberships(pairs []string) {
-	p.onlineMemberships = pairs
+func (p *process) SetOnlineMemberships(pairs []string) {
+	p.mu.Lock()
+	p.onlineMemberships = append([]string(nil), pairs...)
+	p.mu.Unlock()
 }
 
 // GetUptime returns the uptime of the Xray process in seconds.
 func (p *Process) GetUptime() uint64 {
-	return uint64(time.Since(p.startTime).Seconds())
+	p.mu.Lock()
+	startTime := p.startTime
+	p.mu.Unlock()
+	return uint64(time.Since(startTime).Seconds())
 }
 
 // refreshAPIPort updates the API port from the inbound configs.
 func (p *process) refreshAPIPort() {
+	apiPort := 0
 	for _, inbound := range p.config.InboundConfigs {
 		if inbound.Tag == "api" {
-			p.apiPort = inbound.Port
+			apiPort = inbound.Port
 			break
 		}
 	}
+	p.mu.Lock()
+	p.apiPort = apiPort
+	p.mu.Unlock()
 }
 
 // refreshVersion updates the version string by running the Xray binary with -version.
 func (p *process) refreshVersion() {
 	cmd := exec.Command(GetBinaryPath(), "-version")
 	data, err := cmd.Output()
-	if err != nil {
-		p.version = "Unknown"
-		return
+	ver := "Unknown"
+	if err == nil {
+		fields := strings.Fields(string(data))
+		if len(fields) >= 2 {
+			ver = fields[1]
+		}
 	}
-	fields := strings.Fields(string(data))
-	if len(fields) < 2 {
-		p.version = "Unknown"
-		return
+	p.mu.Lock()
+	p.version = ver
+	p.mu.Unlock()
+}
+
+// setEnvOverrides replaces or appends KEY=VALUE pairs cleanly without creating duplicates.
+func setEnvOverrides(baseEnv []string, overrides ...string) []string {
+	out := make([]string, 0, len(baseEnv)+len(overrides))
+	overrideKeys := make(map[string]struct{}, len(overrides))
+	for _, ov := range overrides {
+		if k, _, ok := strings.Cut(ov, "="); ok {
+			overrideKeys[k] = struct{}{}
+		}
 	}
-	p.version = fields[1]
+	for _, entry := range baseEnv {
+		if k, _, ok := strings.Cut(entry, "="); ok {
+			if _, replaced := overrideKeys[k]; replaced {
+				continue
+			}
+		}
+		out = append(out, entry)
+	}
+	return append(out, overrides...)
 }
 
 // Start launches the Xray process with the current configuration.
@@ -314,7 +353,9 @@ func (p *process) Start() (err error) {
 	defer func() {
 		if err != nil {
 			logger.Error("Failure in running xray-core process: ", err)
+			p.mu.Lock()
 			p.exitErr = err
+			p.mu.Unlock()
 		}
 	}()
 
@@ -332,40 +373,47 @@ func (p *process) Start() (err error) {
 	if p.configPath != "" {
 		configPath = p.configPath
 	}
-	err = os.WriteFile(configPath, data, fs.ModePerm)
+	err = os.WriteFile(configPath, data, 0o640)
 	if err != nil {
 		return common.NewErrorf("Failed to write configuration file: %v", err)
 	}
 
 	cmd := exec.Command(GetBinaryPath(), "-c", configPath)
-	done := make(chan struct{})
-	p.mu.Lock()
-	p.cmd = cmd
-	p.done = done
-	p.exitErr = nil
-	p.mu.Unlock()
 
-	// Hand the speed limit sidecar to the patched core out of band. An env var is used
-	// rather than a config section because Xray's app configs are protobuf Any values,
-	// so a plain JSON side-channel there would drag infra/conf and codegen into the
-	// fork patch, and because anything in the config restarts Xray on every change.
-	//
-	// Resolve to an absolute path: cmd.Dir is never set, so Xray inherits whatever cwd
-	// the panel was started with, and GetBinFolderPath is RELATIVE ("bin") unless
-	// VPNUI_BIN_FOLDER overrides it. Resolving here pins the path to the cwd the panel
-	// itself resolves "bin" against, instead of trusting Xray to resolve it the same way.
+	// Hand the speed limit sidecar and asset directory (geoip.dat / geosite.dat)
+	// to Xray-core out of band so custom-updated binaries outside bin/ still
+	// resolve geo assets cleanly.
 	speedLimitPath := GetSpeedLimitPath()
 	if abs, absErr := filepath.Abs(speedLimitPath); absErr == nil {
 		speedLimitPath = abs
 	}
-	cmd.Env = append(os.Environ(), "XRAY_SPEEDLIMIT_FILE="+speedLimitPath)
+	assetDir := config.GetBinFolderPath()
+	if abs, absErr := filepath.Abs(assetDir); absErr == nil {
+		assetDir = abs
+	}
+	cmd.Env = setEnvOverrides(os.Environ(),
+		"XRAY_SPEEDLIMIT_FILE="+speedLimitPath,
+		"XRAY_LOCATION_ASSET="+assetDir,
+	)
 
 	cmd.Stdout = p.logWriter
 	cmd.Stderr = p.logWriter
 
+	done := make(chan struct{})
+	if startErr := cmd.Start(); startErr != nil {
+		return startErr
+	}
+
+	p.mu.Lock()
+	p.cmd = cmd
+	p.done = done
+	p.exitErr = nil
+	p.startTime = time.Now()
+	p.mu.Unlock()
+
 	go func() {
 		defer close(done)
-		runErr := cmd.Run()
+		runErr := cmd.Wait()
 		if runErr != nil {
 			logger.Error("Failure in running xray-core:", runErr)
 			p.mu.Lock()
@@ -430,5 +478,5 @@ func (p *process) Stop() error {
 // writeCrashReport writes a crash report to the binary folder with a timestamped filename.
 func writeCrashReport(m []byte) error {
 	crashReportPath := config.GetBinFolderPath() + "/core_crash_" + time.Now().Format("20060102_150405") + ".log"
-	return os.WriteFile(crashReportPath, m, os.ModePerm)
+	return os.WriteFile(crashReportPath, m, 0o640)
 }

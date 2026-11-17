@@ -146,7 +146,7 @@ function reloadForUpdate(): void {
             <span class="shell-server-name">
               {{ appStore.ui?.serverName || appStore.bootstrap?.host || "VPN-UI" }}
             </span>
-            <span class="shell-version-badge">v{{ appStore.bootstrap?.version || "2.0.2" }}</span>
+            <span class="shell-version-badge">v{{ appStore.bootstrap?.version || "2.0.3" }}</span>
           </div>
         </div>
 

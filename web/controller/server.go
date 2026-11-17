@@ -31,8 +31,10 @@ type ServerController struct {
 	inboundService   service.InboundService
 	bootstrapCtrl    BootstrapController
 
+	statusMu   sync.RWMutex // guards lastStatus
 	lastStatus *service.Status
 
+	versionsMu          sync.Mutex // guards lastVersions/lastGetVersionsTime
 	lastVersions        []string
 	lastGetVersionsTime int64 // unix seconds
 
@@ -138,12 +140,21 @@ func (a *ServerController) initRouter(g *gin.RouterGroup) {
 
 // refreshStatus updates the cached server status and collects CPU history.
 func (a *ServerController) refreshStatus() {
-	a.lastStatus = a.serverService.GetStatus(a.lastStatus)
+	a.statusMu.RLock()
+	prev := a.lastStatus
+	a.statusMu.RUnlock()
+
+	cur := a.serverService.GetStatus(prev)
+
+	a.statusMu.Lock()
+	a.lastStatus = cur
+	a.statusMu.Unlock()
+
 	// collect cpu history when status is fresh
-	if a.lastStatus != nil {
-		a.serverService.AppendCpuSample(time.Now(), a.lastStatus.Cpu)
+	if cur != nil {
+		a.serverService.AppendCpuSample(time.Now(), cur.Cpu)
 		// Broadcast status update via WebSocket
-		websocket.BroadcastStatus(a.lastStatus)
+		websocket.BroadcastStatus(cur)
 	}
 }
 
@@ -159,7 +170,12 @@ func (a *ServerController) startTask() {
 }
 
 // status returns the current server status information.
-func (a *ServerController) status(c *gin.Context) { jsonObj(c, a.lastStatus, nil) }
+func (a *ServerController) status(c *gin.Context) {
+	a.statusMu.RLock()
+	cur := a.lastStatus
+	a.statusMu.RUnlock()
+	jsonObj(c, cur, nil)
+}
 
 // userStats returns the overview's account roll-up (total, online, depleted and
 // expiring) for the logged-in admin. The inbounds page derives the same four
@@ -288,10 +304,14 @@ func (a *ServerController) getCpuHistoryBucket(c *gin.Context) {
 // getXrayVersion retrieves available Xray versions, with caching for 1 minute.
 func (a *ServerController) getXrayVersion(c *gin.Context) {
 	now := time.Now().Unix()
-	if now-a.lastGetVersionsTime <= 60 { // 1 minute cache
-		jsonObj(c, a.lastVersions, nil)
+	a.versionsMu.Lock()
+	if now-a.lastGetVersionsTime <= 60 && len(a.lastVersions) > 0 { // 1 minute cache
+		cached := append([]string(nil), a.lastVersions...)
+		a.versionsMu.Unlock()
+		jsonObj(c, cached, nil)
 		return
 	}
+	a.versionsMu.Unlock()
 
 	versions, err := a.serverService.GetXrayVersions()
 	if err != nil {
@@ -299,8 +319,10 @@ func (a *ServerController) getXrayVersion(c *gin.Context) {
 		return
 	}
 
-	a.lastVersions = versions
-	a.lastGetVersionsTime = now
+	a.versionsMu.Lock()
+	a.lastVersions = append([]string(nil), versions...)
+	a.lastGetVersionsTime = time.Now().Unix()
+	a.versionsMu.Unlock()
 
 	jsonObj(c, versions, nil)
 }
@@ -655,7 +677,9 @@ func (a *ServerController) getDb(c *gin.Context) {
 	c.Header("Content-Disposition", "attachment; filename="+filename)
 
 	// Write the file contents to the response
-	c.Writer.Write(db)
+	if _, werr := c.Writer.Write(db); werr != nil {
+		_ = c.AbortWithError(http.StatusInternalServerError, werr)
+	}
 }
 
 // backupNameOptions reads the filename picker's four checkboxes off the query

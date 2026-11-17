@@ -3,12 +3,14 @@ package service
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -100,6 +102,12 @@ func ControlSocketPath() string {
 	return filepath.Join(filepath.Dir(exe), controlSocketName)
 }
 
+var (
+	controlMu       sync.Mutex
+	controlListener net.Listener
+	controlStopping bool
+)
+
 // StartControlSocket binds the control socket and serves it in a background
 // goroutine. Callers must treat a failure as non-fatal and keep going: the socket
 // only serves the CLI, and a panel carrying VPN traffic without it is far better
@@ -128,21 +136,40 @@ func StartControlSocket() error {
 		_ = ln.Close()
 		return fmt.Errorf("chmod control socket %s: %w", path, err)
 	}
+	controlMu.Lock()
+	controlListener = ln
+	controlStopping = false
+	controlMu.Unlock()
 	logger.Info("control socket listening on", path)
 
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				// Accept only fails permanently here (the listener is never closed while
-				// the panel runs), so log and stop rather than spin on the same error.
-				logger.Warning("control socket accept failed, stopping:", err)
+				controlMu.Lock()
+				stopping := controlStopping || errors.Is(err, net.ErrClosed)
+				controlMu.Unlock()
+				if !stopping {
+					logger.Warning("control socket accept failed, stopping:", err)
+				}
 				return
 			}
 			go serveControlConn(conn)
 		}
 	}()
 	return nil
+}
+
+// StopControlSocket gracefully closes the control socket listener on panel shutdown.
+func StopControlSocket() {
+	controlMu.Lock()
+	controlStopping = true
+	ln := controlListener
+	controlListener = nil
+	controlMu.Unlock()
+	if ln != nil {
+		_ = ln.Close()
+	}
 }
 
 // serveControlConn reads request lines until the peer hangs up, answering each.

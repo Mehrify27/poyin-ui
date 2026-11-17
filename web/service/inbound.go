@@ -1124,6 +1124,14 @@ func hasDerivedXrayInbound(p model.Protocol) bool {
 	return isVpnProtocol(p) || isRelayProtocol(p)
 }
 
+// isDerivedXrayInboundRuntime reports whether this inbound's Xray listener is
+// currently synthesized (dokodemo-door or loopback SOCKS5 bridge) rather than
+// terminated natively by Xray-core. Unlike static hasDerivedXrayInbound, this
+// also returns true for AnyTLS/TUIC/NaiveProxy when they run on sing-box.
+func isDerivedXrayInboundRuntime(p model.Protocol) bool {
+	return hasDerivedXrayInbound(p) || (isForkProtocol(p) && ShouldUseSingboxForkEngine())
+}
+
 // AddInbound creates a new inbound configuration.
 // It validates port uniqueness, client email uniqueness, and required fields,
 // then saves the inbound to the database and optionally adds it to the running Xray instance.
@@ -1465,7 +1473,7 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 
 	needRestart := false
 	if inbound.Enable {
-		if hasDerivedXrayInbound(inbound.Protocol) {
+		if isDerivedXrayInboundRuntime(inbound.Protocol) {
 			// Its dokodemo (VPN) or socks inbound (relay) is added by the full restart
 			// the caller triggers. Neither can be built from this inbound's own
 			// protocol, so the API path below would only log a failure and set this
@@ -1837,7 +1845,7 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 	}
 
 	needRestart := false
-	if hasDerivedXrayInbound(oldInbound.Protocol) {
+	if isDerivedXrayInboundRuntime(oldInbound.Protocol) {
 		// Leave the running dokodemo (VPN) or socks inbound (relay) in place. The live
 		// del/add API would drop it and be unable to recreate it, cutting the clients'
 		// internet until a full restart that an unchanged config will not trigger. The
@@ -2157,11 +2165,23 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 	}()
 
 	needRestart := false
-	s.xrayApi.Init(p.GetAPIPort())
+	derived := isDerivedXrayInboundRuntime(oldInbound.Protocol)
+	if !derived {
+		s.xrayApi.Init(p.GetAPIPort())
+	}
 	for _, client := range clients {
 		if len(client.Email) > 0 {
 			if err = s.AddClientStat(tx, data.Id, &client); err != nil {
+				if !derived {
+					s.xrayApi.Close()
+				}
 				return false, err
+			}
+			if derived {
+				if client.Enable {
+					needRestart = true
+				}
+				continue
 			}
 			if client.Enable {
 				cipher := ""
@@ -2189,7 +2209,9 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 			needRestart = true
 		}
 	}
-	s.xrayApi.Close()
+	if !derived {
+		s.xrayApi.Close()
+	}
 
 	return needRestart, tx.Save(oldInbound).Error
 }
@@ -2641,20 +2663,24 @@ func (s *InboundService) DelInboundClient(inboundId int, clientId string) (bool,
 			}
 		}
 		if needApiDel && notDepleted {
-			s.xrayApi.Init(p.GetAPIPort())
-			err1 := s.xrayApi.RemoveUser(oldInbound.Tag, email)
-			if err1 == nil {
-				logger.Debug("Client deleted by api:", email)
-				needRestart = false
+			if isDerivedXrayInboundRuntime(oldInbound.Protocol) {
+				needRestart = true
 			} else {
-				if strings.Contains(err1.Error(), fmt.Sprintf("User %s not found.", email)) {
-					logger.Debug("User is already deleted. Nothing to do more...")
+				s.xrayApi.Init(p.GetAPIPort())
+				err1 := s.xrayApi.RemoveUser(oldInbound.Tag, email)
+				if err1 == nil {
+					logger.Debug("Client deleted by api:", email)
+					needRestart = false
 				} else {
-					logger.Debug("Error in deleting client by api:", err1)
-					needRestart = true
+					if strings.Contains(err1.Error(), fmt.Sprintf("User %s not found.", email)) {
+						logger.Debug("User is already deleted. Nothing to do more...")
+					} else {
+						logger.Debug("Error in deleting client by api:", err1)
+						needRestart = true
+					}
 				}
+				s.xrayApi.Close()
 			}
-			s.xrayApi.Close()
 		}
 	}
 	if err := db.Save(oldInbound).Error; err != nil {
@@ -2927,43 +2953,47 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 	}
 	needRestart := false
 	if len(oldEmail) > 0 {
-		s.xrayApi.Init(p.GetAPIPort())
-		if oldClients[clientIndex].Enable {
-			err1 := s.xrayApi.RemoveUser(oldInbound.Tag, oldEmail)
-			if err1 == nil {
-				logger.Debug("Old client deleted by api:", oldEmail)
-			} else {
-				if strings.Contains(err1.Error(), fmt.Sprintf("User %s not found.", oldEmail)) {
-					logger.Debug("User is already deleted. Nothing to do more...")
+		if isDerivedXrayInboundRuntime(oldInbound.Protocol) {
+			needRestart = true
+		} else {
+			s.xrayApi.Init(p.GetAPIPort())
+			if oldClients[clientIndex].Enable {
+				err1 := s.xrayApi.RemoveUser(oldInbound.Tag, oldEmail)
+				if err1 == nil {
+					logger.Debug("Old client deleted by api:", oldEmail)
 				} else {
-					logger.Debug("Error in deleting client by api:", err1)
+					if strings.Contains(err1.Error(), fmt.Sprintf("User %s not found.", oldEmail)) {
+						logger.Debug("User is already deleted. Nothing to do more...")
+					} else {
+						logger.Debug("Error in deleting client by api:", err1)
+						needRestart = true
+					}
+				}
+			}
+			if clients[0].Enable {
+				cipher := ""
+				if oldInbound.Protocol == "shadowsocks" {
+					cipher = oldSettings["method"].(string)
+				}
+				err1 := s.xrayApi.AddUser(string(oldInbound.Protocol), oldInbound.Tag, map[string]any{
+					"email":    clients[0].Email,
+					"id":       clients[0].ID,
+					"security": clients[0].Security,
+					"flow":     clients[0].Flow,
+					"auth":     clients[0].Auth,
+					"password": clients[0].Password,
+					"username": clients[0].Username,
+					"cipher":   cipher,
+				})
+				if err1 == nil {
+					logger.Debug("Client edited by api:", clients[0].Email)
+				} else {
+					logger.Debug("Error in adding client by api:", err1)
 					needRestart = true
 				}
 			}
+			s.xrayApi.Close()
 		}
-		if clients[0].Enable {
-			cipher := ""
-			if oldInbound.Protocol == "shadowsocks" {
-				cipher = oldSettings["method"].(string)
-			}
-			err1 := s.xrayApi.AddUser(string(oldInbound.Protocol), oldInbound.Tag, map[string]any{
-				"email":    clients[0].Email,
-				"id":       clients[0].ID,
-				"security": clients[0].Security,
-				"flow":     clients[0].Flow,
-				"auth":     clients[0].Auth,
-				"password": clients[0].Password,
-				"username": clients[0].Username,
-				"cipher":   cipher,
-			})
-			if err1 == nil {
-				logger.Debug("Client edited by api:", clients[0].Email)
-			} else {
-				logger.Debug("Error in adding client by api:", err1)
-				needRestart = true
-			}
-		}
-		s.xrayApi.Close()
 	} else {
 		logger.Debug("Client old email not found")
 		needRestart = true
@@ -3993,6 +4023,10 @@ func (s *InboundService) disableInvalidClients(tx *gorm.DB) (bool, int64, []stri
 				ovpnDisabledEmails = append(ovpnDisabledEmails, result.Email)
 				continue
 			}
+			if isDerivedXrayInboundRuntime(model.Protocol(result.Protocol)) {
+				needRestart = true
+				continue
+			}
 			err1 := s.xrayApi.RemoveUser(result.Tag, result.Email)
 			if err1 == nil {
 				logger.Debug("Client disabled by api:", result.Email)
@@ -4789,6 +4823,10 @@ func (s *InboundService) ResetClientTraffic(id int, clientEmail string) (bool, e
 		}
 		for _, client := range clients {
 			if client.Email == clientEmail && client.Enable {
+				if isDerivedXrayInboundRuntime(inbound.Protocol) {
+					needRestart = true
+					break
+				}
 				s.xrayApi.Init(p.GetAPIPort())
 				cipher := ""
 				if string(inbound.Protocol) == "shadowsocks" {
@@ -5962,19 +6000,23 @@ func (s *InboundService) DelInboundClientByEmail(inboundId int, email string) (b
 		}
 
 		if needApiDel {
-			s.xrayApi.Init(p.GetAPIPort())
-			if err1 := s.xrayApi.RemoveUser(oldInbound.Tag, storedEmail); err1 == nil {
-				logger.Debug("Client deleted by api:", storedEmail)
-				needRestart = false
+			if isDerivedXrayInboundRuntime(oldInbound.Protocol) {
+				needRestart = true
 			} else {
-				if strings.Contains(err1.Error(), fmt.Sprintf("User %s not found.", storedEmail)) {
-					logger.Debug("User is already deleted. Nothing to do more...")
+				s.xrayApi.Init(p.GetAPIPort())
+				if err1 := s.xrayApi.RemoveUser(oldInbound.Tag, storedEmail); err1 == nil {
+					logger.Debug("Client deleted by api:", storedEmail)
+					needRestart = false
 				} else {
-					logger.Debug("Error in deleting client by api:", err1)
-					needRestart = true
+					if strings.Contains(err1.Error(), fmt.Sprintf("User %s not found.", storedEmail)) {
+						logger.Debug("User is already deleted. Nothing to do more...")
+					} else {
+						logger.Debug("Error in deleting client by api:", err1)
+						needRestart = true
+					}
 				}
+				s.xrayApi.Close()
 			}
-			s.xrayApi.Close()
 		}
 	}
 

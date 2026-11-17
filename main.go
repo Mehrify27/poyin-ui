@@ -339,7 +339,7 @@ func runWebServer() {
 
 	sigCh := make(chan os.Signal, 1)
 	// Trap shutdown signals
-	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGTERM, sys.SIGUSR1)
+	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT, sys.SIGUSR1)
 	for {
 		sig := <-sigCh
 
@@ -389,6 +389,7 @@ func runWebServer() {
 			service.StopBot()
 			// ------------------------------------------------------------
 
+			service.StopControlSocket()
 			server.Stop()
 			subServer.Stop()
 			log.Println("Shutting down servers.")

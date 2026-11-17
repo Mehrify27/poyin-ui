@@ -85,21 +85,34 @@ func (j *CheckClientIpJob) Run() {
 
 func (j *CheckClientIpJob) clearAccessLog() {
 	logAccessP, err := os.OpenFile(xray.GetAccessPersistentLogPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	j.checkError(err)
+	if err != nil {
+		j.checkError(err)
+		return
+	}
 	defer logAccessP.Close()
 
 	accessLogPath, err := xray.GetAccessLogPath()
-	j.checkError(err)
+	if err != nil {
+		j.checkError(err)
+		return
+	}
 
 	file, err := os.Open(accessLogPath)
-	j.checkError(err)
+	if err != nil {
+		j.checkError(err)
+		return
+	}
 	defer file.Close()
 
-	_, err = io.Copy(logAccessP, file)
-	j.checkError(err)
+	if _, err = io.Copy(logAccessP, file); err != nil {
+		j.checkError(err)
+		return
+	}
 
-	err = os.Truncate(accessLogPath, 0)
-	j.checkError(err)
+	if err = os.Truncate(accessLogPath, 0); err != nil {
+		j.checkError(err)
+		return
+	}
 
 	j.lastClear = time.Now().Unix()
 }
@@ -139,8 +152,20 @@ func (j *CheckClientIpJob) processLogFile() {
 	emailRegex := regexp.MustCompile(`email: (.+)$`)
 	timestampRegex := regexp.MustCompile(`^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})`)
 
-	accessLogPath, _ := xray.GetAccessLogPath()
-	file, _ := os.Open(accessLogPath)
+	accessLogPath, err := xray.GetAccessLogPath()
+	if err != nil || accessLogPath == "" {
+		if err != nil {
+			j.checkError(err)
+		}
+		return
+	}
+	file, err := os.Open(accessLogPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			j.checkError(err)
+		}
+		return
+	}
 	defer file.Close()
 
 	// Track IPs with their last seen timestamp

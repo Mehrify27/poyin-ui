@@ -5,19 +5,40 @@ import { ApiError, panelApi } from "@/api/client";
 import AppShell from "@/components/AppShell.vue";
 import M3Icon from "@/components/M3Icon.vue";
 import { useAppStore } from "@/stores/app";
-import type { CoreBinaryInventory, NetworkTuningStatus } from "@/types/api";
+import type {
+  CoreBinaryInventory,
+  NetworkTuningStatus,
+  XrayBinaryCapabilities,
+} from "@/types/api";
 
 const { t } = useI18n();
 const appStore = useAppStore();
 
 const loading = ref(false);
 const actingProfile = ref(false);
+const savingForkEngine = ref(false);
 const errorMessage = ref("");
 const binaries = ref<CoreBinaryInventory[]>([]);
+const xrayCaps = ref<XrayBinaryCapabilities | null>(null);
+const forkProtocolEngine = ref("auto");
+const speedLimitEngine = ref("in-core-xray");
 const netTuning = ref<NetworkTuningStatus | null>(null);
 const selectedProfile = ref("vpn-performance");
 
 const isSuperAdmin = computed(() => Boolean(appStore.user?.isSuperAdmin));
+
+function binaryModeLabel(mode?: string): string {
+  switch (mode) {
+    case "bundled-patched":
+      return "Bundled Patched (XTLS)";
+    case "custom-patched":
+      return "Custom Patched";
+    case "official-xtls-unpatched":
+      return "Official XTLS";
+    default:
+      return mode || "-";
+  }
+}
 
 async function loadData(): Promise<void> {
   loading.value = true;
@@ -28,6 +49,13 @@ async function loadData(): Promise<void> {
       panelApi.fetchNetworkTuning(),
     ]);
     binaries.value = versionsRes.binaries ?? [];
+    xrayCaps.value = versionsRes.xrayCapabilities ?? null;
+    if (versionsRes.forkProtocolEngine) {
+      forkProtocolEngine.value = versionsRes.forkProtocolEngine;
+    }
+    if (versionsRes.speedLimitEngine) {
+      speedLimitEngine.value = versionsRes.speedLimitEngine;
+    }
     netTuning.value = tuningRes;
     if (tuningRes.activeProfile) {
       selectedProfile.value = tuningRes.activeProfile;
@@ -36,6 +64,22 @@ async function loadData(): Promise<void> {
     errorMessage.value = err instanceof ApiError ? err.message : t("somethingWentWrong");
   } finally {
     loading.value = false;
+  }
+}
+
+async function applyForkProtocolEngine(): Promise<void> {
+  savingForkEngine.value = true;
+  errorMessage.value = "";
+  try {
+    const res = await panelApi.setForkProtocolEngine(forkProtocolEngine.value);
+    if (res.binaries) binaries.value = res.binaries;
+    if (res.xrayCapabilities) xrayCaps.value = res.xrayCapabilities;
+    if (res.forkProtocolEngine) forkProtocolEngine.value = res.forkProtocolEngine;
+    if (res.speedLimitEngine) speedLimitEngine.value = res.speedLimitEngine;
+  } catch (err) {
+    errorMessage.value = err instanceof ApiError ? err.message : t("somethingWentWrong");
+  } finally {
+    savingForkEngine.value = false;
   }
 }
 
@@ -133,23 +177,44 @@ onMounted(loadData);
       <section class="m3-card">
         <div class="card-head">
           <h2>{{ t("spa.core.sidecarUpdaterTitle") }}</h2>
+          <div class="tuning-metrics">
+            <span v-if="xrayCaps" class="metric-chip">{{ binaryModeLabel(xrayCaps.binaryMode) }}</span>
+            <span class="metric-chip">{{ speedLimitEngine }}</span>
+          </div>
+        </div>
+
+        <div v-if="isSuperAdmin" class="tuning-controls" style="margin-bottom: 14px">
+          <select v-model="forkProtocolEngine" class="profile-select">
+            <option value="auto">AnyTLS/TUIC/Naive: Auto</option>
+            <option value="sing-box">AnyTLS/TUIC/Naive: sing-box</option>
+            <option value="xray">AnyTLS/TUIC/Naive: Patched Xray</option>
+          </select>
+          <button
+            type="button"
+            class="m3-btn m3-btn--outlined"
+            :disabled="savingForkEngine"
+            @click="applyForkProtocolEngine"
+          >
+            <span>{{ t("confirm") }}</span>
+          </button>
         </div>
 
         <div class="binaries-grid">
           <article v-for="bin in binaries" :key="bin.core" class="binary-card">
             <div class="binary-top">
               <div>
-                <strong>{{ bin.title }}</strong>
-                <div class="binary-sub">{{ bin.protocols }}</div>
+                <strong>{{ bin.core }}</strong>
+                <div class="binary-sub">{{ bin.protocols || bin.serviceCore }}</div>
               </div>
-              <span class="m3-pill" :class="bin.available ? 'm3-pill--ok' : 'm3-pill--warn'">
-                {{ bin.available ? t("pages.core.installedTag") : t("pages.core.missing") }}
+              <span class="m3-pill" :class="bin.source !== 'missing' ? 'm3-pill--ok' : 'm3-pill--warn'">
+                {{ bin.source !== 'missing' ? t("pages.core.installedTag") : t("pages.core.missing") }}
               </span>
             </div>
             <div class="binary-meta">
-              <span>{{ t("pages.core.version") }}: <code>{{ bin.version || "-" }}</code></span>
+              <span>{{ t("pages.core.version") }}: <code>{{ bin.installedVersion || bin.version || "-" }}</code></span>
               <span>{{ t("pages.core.backend") }}: <code>{{ bin.source }}</code></span>
-              <span v-if="bin.customPatched" class="m3-pill m3-pill--info">custom-patched</span>
+              <span v-if="bin.binaryMode" class="m3-pill m3-pill--info">{{ binaryModeLabel(bin.binaryMode) }}</span>
+              <span v-else-if="bin.customPatched" class="m3-pill m3-pill--info">custom-patched</span>
             </div>
           </article>
         </div>

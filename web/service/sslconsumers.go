@@ -56,13 +56,14 @@ type SSLConsumer struct {
 }
 
 const (
-	SSLConsumerPanel  = "panel"
-	SSLConsumerSub    = "subscription"
-	SSLConsumerXray   = "xray"
-	SSLConsumerIkev2     = "ikev2"
-	SSLConsumerOcserv    = "ocserv"
-	SSLConsumerSstp      = "sstp"
-	SSLConsumerHysteria2 = "hysteria2"
+	SSLConsumerPanel       = "panel"
+	SSLConsumerSub         = "subscription"
+	SSLConsumerXray        = "xray"
+	SSLConsumerIkev2       = "ikev2"
+	SSLConsumerOcserv      = "ocserv"
+	SSLConsumerSstp        = "sstp"
+	SSLConsumerHysteria2   = "hysteria2"
+	SSLConsumerSingboxFork = "singbox-fork"
 )
 
 // ListSSLConsumers finds everything configured to serve the given certificate
@@ -186,11 +187,18 @@ func sslConsumerForInbound(in *model.Inbound, want string) (SSLConsumer, bool) {
 		}, true
 	}
 
-	// Everything else is an Xray inbound, where the certificate lives in
-	// streamSettings.tlsSettings.certificates[].
+	// Everything else is an Xray inbound (or AnyTLS/TUIC/NaiveProxy running on
+	// sing-box sidecar), where the certificate lives in streamSettings.tlsSettings.certificates[].
 	oneTime, matched := sslXrayCertMatch(in.StreamSettings, want)
 	if !matched {
 		return SSLConsumer{}, false
+	}
+	if isForkProtocol(in.Protocol) && ShouldUseSingboxForkEngine() {
+		return SSLConsumer{
+			Kind: SSLConsumerSingboxFork, Label: fmt.Sprintf("%s inbound %q (sing-box)", strings.ToUpper(string(in.Protocol)), in.Remark),
+			InboundId: in.Id, Protocol: string(in.Protocol), Disruptive: true,
+			Action: "Restart sing-box. It reads its TLS certificate at process start, so EVERY connected session on that inbound is disconnected.",
+		}, true
 	}
 	if oneTime {
 		return SSLConsumer{
@@ -310,6 +318,16 @@ func ApplySSLConsumers(certPath string, opts SSLFanOutOptions, emit func(Provisi
 			var hy2 Hysteria2Service
 			err := hy2.RestartServices()
 			emit(ProvisionStep{Name: c.Label, OK: err == nil, Msg: sslApplyMsg(err, "Restarted sing-box with the new certificate. Connected Hysteria 2 users were disconnected.")})
+
+		case c.Kind == SSLConsumerSingboxFork:
+			if !opts.ApplyDisruptive {
+				deferred = append(deferred, c.Label)
+				emit(ProvisionStep{Name: c.Label, OK: true, Warn: true, Msg: "Skipped: " + c.Action})
+				continue
+			}
+			var sf SingboxForkService
+			err := sf.RestartServices()
+			emit(ProvisionStep{Name: c.Label, OK: err == nil, Msg: sslApplyMsg(err, "Restarted sing-box sidecar with the new certificate. Connected sessions on that inbound were disconnected.")})
 		}
 	}
 

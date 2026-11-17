@@ -383,35 +383,53 @@ func (s *ServerService) GetStatus(lastStatus *Status) *Status {
 
 	status.LogicalPro = runtime.NumCPU()
 
-	if status.CpuSpeedMhz = s.cachedCpuSpeedMhz; s.cachedCpuSpeedMhz == 0 && time.Since(s.lastCpuInfoAttempt) > 5*time.Minute {
+	s.mu.Lock()
+	cachedSpeed := s.cachedCpuSpeedMhz
+	cachedModel := s.cachedCpuModel
+	lastAttempt := s.lastCpuInfoAttempt
+	shouldProbeCpuInfo := cachedSpeed == 0 && time.Since(lastAttempt) > 5*time.Minute
+	if shouldProbeCpuInfo {
 		s.lastCpuInfoAttempt = time.Now()
-		done := make(chan struct{})
+	}
+	s.mu.Unlock()
+
+	if shouldProbeCpuInfo {
+		type cpuInfoRes struct {
+			mhz   float64
+			model string
+		}
+		resCh := make(chan cpuInfoRes, 1)
 		go func() {
-			defer close(done)
 			cpuInfos, err := cpu.Info()
 			if err != nil {
 				logger.Warning("get cpu info failed:", err)
 				return
 			}
 			if len(cpuInfos) > 0 {
-				s.cachedCpuSpeedMhz = cpuInfos[0].Mhz
-				// The model name comes out of the SAME query, so it is cached here rather
-				// than costing a second cpu.Info() on a poll that runs every 2 seconds.
-				s.cachedCpuModel = strings.TrimSpace(cpuInfos[0].ModelName)
-				status.CpuSpeedMhz = s.cachedCpuSpeedMhz
+				resCh <- cpuInfoRes{
+					mhz:   cpuInfos[0].Mhz,
+					// The model name comes out of the SAME query, so it is cached here rather
+					// than costing a second cpu.Info() on a poll that runs every 2 seconds.
+					model: strings.TrimSpace(cpuInfos[0].ModelName),
+				}
 			} else {
 				logger.Warning("could not find cpu info")
 			}
 		}()
 		select {
-		case <-done:
+		case res := <-resCh:
+			s.mu.Lock()
+			s.cachedCpuSpeedMhz = res.mhz
+			s.cachedCpuModel = res.model
+			cachedSpeed = res.mhz
+			cachedModel = res.model
+			s.mu.Unlock()
 		case <-time.After(1500 * time.Millisecond):
 			logger.Warning("cpu info query timed out; will retry later")
 		}
-	} else if s.cachedCpuSpeedMhz != 0 {
-		status.CpuSpeedMhz = s.cachedCpuSpeedMhz
 	}
-	status.CpuModel = s.cachedCpuModel
+	status.CpuSpeedMhz = cachedSpeed
+	status.CpuModel = cachedModel
 	// Read fresh every poll, and deliberately NOT cached: the whole point of it is
 	// that it moves. The rated speed goes in because a host with no readable clock
 	// (every virtual machine) is measured instead, and a measurement of how fast the
@@ -432,6 +450,7 @@ func (s *ServerService) GetStatus(lastStatus *Status) *Status {
 	// Host identity, read once. osReleaseField is the same /etc/os-release reader the
 	// distro-support check uses (pkgmgr.go), so the dashboard and the unsupported-distro
 	// warning cannot disagree about what this host is.
+	s.mu.Lock()
 	if !s.hostInfoLoaded {
 		s.hostInfoLoaded = true
 		// NAME is the plain distro name ("Ubuntu", "Debian GNU/Linux"); ID is the
@@ -469,6 +488,7 @@ func (s *ServerService) GetStatus(lastStatus *Status) *Status {
 	status.Hostname = s.cachedHostname
 	status.Virt = s.cachedVirt
 	status.MemHW = s.cachedMemHW
+	s.mu.Unlock()
 
 	// Memory stats
 	memInfo, err := mem.VirtualMemory()
@@ -619,30 +639,41 @@ func (s *ServerService) GetStatus(lastStatus *Status) *Status {
 		"https://6.ident.me",
 	}
 
-	if s.cachedIPv4 == "" {
+	s.mu.Lock()
+	ipv4 := s.cachedIPv4
+	ipv6 := s.cachedIPv6
+	noV6 := s.noIPv6
+	s.mu.Unlock()
+
+	if ipv4 == "" {
 		for _, ip4Service := range showIp4ServiceLists {
-			s.cachedIPv4 = getPublicIP(ip4Service)
-			if s.cachedIPv4 != "N/A" {
+			ipv4 = getPublicIP(ip4Service)
+			if ipv4 != "N/A" {
 				break
 			}
 		}
+		s.mu.Lock()
+		s.cachedIPv4 = ipv4
+		s.mu.Unlock()
 	}
 
-	if s.cachedIPv6 == "" && !s.noIPv6 {
+	if ipv6 == "" && !noV6 {
 		for _, ip6Service := range showIp6ServiceLists {
-			s.cachedIPv6 = getPublicIP(ip6Service)
-			if s.cachedIPv6 != "N/A" {
+			ipv6 = getPublicIP(ip6Service)
+			if ipv6 != "N/A" {
 				break
 			}
 		}
+		s.mu.Lock()
+		s.cachedIPv6 = ipv6
+		if ipv6 == "N/A" {
+			s.noIPv6 = true
+		}
+		s.mu.Unlock()
 	}
 
-	if s.cachedIPv6 == "N/A" {
-		s.noIPv6 = true
-	}
-
-	status.PublicIP.IPv4 = s.cachedIPv4
-	status.PublicIP.IPv6 = s.cachedIPv6
+	status.PublicIP.IPv4 = ipv4
+	status.PublicIP.IPv6 = ipv6
 
 	// Xray status
 	if s.xrayService.IsXrayRunning() {
@@ -918,23 +949,32 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 	}
 
 	fileName := fmt.Sprintf("Xray-%s-%s.zip", osName, arch)
-	url := fmt.Sprintf("https://github.com/XTLS/Xray-core/releases/download/%s/%s", version, fileName)
-	resp, err := http.Get(url)
+	dlURL := config.ApplyGHProxy(fmt.Sprintf("https://github.com/XTLS/Xray-core/releases/download/%s/%s", version, fileName))
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Get(dlURL)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download Xray %s: HTTP %d", version, resp.StatusCode)
+	}
 
-	os.Remove(fileName)
+	_ = os.Remove(fileName)
 	file, err := os.Create(fileName)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
 
-	_, err = io.Copy(file, resp.Body)
-	if err != nil {
-		return "", err
+	_, copyErr := io.Copy(file, io.LimitReader(resp.Body, 256<<20))
+	closeErr := file.Close()
+	if copyErr != nil {
+		_ = os.Remove(fileName)
+		return "", copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(fileName)
+		return "", closeErr
 	}
 
 	return fileName, nil
@@ -1471,30 +1511,42 @@ func (s *ServerService) UpdateGeofile(fileName string) error {
 	return nil
 }
 
+func parseXrayKeyPair(output string) (string, string, error) {
+	var nonEmpty []string
+	for _, raw := range strings.Split(strings.TrimSpace(output), "\n") {
+		if line := strings.TrimSpace(raw); line != "" {
+			nonEmpty = append(nonEmpty, line)
+		}
+	}
+	if len(nonEmpty) < 2 {
+		return "", "", common.NewError("unexpected xray key output format")
+	}
+	firstParts := strings.SplitN(nonEmpty[0], ":", 2)
+	secondParts := strings.SplitN(nonEmpty[1], ":", 2)
+	if len(firstParts) != 2 || len(secondParts) != 2 {
+		return "", "", common.NewError("unexpected xray key line delimiter")
+	}
+	return strings.TrimSpace(firstParts[1]), strings.TrimSpace(secondParts[1]), nil
+}
+
 func (s *ServerService) GetNewX25519Cert() (any, error) {
 	// Run the command
 	cmd := exec.Command(xray.GetBinaryPath(), "x25519")
 	var out bytes.Buffer
 	cmd.Stdout = &out
-	err := cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+
+	privateKey, publicKey, err := parseXrayKeyPair(out.String())
 	if err != nil {
 		return nil, err
 	}
 
-	lines := strings.Split(out.String(), "\n")
-
-	privateKeyLine := strings.Split(lines[0], ":")
-	publicKeyLine := strings.Split(lines[1], ":")
-
-	privateKey := strings.TrimSpace(privateKeyLine[1])
-	publicKey := strings.TrimSpace(publicKeyLine[1])
-
-	keyPair := map[string]any{
+	return map[string]any{
 		"privateKey": privateKey,
 		"publicKey":  publicKey,
-	}
-
-	return keyPair, nil
+	}, nil
 }
 
 func (s *ServerService) GetNewmldsa65() (any, error) {
@@ -1502,25 +1554,19 @@ func (s *ServerService) GetNewmldsa65() (any, error) {
 	cmd := exec.Command(xray.GetBinaryPath(), "mldsa65")
 	var out bytes.Buffer
 	cmd.Stdout = &out
-	err := cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+
+	seed, verify, err := parseXrayKeyPair(out.String())
 	if err != nil {
 		return nil, err
 	}
 
-	lines := strings.Split(out.String(), "\n")
-
-	SeedLine := strings.Split(lines[0], ":")
-	VerifyLine := strings.Split(lines[1], ":")
-
-	seed := strings.TrimSpace(SeedLine[1])
-	verify := strings.TrimSpace(VerifyLine[1])
-
-	keyPair := map[string]any{
+	return map[string]any{
 		"seed":   seed,
 		"verify": verify,
-	}
-
-	return keyPair, nil
+	}, nil
 }
 
 func (s *ServerService) GetNewEchCert(sni string) (any, error) {
@@ -1603,23 +1649,17 @@ func (s *ServerService) GetNewmlkem768() (any, error) {
 	cmd := exec.Command(xray.GetBinaryPath(), "mlkem768")
 	var out bytes.Buffer
 	cmd.Stdout = &out
-	err := cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+
+	seed, client, err := parseXrayKeyPair(out.String())
 	if err != nil {
 		return nil, err
 	}
 
-	lines := strings.Split(out.String(), "\n")
-
-	SeedLine := strings.Split(lines[0], ":")
-	ClientLine := strings.Split(lines[1], ":")
-
-	seed := strings.TrimSpace(SeedLine[1])
-	client := strings.TrimSpace(ClientLine[1])
-
-	keyPair := map[string]any{
+	return map[string]any{
 		"seed":   seed,
 		"client": client,
-	}
-
-	return keyPair, nil
+	}, nil
 }

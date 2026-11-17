@@ -145,6 +145,11 @@ var defaultValueMap = map[string]string{
 	// getString treats a key missing from this map as an ERROR rather than as unset,
 	// so every read before the first save would come back as a failure.
 	"coreConfigOverrides": "",
+	// Which runtime executes AnyTLS, TUIC v5, and NaiveProxy inbounds:
+	// "auto" uses sing-box automatically when the active Xray binary lacks
+	// fork protocol patches (e.g. official XTLS/Xray-core), "sing-box" always
+	// delegates them to sing-box, and "xray" keeps them in patched Xray-core.
+	"forkProtocolEngine": "auto",
 }
 
 // SettingService provides business logic for application settings management.
@@ -980,6 +985,41 @@ func (s *SettingService) GetRadiusSecret() (string, error) {
 
 func (s *SettingService) SetRadiusSecret(secret string) error {
 	return s.setString("radiusSecret", secret)
+}
+
+// NormalizeForkProtocolEngine normalizes the configured runtime engine for
+// AnyTLS, TUIC v5, and NaiveProxy into "auto", "sing-box", or "xray".
+func NormalizeForkProtocolEngine(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "sing-box", "singbox":
+		return "sing-box"
+	case "xray", "xray-core":
+		return "xray"
+	default:
+		return "auto"
+	}
+}
+
+// GetForkProtocolEngine returns which runtime executes AnyTLS, TUIC v5, and
+// NaiveProxy ("auto", "sing-box", or "xray"). Defaults to "auto" when absent or
+// before DB initialization.
+func (s *SettingService) GetForkProtocolEngine() string {
+	val, err := s.getString("forkProtocolEngine")
+	if err != nil {
+		return "auto"
+	}
+	return NormalizeForkProtocolEngine(val)
+}
+
+// SetForkProtocolEngine persists the operator's preferred fork protocol runtime.
+func (s *SettingService) SetForkProtocolEngine(mode string) error {
+	norm := NormalizeForkProtocolEngine(mode)
+	if trimmed := strings.ToLower(strings.TrimSpace(mode)); trimmed != "" &&
+		trimmed != "auto" && trimmed != "sing-box" && trimmed != "singbox" &&
+		trimmed != "xray" && trimmed != "xray-core" {
+		return fmt.Errorf("invalid forkProtocolEngine %q (expected auto, sing-box, or xray)", mode)
+	}
+	return s.setString("forkProtocolEngine", norm)
 }
 
 func (s *SettingService) UpdateAllSetting(allSetting *entity.AllSetting) error {

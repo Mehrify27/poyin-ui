@@ -37,7 +37,7 @@ export function getRuntimeConfig(): RuntimeConfig {
     wsPath: injected?.wsPath || `${basePath}ws`,
     manifestUrl: injected?.manifestUrl || `${basePath}manifest.webmanifest`,
     swUrl: injected?.swUrl || `${basePath}sw.js`,
-    version: injected?.version || "2.0.2",
+    version: injected?.version || "2.0.3",
     assetVersion: injected?.assetVersion || "",
   };
   return cachedRuntime;

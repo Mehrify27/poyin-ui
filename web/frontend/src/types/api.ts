@@ -140,18 +140,23 @@ export interface ApiEnvelope<T = unknown> {
 
 export interface CoreBinaryInventory {
   core: string;
-  title: string;
   serviceCore: string;
-  protocols: string;
+  protocols?: string;
   activePath: string;
   bundledPath?: string;
   customPath?: string;
+  customDir?: string;
   source: string;
   version: string;
+  installedVersion?: string;
   sha256?: string;
-  available: boolean;
   hasBackup: boolean;
   customPatched?: boolean;
+  binaryMode?: string;
+  supportsSpeedLimit?: boolean;
+  supportsNativeForkProtocols?: boolean;
+  speedLimitEngine?: string;
+  forkProtocolEngine?: string;
   patchSet?: string[];
   upstreamRepo?: string;
   upstreamUrl?: string;
@@ -160,9 +165,18 @@ export interface CoreBinaryInventory {
   upstreamWarning?: string;
 }
 
+export interface XrayBinaryCapabilities {
+  binaryMode: string;
+  supportsSpeedLimit: boolean;
+  supportsNativeForkProtocols: boolean;
+}
+
 export interface CoreVersionsResponse {
   binaries: CoreBinaryInventory[];
   engines: ProtocolEngineInfo[];
+  xrayCapabilities?: XrayBinaryCapabilities;
+  forkProtocolEngine?: string;
+  speedLimitEngine?: string;
 }
 
 export interface NetworkTuningStatus {

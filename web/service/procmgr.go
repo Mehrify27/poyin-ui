@@ -117,8 +117,10 @@ type managedProc struct {
 	env     []string
 	dir     string
 	cmd     *exec.Cmd
-	stopped bool // Stop() called → suppress auto-restart
-	gen     int  // bumped on every (re)start/stop; supervisors compare against it
+	running bool          // set under mu in launchLocked, cleared under mu after cmd.Wait
+	stopCh  chan struct{} // closed to cancel any pending restart delay immediately
+	stopped bool          // Stop() called → suppress auto-restart
+	gen     int           // bumped on every (re)start/stop; supervisors compare against it
 }
 
 // ProcManager supervises the bundled VPN daemons as child processes.
@@ -153,6 +155,7 @@ func (m *ProcManager) Start(name, bin string, args, env []string, dir string) er
 	defer p.mu.Unlock()
 	// Supersede any current instance/supervisor and stop it.
 	p.gen++
+	p.closeStopChLocked()
 	old := p.cmd
 	p.terminateLocked()
 	// Wait for the old instance to actually exit before launching the replacement.
@@ -163,9 +166,17 @@ func (m *ProcManager) Start(name, bin string, args, env []string, dir string) er
 	if old != nil && old.Process != nil {
 		waitProcessExit(old.Process.Pid)
 	}
+	p.running = false
 	p.bin, p.args, p.env, p.dir = bin, args, env, dir
 	p.stopped = false
 	return p.launchLocked()
+}
+
+func (p *managedProc) closeStopChLocked() {
+	if p.stopCh != nil {
+		close(p.stopCh)
+		p.stopCh = nil
+	}
 }
 
 // waitProcessExit blocks until pid has exited — and thus released its ports —
@@ -206,20 +217,27 @@ func (p *managedProc) launchLocked() error {
 		p.log.add("[procmgr] failed to start " + p.bin + ": " + err.Error())
 		return err
 	}
+	p.closeStopChLocked()
+	stopCh := make(chan struct{})
+	p.stopCh = stopCh
 	p.cmd = cmd
+	p.running = true
 	p.log.add("[procmgr] started: " + p.bin + " " + strings.Join(p.args, " "))
 	gen := p.gen
-	go p.supervise(cmd, gen)
+	go p.supervise(cmd, gen, stopCh)
 	return nil
 }
 
 // supervise waits for the process; if it exits without an explicit Stop and is
 // still the current generation, it is restarted after a short delay.
-func (p *managedProc) supervise(cmd *exec.Cmd, gen int) {
+func (p *managedProc) supervise(cmd *exec.Cmd, gen int, stopCh <-chan struct{}) {
 	waitErr := cmd.Wait()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.cmd == cmd {
+		p.running = false
+	}
 	if gen != p.gen || p.stopped {
 		return // superseded or intentionally stopped
 	}
@@ -231,7 +249,11 @@ func (p *managedProc) supervise(cmd *exec.Cmd, gen int) {
 	p.log.add("[procmgr] " + msg + " — restarting in 5s")
 	restartGen := p.gen
 	go func() {
-		time.Sleep(5 * time.Second)
+		select {
+		case <-stopCh:
+			return
+		case <-time.After(5 * time.Second):
+		}
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		if p.stopped || p.gen != restartGen {
@@ -291,6 +313,7 @@ func (m *ProcManager) Stop(name string) error {
 	defer p.mu.Unlock()
 	p.stopped = true
 	p.gen++
+	p.closeStopChLocked()
 	var pid int
 	if p.cmd != nil && p.cmd.Process != nil {
 		pid = p.cmd.Process.Pid
@@ -299,6 +322,7 @@ func (m *ProcManager) Stop(name string) error {
 	if pid > 0 {
 		waitProcessExit(pid)
 	}
+	p.running = false
 	return nil
 }
 
@@ -330,7 +354,7 @@ func (m *ProcManager) IsRunning(name string) bool {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return !p.stopped && p.cmd != nil && p.cmd.Process != nil && p.cmd.ProcessState == nil
+	return !p.stopped && p.running
 }
 
 // AnyRunningWithPrefix reports whether any managed daemon with the given name
@@ -382,7 +406,7 @@ func (m *ProcManager) alive(name string) bool {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.cmd != nil && p.cmd.Process != nil && p.cmd.ProcessState == nil
+	return p.running
 }
 
 // kill SIGKILLs the named process group (last resort for a straggler).

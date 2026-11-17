@@ -270,6 +270,9 @@ func ipLimitEnforcedInCore(inb *model.Inbound) bool {
 	if inb == nil {
 		return false
 	}
+	if isForkProtocol(inb.Protocol) && ShouldUseSingboxForkEngine() {
+		return false
+	}
 	return !isVpnProtocol(inb.Protocol) && inb.Protocol != model.SSH && inb.Protocol != model.MTPROTO && inb.Protocol != model.Hysteria2
 }
 
@@ -640,20 +643,23 @@ func WriteSpeedLimits() {
 		usage = loadSpeedLimitUsage()
 		ipMap = BuildVpnEmailToIPMap()
 	}
-	data, err := speedLimitDocument(policies, usage, ipMap)
+	users := computeSpeedLimits(policies, usage, ipMap)
+	doc := speedLimitDoc{Users: users}
+	rawJSON, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		logger.Warning("speed limit: marshal failed:", err)
 		return
 	}
+	data := append(rawJSON, '\n')
 	path := xray.GetSpeedLimitPath()
-	if old, readErr := os.ReadFile(path); readErr == nil && bytes.Equal(old, data) {
-		return
+	if old, readErr := os.ReadFile(path); readErr != nil || !bytes.Equal(old, data) {
+		// 0600: the file names every limited account. Nothing but the panel writes it and
+		// nothing but Xray (running as the same user) reads it.
+		if err := backend.WriteFileAtomic(path, data, 0o600); err != nil {
+			logger.Warning("speed limit: write", path, "failed:", err)
+		}
 	}
-	// 0600: the file names every limited account. Nothing but the panel writes it and
-	// nothing but Xray (running as the same user) reads it.
-	if err := backend.WriteFileAtomic(path, data, 0o600); err != nil {
-		logger.Warning("speed limit: write", path, "failed:", err)
-	}
+	applyKernelTCSpeedLimitsIfNeeded(users)
 }
 
 // The sidecar has TWO independent inputs and used to be wired to only one of them.

@@ -53,6 +53,7 @@ func (a *CoreController) initRouter(g *gin.RouterGroup) {
 	g.GET("/upstream/:core", a.upstreamVersions)
 	g.POST("/update/:core", requireSuperAdmin(), a.updateCore)
 	g.POST("/rollback/:core", requireSuperAdmin(), a.rollbackCore)
+	g.POST("/fork-engine", requireSuperAdmin(), a.setForkProtocolEngine)
 	g.GET("/network-tuning", a.networkTuningStatus)
 	g.POST("/network-tuning/apply", requireSuperAdmin(), a.networkTuningApply)
 	g.POST("/network-tuning/revert", requireSuperAdmin(), a.networkTuningRevert)
@@ -281,9 +282,13 @@ type coreBinaryUpdateForm struct {
 // versions returns active paths, sources (custom-override vs bundled), versions,
 // SHA-256 checksums, backup availability, and full 12-protocol engine diagnostics.
 func (a *CoreController) versions(c *gin.Context) {
+	var ss service.SettingService
 	jsonObj(c, gin.H{
-		"binaries": a.coreService.GetCoreBinaryInventory(),
-		"engines":  a.coreService.GetDaemonVersions(),
+		"binaries":           a.coreService.GetCoreBinaryInventory(),
+		"engines":            a.coreService.GetDaemonVersions(),
+		"xrayCapabilities":   service.DetectActiveXrayCapabilities(),
+		"forkProtocolEngine": ss.GetForkProtocolEngine(),
+		"speedLimitEngine":   service.ActiveSpeedLimitEngine(),
 	}, nil)
 }
 
@@ -291,12 +296,13 @@ func (a *CoreController) versions(c *gin.Context) {
 // so operators can pick the latest release or any specific version directly from UI.
 func (a *CoreController) upstreamVersions(c *gin.Context) {
 	forceRefresh := c.Query("refresh") == "1" || c.Query("refresh") == "true"
-	spec, releases, err := a.coreService.ListUpstreamCoreVersions(c.Param("core"), forceRefresh)
-	if err != nil {
-		jsonMsg(c, "Failed to fetch upstream versions", err)
-		return
+	target := c.Param("core")
+	spec, releases, err := a.coreService.ListUpstreamCoreVersions(target, forceRefresh)
+	info, hasInfo := a.coreService.GetCoreBinaryInfo(spec.Target)
+	if !hasInfo {
+		info, hasInfo = a.coreService.GetCoreBinaryInfo(target)
 	}
-	jsonObj(c, gin.H{
+	payload := gin.H{
 		"core":            spec.Target,
 		"serviceCore":     spec.ServiceCore,
 		"protocols":       spec.Protocols,
@@ -308,7 +314,49 @@ func (a *CoreController) upstreamVersions(c *gin.Context) {
 		"patchSet":        spec.PatchSet,
 		"upstreamWarning": spec.UpstreamWarning,
 		"releases":        releases,
-	}, nil)
+	}
+	if hasInfo {
+		payload["installedVersion"] = info.InstalledVersion
+		payload["version"] = info.Version
+		payload["source"] = info.Source
+		payload["hasBackup"] = info.HasBackup
+		payload["customPatched"] = info.CustomPatched
+		payload["binaryMode"] = info.BinaryMode
+		payload["supportsSpeedLimit"] = info.SupportsSpeedLimit
+		payload["supportsNativeForkProtocols"] = info.SupportsNativeForkProtocols
+		payload["speedLimitEngine"] = info.SpeedLimitEngine
+		payload["forkProtocolEngine"] = info.ForkProtocolEngine
+	}
+	if err != nil {
+		jsonMsgObj(c, "Failed to fetch upstream versions", payload, err)
+		return
+	}
+	jsonObj(c, payload, nil)
+}
+
+type forkEngineForm struct {
+	Engine string `form:"engine" json:"engine"`
+}
+
+func (a *CoreController) setForkProtocolEngine(c *gin.Context) {
+	var form forkEngineForm
+	if err := c.ShouldBind(&form); err != nil {
+		jsonMsg(c, "Invalid fork protocol engine request", err)
+		return
+	}
+	var ss service.SettingService
+	if err := ss.SetForkProtocolEngine(form.Engine); err != nil {
+		jsonMsg(c, "Invalid fork protocol engine", err)
+		return
+	}
+	err := a.coreService.RestartCore("xray")
+	jsonMsgObj(c, "Fork protocol engine updated", gin.H{
+		"forkProtocolEngine": ss.GetForkProtocolEngine(),
+		"speedLimitEngine":   service.ActiveSpeedLimitEngine(),
+		"xrayCapabilities":   service.DetectActiveXrayCapabilities(),
+		"binaries":           a.coreService.GetCoreBinaryInventory(),
+		"engines":            a.coreService.GetDaemonVersions(),
+	}, err)
 }
 
 // updateCore installs an independent core/sidecar binary update into the custom
@@ -316,7 +364,10 @@ func (a *CoreController) upstreamVersions(c *gin.Context) {
 // only the affected core, and automatically rolls back on health failure.
 func (a *CoreController) updateCore(c *gin.Context) {
 	var form coreBinaryUpdateForm
-	_ = c.ShouldBind(&form)
+	if err := c.ShouldBind(&form); err != nil {
+		jsonMsg(c, "Invalid core update parameters", err)
+		return
+	}
 	results, err := a.coreService.UpdateCore(service.CoreUpdateOptions{
 		Target:         c.Param("core"),
 		Version:        form.Version,
@@ -325,10 +376,14 @@ func (a *CoreController) updateCore(c *gin.Context) {
 		SHA256:         form.SHA256,
 		AllowUnpatched: form.AllowUnpatched,
 	})
+	var ss service.SettingService
 	jsonMsgObj(c, "Core binary update", gin.H{
-		"results":  results,
-		"binaries": a.coreService.GetCoreBinaryInventory(),
-		"engines":  a.coreService.GetDaemonVersions(),
+		"results":            results,
+		"binaries":           a.coreService.GetCoreBinaryInventory(),
+		"engines":            a.coreService.GetDaemonVersions(),
+		"xrayCapabilities":   service.DetectActiveXrayCapabilities(),
+		"forkProtocolEngine": ss.GetForkProtocolEngine(),
+		"speedLimitEngine":   service.ActiveSpeedLimitEngine(),
 	}, err)
 }
 
@@ -336,10 +391,14 @@ func (a *CoreController) updateCore(c *gin.Context) {
 // custom override to fall back to the bundled binary) and restarts only that core.
 func (a *CoreController) rollbackCore(c *gin.Context) {
 	res, err := a.coreService.RollbackCore(c.Param("core"), nil)
+	var ss service.SettingService
 	jsonMsgObj(c, "Core binary rollback", gin.H{
-		"result":   res,
-		"binaries": a.coreService.GetCoreBinaryInventory(),
-		"engines":  a.coreService.GetDaemonVersions(),
+		"result":             res,
+		"binaries":           a.coreService.GetCoreBinaryInventory(),
+		"engines":            a.coreService.GetDaemonVersions(),
+		"xrayCapabilities":   service.DetectActiveXrayCapabilities(),
+		"forkProtocolEngine": ss.GetForkProtocolEngine(),
+		"speedLimitEngine":   service.ActiveSpeedLimitEngine(),
 	}, err)
 }
 
@@ -355,7 +414,10 @@ func (a *CoreController) networkTuningStatus(c *gin.Context) {
 // networkTuningApply applies the selected BBR / network stack tuning profile.
 func (a *CoreController) networkTuningApply(c *gin.Context) {
 	var form networkTuningApplyForm
-	_ = c.ShouldBind(&form)
+	if err := c.ShouldBind(&form); err != nil {
+		jsonMsg(c, "Invalid network tuning profile", err)
+		return
+	}
 	res, err := a.networkTuningService.ApplyProfile(form.Profile)
 	jsonMsgObj(c, "Network stack tuning", res, err)
 }

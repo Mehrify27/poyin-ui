@@ -159,7 +159,7 @@ read_build_version() {
     fi
     raw="${raw#v}"
     raw="${raw#V}"
-    [[ -n "$raw" ]] || raw="2.0.1"
+    [[ -n "$raw" ]] || raw="2.0.3"
     printf '%s' "$raw"
 }
 

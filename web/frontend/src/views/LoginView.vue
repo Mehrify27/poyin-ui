@@ -178,7 +178,7 @@ async function onLocaleChange(event: Event): Promise<void> {
 
       <footer class="login-foot">
         <a :href="`${appStore.runtime.basePath}panel/`">{{ t("spa.openLegacy") }}</a>
-        <span class="login-ver">v{{ appStore.bootstrap?.version || "2.0.2" }}</span>
+        <span class="login-ver">v{{ appStore.bootstrap?.version || "2.0.3" }}</span>
       </footer>
     </section>
   </main>

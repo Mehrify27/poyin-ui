@@ -1,16 +1,14 @@
 package job
 
 import (
-	"time"
-
+	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	ldaputil "github.com/mhsanaei/3x-ui/v2/util/ldap"
 	"github.com/mhsanaei/3x-ui/v2/web/service"
-
-	"strconv"
 
 	"github.com/google/uuid"
 )
@@ -23,34 +21,31 @@ type LdapSyncJob struct {
 	xrayService    service.XrayService
 }
 
-// --- Helper functions for mustGet ---
-func mustGetString(fn func() (string, error)) string {
+func getSettingStringOr(fn func() (string, error), fallback string) string {
 	v, err := fn()
 	if err != nil {
-		panic(err)
+		logger.Warning("LDAP setting string read failed:", err)
+		return fallback
+	}
+	if v == "" {
+		return fallback
 	}
 	return v
 }
 
-func mustGetInt(fn func() (int, error)) int {
+func getSettingIntOr(fn func() (int, error), fallback int) int {
 	v, err := fn()
 	if err != nil {
-		panic(err)
+		logger.Warning("LDAP setting int read failed:", err)
+		return fallback
 	}
 	return v
 }
 
-func mustGetBool(fn func() (bool, error)) bool {
+func getSettingBoolOr(fn func() (bool, error), fallback bool) bool {
 	v, err := fn()
 	if err != nil {
-		panic(err)
-	}
-	return v
-}
-
-func mustGetStringOr(fn func() (string, error), fallback string) string {
-	v, err := fn()
-	if err != nil || v == "" {
+		logger.Warning("LDAP setting bool read failed:", err)
 		return fallback
 	}
 	return v
@@ -69,19 +64,36 @@ func (j *LdapSyncJob) Run() {
 		return
 	}
 
+	host, err := j.settingService.GetLdapHost()
+	if err != nil || strings.TrimSpace(host) == "" {
+		logger.Warning("LDAP sync skipped: invalid or missing ldapHost:", err)
+		return
+	}
+	port, err := j.settingService.GetLdapPort()
+	if err != nil || port <= 0 {
+		logger.Warning("LDAP sync skipped: invalid or missing ldapPort:", err)
+		return
+	}
+	baseDN, err := j.settingService.GetLdapBaseDN()
+	if err != nil || strings.TrimSpace(baseDN) == "" {
+		logger.Warning("LDAP sync skipped: invalid or missing ldapBaseDN:", err)
+		return
+	}
+
 	// --- LDAP fetch ---
+	flagField := getSettingStringOr(j.settingService.GetLdapFlagField, getSettingStringOr(j.settingService.GetLdapVlessField, ""))
 	cfg := ldaputil.Config{
-		Host:       mustGetString(j.settingService.GetLdapHost),
-		Port:       mustGetInt(j.settingService.GetLdapPort),
-		UseTLS:     mustGetBool(j.settingService.GetLdapUseTLS),
-		BindDN:     mustGetString(j.settingService.GetLdapBindDN),
-		Password:   mustGetString(j.settingService.GetLdapPassword),
-		BaseDN:     mustGetString(j.settingService.GetLdapBaseDN),
-		UserFilter: mustGetString(j.settingService.GetLdapUserFilter),
-		UserAttr:   mustGetString(j.settingService.GetLdapUserAttr),
-		FlagField:  mustGetStringOr(j.settingService.GetLdapFlagField, mustGetString(j.settingService.GetLdapVlessField)),
-		TruthyVals: splitCsv(mustGetString(j.settingService.GetLdapTruthyValues)),
-		Invert:     mustGetBool(j.settingService.GetLdapInvertFlag),
+		Host:       host,
+		Port:       port,
+		UseTLS:     getSettingBoolOr(j.settingService.GetLdapUseTLS, false),
+		BindDN:     getSettingStringOr(j.settingService.GetLdapBindDN, ""),
+		Password:   getSettingStringOr(j.settingService.GetLdapPassword, ""),
+		BaseDN:     baseDN,
+		UserFilter: getSettingStringOr(j.settingService.GetLdapUserFilter, ""),
+		UserAttr:   getSettingStringOr(j.settingService.GetLdapUserAttr, ""),
+		FlagField:  flagField,
+		TruthyVals: splitCsv(getSettingStringOr(j.settingService.GetLdapTruthyValues, "")),
+		Invert:     getSettingBoolOr(j.settingService.GetLdapInvertFlag, false),
 	}
 
 	flags, err := ldaputil.FetchVlessFlags(cfg)
@@ -92,7 +104,7 @@ func (j *LdapSyncJob) Run() {
 	logger.Infof("Fetched %d LDAP flags", len(flags))
 
 	// --- Load all inbounds and all clients once ---
-	inboundTags := splitCsv(mustGetString(j.settingService.GetLdapInboundTags))
+	inboundTags := splitCsv(getSettingStringOr(j.settingService.GetLdapInboundTags, ""))
 	inbounds, err := j.inboundService.GetAllInbounds()
 	if err != nil {
 		logger.Warning("Failed to get inbounds:", err)
@@ -110,10 +122,10 @@ func (j *LdapSyncJob) Run() {
 	}
 
 	// --- Prepare batch operations ---
-	autoCreate := mustGetBool(j.settingService.GetLdapAutoCreate)
-	defGB := mustGetInt(j.settingService.GetLdapDefaultTotalGB)
-	defExpiryDays := mustGetInt(j.settingService.GetLdapDefaultExpiryDays)
-	defLimitIP := mustGetInt(j.settingService.GetLdapDefaultLimitIP)
+	autoCreate := getSettingBoolOr(j.settingService.GetLdapAutoCreate, false)
+	defGB := getSettingIntOr(j.settingService.GetLdapDefaultTotalGB, 0)
+	defExpiryDays := getSettingIntOr(j.settingService.GetLdapDefaultExpiryDays, 0)
+	defLimitIP := getSettingIntOr(j.settingService.GetLdapDefaultLimitIP, 0)
 
 	clientsToCreate := map[string][]model.Client{} // tag -> []new clients
 	clientsToEnable := map[string][]string{}       // tag -> []email
@@ -122,8 +134,12 @@ func (j *LdapSyncJob) Run() {
 	for email, allowed := range flags {
 		exists := allClients[email] != nil
 		for _, tag := range inboundTags {
+			ib := inboundMap[tag]
+			if ib == nil {
+				continue
+			}
 			if !exists && allowed && autoCreate {
-				newClient := j.buildClient(inboundMap[tag], email, defGB, defExpiryDays, defLimitIP)
+				newClient := j.buildClient(ib, email, defGB, defExpiryDays, defLimitIP)
 				clientsToCreate[tag] = append(clientsToCreate[tag], newClient)
 			} else if exists {
 				if allowed && !allClients[email].Enable {
@@ -140,7 +156,11 @@ func (j *LdapSyncJob) Run() {
 		if len(newClients) == 0 {
 			continue
 		}
-		payload := &model.Inbound{Id: inboundMap[tag].Id}
+		ib := inboundMap[tag]
+		if ib == nil {
+			continue
+		}
+		payload := &model.Inbound{Id: ib.Id}
 		payload.Settings = j.clientsToJSON(newClients)
 		if _, err := j.inboundService.AddInboundClient(payload); err != nil {
 			logger.Warningf("Failed to add clients for tag %s: %v", tag, err)
@@ -152,14 +172,18 @@ func (j *LdapSyncJob) Run() {
 
 	// --- Execute enable/disable batch ---
 	for tag, emails := range clientsToEnable {
-		j.batchSetEnable(inboundMap[tag], emails, true)
+		if ib := inboundMap[tag]; ib != nil {
+			j.batchSetEnable(ib, emails, true)
+		}
 	}
 	for tag, emails := range clientsToDisable {
-		j.batchSetEnable(inboundMap[tag], emails, false)
+		if ib := inboundMap[tag]; ib != nil {
+			j.batchSetEnable(ib, emails, false)
+		}
 	}
 
 	// --- Auto delete clients not in LDAP ---
-	autoDelete := mustGetBool(j.settingService.GetLdapAutoDelete)
+	autoDelete := getSettingBoolOr(j.settingService.GetLdapAutoDelete, false)
 	if autoDelete {
 		ldapEmailSet := map[string]struct{}{}
 		for e := range flags {
@@ -196,6 +220,10 @@ func (j *LdapSyncJob) buildClient(ib *model.Inbound, email string, defGB, defExp
 	}
 	if defExpiryDays > 0 {
 		c.ExpiryTime = time.Now().Add(time.Duration(defExpiryDays) * 24 * time.Hour).UnixMilli()
+	}
+	if ib == nil {
+		c.ID = uuid.NewString()
+		return c
 	}
 	switch ib.Protocol {
 	case model.Trojan, model.Shadowsocks:
@@ -305,54 +333,34 @@ func (j *LdapSyncJob) deleteClientsNotInLDAP(inboundTag string, ldapEmails map[s
 	}
 }
 
-// clientsToJSON serializes an array of clients to JSON
+// clientsToJSON serializes an array of clients safely using encoding/json.
 func (j *LdapSyncJob) clientsToJSON(clients []model.Client) string {
-	b := strings.Builder{}
-	b.WriteString("{\"clients\":[")
-	for i, c := range clients {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString(j.clientToJSON(c))
+	type ldapClientPayload struct {
+		ID         string `json:"id,omitempty"`
+		Password   string `json:"password,omitempty"`
+		Email      string `json:"email"`
+		Enable     bool   `json:"enable"`
+		LimitIP    int    `json:"limitIp"`
+		TotalGB    int64  `json:"totalGB"`
+		ExpiryTime int64  `json:"expiryTime,omitempty"`
 	}
-	b.WriteString("]}")
-	return b.String()
-}
-
-// clientToJSON serializes minimal client fields to JSON object string without extra deps
-func (j *LdapSyncJob) clientToJSON(c model.Client) string {
-	// construct minimal JSON manually to avoid importing json for simple case
-	b := strings.Builder{}
-	b.WriteString("{")
-	if c.ID != "" {
-		b.WriteString("\"id\":\"")
-		b.WriteString(c.ID)
-		b.WriteString("\",")
+	items := make([]ldapClientPayload, 0, len(clients))
+	for _, c := range clients {
+		items = append(items, ldapClientPayload{
+			ID:         c.ID,
+			Password:   c.Password,
+			Email:      c.Email,
+			Enable:     c.Enable,
+			LimitIP:    c.LimitIP,
+			TotalGB:    c.TotalGB,
+			ExpiryTime: c.ExpiryTime,
+		})
 	}
-	if c.Password != "" {
-		b.WriteString("\"password\":\"")
-		b.WriteString(c.Password)
-		b.WriteString("\",")
+	raw, err := json.Marshal(struct {
+		Clients []ldapClientPayload `json:"clients"`
+	}{Clients: items})
+	if err != nil {
+		return `{"clients":[]}`
 	}
-	b.WriteString("\"email\":\"")
-	b.WriteString(c.Email)
-	b.WriteString("\",")
-	b.WriteString("\"enable\":")
-	if c.Enable {
-		b.WriteString("true")
-	} else {
-		b.WriteString("false")
-	}
-	b.WriteString(",")
-	b.WriteString("\"limitIp\":")
-	b.WriteString(strconv.Itoa(c.LimitIP))
-	b.WriteString(",")
-	b.WriteString("\"totalGB\":")
-	b.WriteString(strconv.FormatInt(c.TotalGB, 10))
-	if c.ExpiryTime > 0 {
-		b.WriteString(",\"expiryTime\":")
-		b.WriteString(strconv.FormatInt(c.ExpiryTime, 10))
-	}
-	b.WriteString("}")
-	return b.String()
+	return string(raw)
 }

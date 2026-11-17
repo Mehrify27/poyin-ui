@@ -157,6 +157,10 @@ export const panelApi = {
     return apiClient.get<CoreVersionsResponse>("panel/core/versions");
   },
 
+  setForkProtocolEngine(engine: string): Promise<CoreVersionsResponse> {
+    return apiClient.postJson<CoreVersionsResponse>("panel/core/fork-engine", { engine });
+  },
+
   fetchNetworkTuning(): Promise<NetworkTuningStatus> {
     return apiClient.get<NetworkTuningStatus>("panel/core/network-tuning");
   },

@@ -3,8 +3,14 @@ package xray
 import (
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/mhsanaei/3x-ui/v2/logger"
+)
+
+var (
+	crashLineRegex = regexp.MustCompile(`(?i)(panic|exception|stack trace|fatal error)`)
+	xrayLogRegex   = regexp.MustCompile(`^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d{6}) \[([^\]]+)\] (.+)$`)
 )
 
 // NewLogWriter returns a new LogWriter for processing Xray log output.
@@ -14,20 +20,32 @@ func NewLogWriter() *LogWriter {
 
 // LogWriter processes and filters log output from the Xray process, handling crash detection and message filtering.
 type LogWriter struct {
+	mu       sync.Mutex
 	lastLine string
+}
+
+// LastLine returns the most recent unstructured or crash log line recorded by the writer.
+func (lw *LogWriter) LastLine() string {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	return lw.lastLine
+}
+
+func (lw *LogWriter) setLastLine(line string) {
+	lw.mu.Lock()
+	lw.lastLine = line
+	lw.mu.Unlock()
 }
 
 // Write processes and filters log output from the Xray process, handling crash detection and message filtering.
 func (lw *LogWriter) Write(m []byte) (n int, err error) {
-	crashRegex := regexp.MustCompile(`(?i)(panic|exception|stack trace|fatal error)`)
-
 	// Convert the data to a string
 	message := strings.TrimSpace(string(m))
 
 	// Check if the message contains a crash
-	if crashRegex.MatchString(message) {
+	if crashLineRegex.MatchString(message) {
 		logger.Debug("Core crash detected:\n", message)
-		lw.lastLine = message
+		lw.setLastLine(message)
 		err1 := writeCrashReport(m)
 		if err1 != nil {
 			logger.Error("Unable to write crash report:", err1)
@@ -35,11 +53,10 @@ func (lw *LogWriter) Write(m []byte) (n int, err error) {
 		return len(m), nil
 	}
 
-	regex := regexp.MustCompile(`^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d{6}) \[([^\]]+)\] (.+)$`)
 	messages := strings.SplitSeq(message, "\n")
 
 	for msg := range messages {
-		matches := regex.FindStringSubmatch(msg)
+		matches := xrayLogRegex.FindStringSubmatch(msg)
 
 		if len(matches) > 3 {
 			level := matches[2]
@@ -49,7 +66,7 @@ func (lw *LogWriter) Write(m []byte) (n int, err error) {
 			if strings.Contains(msgBodyLower, "tls handshake error") ||
 				strings.Contains(msgBodyLower, "connection ends") {
 				logger.Debug("XRAY: " + msgBody)
-				lw.lastLine = ""
+				lw.setLastLine("")
 				continue
 			}
 
@@ -69,14 +86,14 @@ func (lw *LogWriter) Write(m []byte) (n int, err error) {
 					logger.Debug("XRAY: " + msg)
 				}
 			}
-			lw.lastLine = ""
+			lw.setLastLine("")
 		} else if msg != "" {
 			msgLower := strings.ToLower(msg)
 
 			if strings.Contains(msgLower, "tls handshake error") ||
 				strings.Contains(msgLower, "connection ends") {
 				logger.Debug("XRAY: " + msg)
-				lw.lastLine = msg
+				lw.setLastLine(msg)
 				continue
 			}
 
@@ -85,7 +102,7 @@ func (lw *LogWriter) Write(m []byte) (n int, err error) {
 			} else {
 				logger.Debug("XRAY: " + msg)
 			}
-			lw.lastLine = msg
+			lw.setLastLine(msg)
 		}
 	}
 

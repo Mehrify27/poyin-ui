@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -104,5 +105,38 @@ func TestProcessStopWaitsForChildExitAndIsRaceSafe(t *testing.T) {
 	}
 
 	close(stopReaders)
+	wg.Wait()
+}
+
+func TestSetEnvOverridesAndLogWriterRaceSafety(t *testing.T) {
+	base := []string{
+		"PATH=/usr/bin",
+		"XRAY_LOCATION_ASSET=/stale/dir",
+		"XRAY_SPEEDLIMIT_FILE=/stale/speed.json",
+	}
+	out := setEnvOverrides(base,
+		"XRAY_SPEEDLIMIT_FILE=/opt/vpn-ui/bin/speedlimits.json",
+		"XRAY_LOCATION_ASSET=/opt/vpn-ui/bin",
+	)
+	joined := strings.Join(out, "\n")
+	if strings.Contains(joined, "/stale/") {
+		t.Fatalf("stale env entries were not replaced: %v", out)
+	}
+	if count := strings.Count(joined, "XRAY_LOCATION_ASSET="); count != 1 {
+		t.Fatalf("expected 1 XRAY_LOCATION_ASSET entry, got %d (%v)", count, out)
+	}
+
+	lw := NewLogWriter()
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				_, _ = lw.Write([]byte("failed to read geoip.dat"))
+				_ = lw.LastLine()
+			}
+		}()
+	}
 	wg.Wait()
 }

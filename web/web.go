@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"embed"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -123,6 +124,7 @@ type Server struct {
 	greService         service.GreService
 	mtprotoService     service.MtprotoService
 	hysteria2Service   service.Hysteria2Service
+	singboxForkService service.SingboxForkService
 	hy2OutboundService service.Hysteria2OutboundService
 	sshService         service.SshService
 	sshOutboundService service.SshOutboundService
@@ -405,6 +407,7 @@ func (s *Server) startTask() {
 	s.greService.InitGre()
 	s.mtprotoService.InitMtproto()
 	s.hysteria2Service.InitHysteria2()
+	s.singboxForkService.InitServices()
 	s.sshService.InitSsh()
 	// BEFORE anything dials, which is why it is here and not beside InitVpnOutbound
 	// below. A carrier is a device plus a routing table, and whatever rides on it sends
@@ -471,9 +474,15 @@ func (s *Server) startTask() {
 	s.cron.AddJob("@every 20s", job.NewCheckVpnDokodemoJob())
 
 	go func() {
-		time.Sleep(time.Second * 5)
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
 		// Statistics every 10 seconds, start the delay for 5 seconds for the first time, and staggered with the time to restart xray
-		s.cron.AddJob("@every 10s", job.NewXrayTrafficJob(&s.radiusService))
+		if s.cron != nil {
+			s.cron.AddJob("@every 10s", job.NewXrayTrafficJob(&s.radiusService))
+		}
 	}()
 
 	// Clean stale RADIUS sessions every 60 seconds
@@ -663,7 +672,6 @@ func (s *Server) Start() (err error) {
 
 // Stop gracefully shuts down the web server, stops Xray, RADIUS, cron jobs, and Telegram bot.
 func (s *Server) Stop() error {
-	s.cancel()
 	// Terminate the supervised VPN daemons (openvpn/xl2tpd/pptpd) so they die
 	// with the panel rather than orphaning.
 	service.GetProcManager().StopAll()
@@ -677,7 +685,11 @@ func (s *Server) Stop() error {
 	s.radiusService.Stop()
 	s.xrayService.StopXray()
 	if s.cron != nil {
-		s.cron.Stop()
+		cronCtx := s.cron.Stop()
+		select {
+		case <-cronCtx.Done():
+		case <-time.After(5 * time.Second):
+		}
 	}
 	if s.tgbotService.IsRunning() {
 		s.tgbotService.Stop()
@@ -689,10 +701,15 @@ func (s *Server) Stop() error {
 	var err1 error
 	var err2 error
 	if s.httpServer != nil {
-		err1 = s.httpServer.Shutdown(s.ctx)
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err1 = s.httpServer.Shutdown(shutdownCtx)
+		shutdownCancel()
 	}
+	s.cancel()
 	if s.listener != nil {
-		err2 = s.listener.Close()
+		if lerr := s.listener.Close(); lerr != nil && !errors.Is(lerr, net.ErrClosed) {
+			err2 = lerr
+		}
 	}
 	return common.Combine(err1, err2)
 }

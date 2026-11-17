@@ -5,6 +5,7 @@ package sub
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"html/template"
 	"io"
 	"io/fs"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/util/common"
@@ -374,15 +376,18 @@ func (s *Server) Start() (err error) {
 
 // Stop gracefully shuts down the subscription server and closes the listener.
 func (s *Server) Stop() error {
-	s.cancel()
-
 	var err1 error
 	var err2 error
 	if s.httpServer != nil {
-		err1 = s.httpServer.Shutdown(s.ctx)
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err1 = s.httpServer.Shutdown(shutdownCtx)
+		shutdownCancel()
 	}
+	s.cancel()
 	if s.listener != nil {
-		err2 = s.listener.Close()
+		if lerr := s.listener.Close(); lerr != nil && !errors.Is(lerr, net.ErrClosed) {
+			err2 = lerr
+		}
 	}
 	return common.Combine(err1, err2)
 }

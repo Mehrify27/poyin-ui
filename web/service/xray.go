@@ -42,21 +42,22 @@ const (
 // XrayService provides business logic for Xray process management.
 // It handles starting, stopping, restarting Xray, and managing its configuration.
 type XrayService struct {
-	inboundService InboundService
-	settingService SettingService
-	l2tpService    L2tpService
-	pptpService    PptpService
-	openvpnService OpenVpnService
-	ocservService  OcservService
-	sstpService    SstpService
-	ikev2Service   Ikev2Service
-	wgcService     WgcService
-	awgService     AwgService
-	greService       GreService
-	mtprotoService   MtprotoService
-	hysteria2Service Hysteria2Service
-	sshService       SshService
-	xrayAPI          xray.XrayAPI
+	inboundService     InboundService
+	settingService     SettingService
+	l2tpService        L2tpService
+	pptpService        PptpService
+	openvpnService     OpenVpnService
+	ocservService      OcservService
+	sstpService        SstpService
+	ikev2Service       Ikev2Service
+	wgcService         WgcService
+	awgService         AwgService
+	greService         GreService
+	mtprotoService     MtprotoService
+	hysteria2Service   Hysteria2Service
+	singboxForkService SingboxForkService
+	sshService         SshService
+	xrayAPI            xray.XrayAPI
 }
 
 // IsXrayRunning checks if the Xray process is currently running.
@@ -201,8 +202,17 @@ func applyLoopbackSocksOutboundsWith(config *xray.Config, specs []loopbackSocksS
 	return nil
 }
 
-// GetXrayConfig retrieves and builds the Xray configuration from settings and inbounds.
+// GetXrayConfig retrieves and builds the Xray configuration from settings and inbounds
+// using the currently active fork protocol runtime mode.
 func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
+	return s.BuildXrayConfigWithCapabilities(DetectActiveXrayCapabilities())
+}
+
+// BuildXrayConfigWithCapabilities builds an Xray configuration tailored to the supplied
+// Xray binary capability profile (e.g. during staged preflight validation of an
+// unpatched official XTLS/Xray-core release before swapping live binaries).
+func (s *XrayService) BuildXrayConfigWithCapabilities(caps XrayBinaryCapabilities) (*xray.Config, error) {
+	useSingboxFork := ShouldUseSingboxForkEngineForCaps(caps)
 	templateConfig, err := s.settingService.GetXrayConfigTemplate()
 	if err != nil {
 		return nil, err
@@ -273,6 +283,9 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		// Xray as a native inbound, Xray would reject the unknown protocol, and the
 		// WHOLE core would fail to start, taking every other inbound down with it.
 		if inbound.Protocol == "l2tp" || inbound.Protocol == "pptp" || inbound.Protocol == "openvpn" || inbound.Protocol == "openconnect" || inbound.Protocol == "sstp" || inbound.Protocol == "ikev2" || inbound.Protocol == "wg-c" || inbound.Protocol == "awg" || inbound.Protocol == "gre" || inbound.Protocol == "mtproto" || inbound.Protocol == "ssh" || inbound.Protocol == "hysteria2" {
+			continue
+		}
+		if useSingboxFork && isForkProtocol(inbound.Protocol) {
 			continue
 		}
 		// get settings clients
@@ -534,6 +547,20 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		}
 		if socksConfig := s.hysteria2Service.GetSocksConfig(hy2Inbound); socksConfig != nil {
 			xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *socksConfig)
+		}
+	}
+
+	// Inject loopback socks inbounds for AnyTLS / TUIC v5 / NaiveProxy when running
+	// natively via sing-box (e.g. alongside unpatched official XTLS/Xray-core).
+	if useSingboxFork {
+		sfInbounds, _ := s.singboxForkService.GetManagedInbounds()
+		for _, sfInbound := range sfInbounds {
+			if !sfInbound.Enable {
+				continue
+			}
+			if socksConfig := s.singboxForkService.GetSocksConfig(sfInbound); socksConfig != nil {
+				xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *socksConfig)
+			}
 		}
 	}
 

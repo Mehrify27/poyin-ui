@@ -2,22 +2,15 @@ package service
 
 import (
 	"bytes"
-	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,12 +20,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/util/common"
-	"github.com/mhsanaei/3x-ui/v2/util/json_util"
 	"github.com/mhsanaei/3x-ui/v2/xray"
-
-	statsService "github.com/xtls/xray-core/app/stats/command"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
@@ -318,13 +306,9 @@ func (s *Hysteria2Service) GetSocksConfig(inbound *model.Inbound) *xray.InboundC
 		return nil
 	}
 
-	disabled := s.getDisabledEmails()
+	disabled := getDisabledAccountEmails()
 	nowMs := time.Now().UnixMilli()
-	type socksAccount struct {
-		User string `json:"user"`
-		Pass string `json:"pass"`
-	}
-	var accounts []socksAccount
+	var accounts []singboxSocksAccount
 	for _, c := range settings.Clients {
 		if !c.Enable || disabled[c.Email] {
 			continue
@@ -336,52 +320,13 @@ func (s *Hysteria2Service) GetSocksConfig(inbound *model.Inbound) *xray.InboundC
 		if auth == "" || strings.TrimSpace(c.Email) == "" {
 			continue
 		}
-		accounts = append(accounts, socksAccount{User: c.Email, Pass: auth})
+		accounts = append(accounts, singboxSocksAccount{User: c.Email, Pass: auth})
 	}
-
-	var socksSettings []byte
-	if len(accounts) > 0 {
-		socksSettings, err = json.Marshal(struct {
-			Auth     string         `json:"auth"`
-			Accounts []socksAccount `json:"accounts"`
-			UDP      bool           `json:"udp"`
-		}{Auth: "password", Accounts: accounts, UDP: true})
-	} else {
-		socksSettings, err = json.Marshal(struct {
-			Auth string `json:"auth"`
-			UDP  bool   `json:"udp"`
-		}{Auth: "noauth", UDP: true})
-	}
-	if err != nil {
-		logger.Warning("Hysteria2: socks settings marshal failed:", err)
-		return nil
-	}
-
-	sniffing := `{"enabled":true,"destOverride":["tls","http","quic"]}`
-	return &xray.InboundConfig{
-		Listen:   json_util.RawMessage(`"127.0.0.1"`),
-		Port:     s.GetSocksPort(inbound),
-		Protocol: "socks",
-		Settings: json_util.RawMessage(socksSettings),
-		Tag:      inbound.Tag,
-		Sniffing: json_util.RawMessage(sniffing),
-	}
+	return buildLoopbackSocksInbound(inbound, s.GetSocksPort(inbound), accounts)
 }
 
 func (s *Hysteria2Service) getDisabledEmails() map[string]bool {
-	disabled := map[string]bool{}
-	db := database.GetDB()
-	if db == nil {
-		return disabled
-	}
-	var traffics []*xray.ClientTraffic
-	if err := db.Model(xray.ClientTraffic{}).Where("enable = ?", false).Find(&traffics).Error; err != nil {
-		return disabled
-	}
-	for _, t := range traffics {
-		disabled[t.Email] = true
-	}
-	return disabled
+	return getDisabledAccountEmails()
 }
 
 func (s *Hysteria2Service) getOrCreateClashSecret(inboundId int) string {
@@ -392,25 +337,7 @@ func (s *Hysteria2Service) getOrCreateClashSecret(inboundId int) string {
 	}
 	hy2State.mu.Unlock()
 
-	if raw, err := os.ReadFile(s.configPath(inboundId)); err == nil {
-		var parsed struct {
-			Experimental struct {
-				ClashAPI struct {
-					Secret string `json:"secret"`
-				} `json:"clash_api"`
-			} `json:"experimental"`
-		}
-		if json.Unmarshal(raw, &parsed) == nil && parsed.Experimental.ClashAPI.Secret != "" {
-			hy2State.mu.Lock()
-			hy2State.clashSecrets[inboundId] = parsed.Experimental.ClashAPI.Secret
-			hy2State.mu.Unlock()
-			return parsed.Experimental.ClashAPI.Secret
-		}
-	}
-
-	buf := make([]byte, 16)
-	_, _ = rand.Read(buf)
-	sec := hex.EncodeToString(buf)
+	sec := loadOrCreateClashSecret(s.configPath(inboundId))
 	hy2State.mu.Lock()
 	hy2State.clashSecrets[inboundId] = sec
 	hy2State.mu.Unlock()
@@ -420,82 +347,15 @@ func (s *Hysteria2Service) getOrCreateClashSecret(inboundId int) string {
 // resolveTLSCerts ensures a valid certificate and key pair on disk for an inbound
 // and returns (certPath, keyPath, materialFingerprint, err).
 func (s *Hysteria2Service) resolveTLSCerts(inbound *model.Inbound, settings Hysteria2Settings) (string, string, string, error) {
-	dir := s.configDir(inbound.Id)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", "", "", err
-	}
-
-	certFile := strings.TrimSpace(settings.CertificateFile)
-	if certFile == "" {
-		certFile = strings.TrimSpace(settings.CertFile)
-	}
-	if certFile != "" && strings.TrimSpace(settings.KeyFile) != "" {
-		return certFile, strings.TrimSpace(settings.KeyFile), fileHashPair(certFile, strings.TrimSpace(settings.KeyFile)), nil
-	}
-
-	if strings.TrimSpace(settings.Certificate) != "" && strings.TrimSpace(settings.Key) != "" {
-		certPath := filepath.Join(dir, "server.crt")
-		keyPath := filepath.Join(dir, "server.key")
-		if err := writeFileIfChanged(certPath, []byte(strings.TrimSpace(settings.Certificate)+"\n"), 0o644); err != nil {
-			return "", "", "", err
-		}
-		if err := writeFileIfChanged(keyPath, []byte(strings.TrimSpace(settings.Key)+"\n"), 0o600); err != nil {
-			return "", "", "", err
-		}
-		return certPath, keyPath, sha256Hex([]byte(settings.Certificate + "|" + settings.Key)), nil
-	}
-
-	// Fall back to configured panel SSL certificate if both files exist on disk.
-	if certFile, err := s.settingService.GetCertFile(); err == nil && strings.TrimSpace(certFile) != "" {
-		if keyFile, err := s.settingService.GetKeyFile(); err == nil && strings.TrimSpace(keyFile) != "" {
-			if regularFileExists(certFile) && regularFileExists(keyFile) {
-				return certFile, keyFile, fileHashPair(certFile, keyFile), nil
-			}
-		}
-	}
-	if certFile, err := s.settingService.GetSubCertFile(); err == nil && strings.TrimSpace(certFile) != "" {
-		if keyFile, err := s.settingService.GetSubKeyFile(); err == nil && strings.TrimSpace(keyFile) != "" {
-			if regularFileExists(certFile) && regularFileExists(keyFile) {
-				return certFile, keyFile, fileHashPair(certFile, keyFile), nil
-			}
-		}
-	}
-
-	// Auto-generate an idempotent self-signed ECDSA certificate if none is configured.
-	certPath := filepath.Join(dir, "selfsigned.crt")
-	keyPath := filepath.Join(dir, "selfsigned.key")
-	if !regularFileExists(certPath) || !regularFileExists(keyPath) {
-		host := strings.TrimSpace(settings.ServerName)
-		if host == "" {
-			host = strings.TrimSpace(inbound.Listen)
-		}
-		if host == "" || host == "0.0.0.0" || host == "::" {
-			host = "localhost"
-		}
-		genDir := filepath.Join(dir, ".gen")
-		pCert, pKey, err := GeneratePanelSelfSignedCert(genDir, host)
-		if err != nil {
-			return "", "", "", fmt.Errorf("hysteria2 self-signed cert: %w", err)
-		}
-		if err := os.Rename(pCert, certPath); err != nil {
-			if raw, rerr := os.ReadFile(pCert); rerr == nil {
-				_ = os.WriteFile(certPath, raw, 0o644)
-			} else {
-				_ = os.RemoveAll(genDir)
-				return "", "", "", err
-			}
-		}
-		if err := os.Rename(pKey, keyPath); err != nil {
-			if raw, rerr := os.ReadFile(pKey); rerr == nil {
-				_ = os.WriteFile(keyPath, raw, 0o600)
-			} else {
-				_ = os.RemoveAll(genDir)
-				return "", "", "", err
-			}
-		}
-		_ = os.RemoveAll(genDir)
-	}
-	return certPath, keyPath, fileHashPair(certPath, keyPath), nil
+	return resolveSidecarTLSCerts(s.configDir(inbound.Id), sidecarTLSInput{
+		ServerName:      settings.ServerName,
+		Listen:          inbound.Listen,
+		CertificateFile: firstNonEmptyString(settings.CertificateFile, settings.CertFile),
+		KeyFile:         settings.KeyFile,
+		Certificate:     settings.Certificate,
+		Key:             settings.Key,
+		StreamSettings:  inbound.StreamSettings,
+	}, &s.settingService)
 }
 
 // ResolveCertPinSHA256 returns the lowercase colonless hex SHA-256 hash of the
@@ -652,37 +512,11 @@ func (s *Hysteria2Service) buildServerConfig(inbound *model.Inbound, settings Hy
 	finalOutbound := "direct"
 
 	if settings.routeViaXray() {
-		socksPort := s.GetSocksPort(inbound)
-		for i, u := range users {
-			outTag := fmt.Sprintf("xray-u-%d", i)
-			outbounds = append(outbounds, map[string]any{
-				"type":        "socks",
-				"tag":         outTag,
-				"server":      "127.0.0.1",
-				"server_port": socksPort,
-				"version":     "5",
-				"username":    u.Name,
-				"password":    u.Password,
-			})
-			routeRules = append(routeRules, map[string]any{
-				"inbound":   []string{tag},
-				"auth_user": []string{u.Name},
-				"outbound":  outTag,
-			})
+		socksAccounts := make([]singboxSocksAccount, 0, len(users))
+		for _, u := range users {
+			socksAccounts = append(socksAccounts, singboxSocksAccount{User: u.Name, Pass: u.Password})
 		}
-		fallbackOut := map[string]any{
-			"type":        "socks",
-			"tag":         "xray-fallback",
-			"server":      "127.0.0.1",
-			"server_port": socksPort,
-			"version":     "5",
-		}
-		if len(users) > 0 {
-			fallbackOut["username"] = users[0].Name
-			fallbackOut["password"] = users[0].Password
-		}
-		outbounds = append(outbounds, fallbackOut)
-		finalOutbound = "xray-fallback"
+		outbounds, routeRules, finalOutbound = buildSingboxRouteOutboundsForXray(tag, s.GetSocksPort(inbound), socksAccounts)
 	} else {
 		outbounds = append(outbounds, map[string]any{
 			"type": "direct",
@@ -964,105 +798,24 @@ func (s *Hysteria2Service) KillDisabledSessions() {
 	}
 }
 
-type clashConnectionsResp struct {
-	Connections []clashConnection `json:"connections"`
-}
-
-type clashConnection struct {
-	ID       string   `json:"id"`
-	Chains   []string `json:"chains"`
-	Start    any      `json:"start"`
-	Metadata struct {
-		SourceIP string `json:"sourceIP"`
-		User     string `json:"user"`
-	} `json:"metadata"`
-}
-
-func (c clashConnection) startUnixNano() int64 {
-	switch v := c.Start.(type) {
-	case float64:
-		return int64(v) * int64(time.Millisecond)
-	case string:
-		if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
-			return t.UnixNano()
-		}
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
-			return t.UnixNano()
-		}
-	}
-	return 0
-}
-
-var hy2ChainIdxRe = regexp.MustCompile(`^xray-u-(\d+)$`)
-
 func resolveConnectionUser(conn clashConnection, clients []Hysteria2Client) string {
 	if u := strings.TrimSpace(conn.Metadata.User); u != "" {
 		return u
 	}
-	for _, ch := range conn.Chains {
-		if m := hy2ChainIdxRe.FindStringSubmatch(ch); len(m) == 2 {
-			if idx, err := strconv.Atoi(m[1]); err == nil && idx >= 0 && idx < len(clients) {
-				if email := strings.TrimSpace(clients[idx].Email); email != "" {
-					return email
-				}
-			}
+	if idx, ok := resolveChainIndex(conn.Chains); ok && idx < len(clients) {
+		if email := strings.TrimSpace(clients[idx].Email); email != "" {
+			return email
 		}
 	}
 	return ""
 }
 
 func (s *Hysteria2Service) fetchConnections(inb *model.Inbound) ([]clashConnection, error) {
-	port := s.GetClashAPIPort(inb)
-	secret := s.getOrCreateClashSecret(inb.Id)
-	url := fmt.Sprintf("http://127.0.0.1:%d/connections", port)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	if secret != "" {
-		req.Header.Set("Authorization", "Bearer "+secret)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("clash api /connections status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, err
-	}
-	var parsed clashConnectionsResp
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, err
-	}
-	return parsed.Connections, nil
+	return fetchClashConnections(s.GetClashAPIPort(inb), s.getOrCreateClashSecret(inb.Id))
 }
 
 func (s *Hysteria2Service) closeConnection(inb *model.Inbound, connID string) {
-	if connID == "" {
-		return
-	}
-	port := s.GetClashAPIPort(inb)
-	secret := s.getOrCreateClashSecret(inb.Id)
-	url := fmt.Sprintf("http://127.0.0.1:%d/connections/%s", port, connID)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
-	if err != nil {
-		return
-	}
-	if secret != "" {
-		req.Header.Set("Authorization", "Bearer "+secret)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err == nil {
-		_ = resp.Body.Close()
-	}
+	closeClashConnection(s.GetClashAPIPort(inb), s.getOrCreateClashSecret(inb.Id), connID)
 }
 
 func (s *Hysteria2Service) closeUserConnections(inb *model.Inbound, targets map[string]bool) {
@@ -1086,74 +839,14 @@ func (s *Hysteria2Service) enforceUserLimit(inb *model.Inbound, limit int, strat
 	if limit <= 0 {
 		return
 	}
-	conns, err := s.fetchConnections(inb)
-	if err != nil || len(conns) == 0 {
-		return
-	}
-
-	type ipBucket struct {
-		ip       string
-		earliest int64
-		connIDs  []string
-	}
-	byUser := map[string]map[string]*ipBucket{}
-	for _, conn := range conns {
-		user := resolveConnectionUser(conn, clients)
-		ip := strings.TrimSpace(conn.Metadata.SourceIP)
-		if user == "" || ip == "" {
-			continue
-		}
-		if host, _, err := net.SplitHostPort(ip); err == nil {
-			ip = host
-		}
-		userMap := byUser[user]
-		if userMap == nil {
-			userMap = map[string]*ipBucket{}
-			byUser[user] = userMap
-		}
-		b := userMap[ip]
-		if b == nil {
-			b = &ipBucket{ip: ip, earliest: conn.startUnixNano()}
-			userMap[ip] = b
-		} else if st := conn.startUnixNano(); st > 0 && (b.earliest == 0 || st < b.earliest) {
-			b.earliest = st
-		}
-		b.connIDs = append(b.connIDs, conn.ID)
-	}
-
-	for _, userMap := range byUser {
-		if len(userMap) <= limit {
-			continue
-		}
-		buckets := make([]*ipBucket, 0, len(userMap))
-		for _, b := range userMap {
-			buckets = append(buckets, b)
-		}
-		sort.Slice(buckets, func(i, j int) bool {
-			if buckets[i].earliest == buckets[j].earliest {
-				return buckets[i].ip < buckets[j].ip
-			}
-			return buckets[i].earliest < buckets[j].earliest
-		})
-
-		var evict []*ipBucket
-		if strategy == "reject" {
-			evict = buckets[limit:]
-		} else {
-			evict = buckets[:len(buckets)-limit]
-		}
-		for _, b := range evict {
-			for _, id := range b.connIDs {
-				s.closeConnection(inb, id)
-			}
-		}
-	}
+	enforceClashIPLimits(
+		s.GetClashAPIPort(inb),
+		s.getOrCreateClashSecret(inb.Id),
+		strategy,
+		func(conn clashConnection) string { return resolveConnectionUser(conn, clients) },
+		func(string) int { return limit },
+	)
 }
-
-var (
-	hy2UserStatRe    = regexp.MustCompile(`^user>>>([^>]+)>>>traffic>>>(uplink|downlink)$`)
-	hy2InboundStatRe = regexp.MustCompile(`^inbound>>>([^>]+)>>>traffic>>>(uplink|downlink)$`)
-)
 
 // CollectAllTraffic queries per-inbound sing-box v2ray_api gRPC stats and returns
 // direct-mode inbound stats plus per-user traffic deltas attributed to each inbound.
@@ -1193,83 +886,11 @@ func (s *Hysteria2Service) CollectTraffic() []*xray.ClientTraffic {
 }
 
 func (s *Hysteria2Service) collectInboundStats(inb *model.Inbound, includeInbound bool) ([]*xray.Traffic, []*xray.ClientTraffic) {
-	port := s.GetV2rayAPIPort(inb)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	conn, err := grpc.NewClient(
-		fmt.Sprintf("127.0.0.1:%d", port),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		return nil, nil
-	}
-	defer conn.Close()
-
-	client := statsService.NewStatsServiceClient(conn)
-	resp, err := client.QueryStats(ctx, &statsService.QueryStatsRequest{Reset_: true})
-	if err != nil {
-		logger.Debug("Hysteria2: QueryStats failed on inbound", inb.Id, ":", err)
-		return nil, nil
-	}
-
 	tag := strings.TrimSpace(inb.Tag)
 	if tag == "" {
 		tag = hy2ProcName(inb.Id)
 	}
-	var inbPair hy2TrafficPair
-	userPairs := map[string]*hy2TrafficPair{}
-
-	for _, st := range resp.GetStat() {
-		if m := hy2UserStatRe.FindStringSubmatch(st.Name); len(m) == 3 {
-			email := m[1]
-			p := userPairs[email]
-			if p == nil {
-				p = &hy2TrafficPair{}
-				userPairs[email] = p
-			}
-			if m[2] == "uplink" {
-				p.up += st.Value
-			} else {
-				p.down += st.Value
-			}
-			continue
-		}
-		if includeInbound {
-			if m := hy2InboundStatRe.FindStringSubmatch(st.Name); len(m) == 3 && m[1] == tag {
-				if m[2] == "uplink" {
-					inbPair.up += st.Value
-				} else {
-					inbPair.down += st.Value
-				}
-			}
-		}
-	}
-
-	var outInbounds []*xray.Traffic
-	if includeInbound && (inbPair.up > 0 || inbPair.down > 0) {
-		outInbounds = append(outInbounds, &xray.Traffic{
-			IsInbound:  true,
-			IsOutbound: false,
-			Tag:        tag,
-			Up:         inbPair.up,
-			Down:       inbPair.down,
-		})
-	}
-
-	var outClients []*xray.ClientTraffic
-	for email, p := range userPairs {
-		if p.up <= 0 && p.down <= 0 {
-			continue
-		}
-		outClients = append(outClients, &xray.ClientTraffic{
-			InboundId: inb.Id,
-			Email:     email,
-			Up:        p.up,
-			Down:      p.down,
-		})
-	}
-	return outInbounds, outClients
+	return querySingboxV2rayStats(s.GetV2rayAPIPort(inb), inb.Id, tag, includeInbound, nil)
 }
 
 // Hysteria2Logs returns the combined stdout/stderr ring buffers for all Hysteria 2 daemons.

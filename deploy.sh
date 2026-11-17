@@ -71,7 +71,7 @@ Environment variables:
   DEPLOY_DOMAIN, DEPLOY_EMAIL, DEPLOY_CF_TOKEN, DEPLOY_WILDCARD=1
 
 Examples (including offline / Iran servers):
-  ./deploy.sh --local ./vpn-ui-2.0.1-linux-amd64.tar.gz
+  ./deploy.sh --local ./vpn-ui-2.0.3-linux-amd64.tar.gz
   ./deploy.sh --mirror https://mirror.example.com/
   ./deploy.sh --offline
 EOF

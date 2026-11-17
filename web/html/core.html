@@ -376,13 +376,40 @@
                   </a-popconfirm>
                 </a-space>
               </template>
+              <div v-if="xrayCapabilities.binaryMode || speedLimitEngine"
+                :style="{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap', padding: '10px 12px', marginBottom: '12px', borderRadius: '8px', border: '1px solid rgba(128,128,128,0.2)' }">
+                <div :style="{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }">
+                  <a-tag :color="xrayCapabilities.binaryMode === 'official-xtls-unpatched' ? 'blue' : (xrayCapabilities.binaryMode === 'missing' ? 'red' : 'purple')">
+                    Xray Build: [[ binaryModeLabel(xrayCapabilities.binaryMode) ]]
+                  </a-tag>
+                  <a-tag :color="speedLimitEngine === 'in-core-xray' ? 'green' : 'orange'">
+                    Speed Limit: [[ speedLimitEngine === 'in-core-xray' ? 'In-Core Xray Dispatcher' : 'Kernel tc Fallback' ]]
+                  </a-tag>
+                </div>
+                <div :style="{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }">
+                  <span :style="{ fontSize: '12px', opacity: 0.75 }">AnyTLS / TUIC / Naive Engine:</span>
+                  <a-select v-model="forkProtocolEngine" size="small" :style="{ width: '175px' }"
+                    :loading="forkEngineSaving" @change="changeForkProtocolEngine">
+                    <a-select-option value="auto">Auto (Detect Xray Patches)</a-select-option>
+                    <a-select-option value="sing-box">sing-box Sidecar</a-select-option>
+                    <a-select-option value="xray">Patched Xray-core</a-select-option>
+                  </a-select>
+                </div>
+              </div>
               <a-row :gutter="[12, 12]">
                 <a-col :xs="24" :md="12" :xl="8" v-for="bin in binaryInventory" :key="bin.core">
                   <div :style="{ border: '1px solid rgba(128,128,128,0.2)', borderRadius: '8px', padding: '12px' }">
                     <div :style="{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', gap: '6px', flexWrap: 'wrap' }">
                       <strong>[[ bin.core ]]</strong>
                       <a-space :size="4">
-                        <a-tooltip v-if="bin.customPatched && bin.patchSet && bin.patchSet.length"
+                        <a-tooltip v-if="bin.core === 'xray' && bin.binaryMode"
+                          :title="bin.customPatched && bin.patchSet && bin.patchSet.length ? bin.patchSet.join(' · ') : 'Official upstream XTLS/Xray-core release (unpatched)'">
+                          <a-tag :color="bin.binaryMode === 'official-xtls-unpatched' ? 'blue' : 'purple'">
+                            <a-icon :type="bin.binaryMode === 'official-xtls-unpatched' ? 'cloud' : 'safety-certificate'"></a-icon>
+                            [[ bin.binaryMode === 'official-xtls-unpatched' ? 'Official XTLS' : 'Patched' ]]
+                          </a-tag>
+                        </a-tooltip>
+                        <a-tooltip v-else-if="bin.customPatched && bin.patchSet && bin.patchSet.length"
                           :title="bin.patchSet.join(' · ')">
                           <a-tag color="purple"><a-icon type="safety-certificate"></a-icon> Patched</a-tag>
                         </a-tooltip>
@@ -818,7 +845,7 @@
         </span>
       </template>
       <template #description>
-        Updates install safely to the custom override directory with a .bak snapshot, restart only the affected core, and auto-roll back if health checks fail.
+        Updates verify SHA-256/.dgst checksums when published, run staged pre-flight checks (including <code>xray run -test</code> against your active config) before swapping, keep a .bak snapshot, restart only the affected core, and auto-roll back if health checks fail.
       </template>
     </a-alert>
 
@@ -1004,6 +1031,10 @@
       protocolEngines: [],
       binaryLoading: false,
       quickUpdatingCore: '',
+      xrayCapabilities: {},
+      forkProtocolEngine: 'auto',
+      forkEngineSaving: false,
+      speedLimitEngine: 'in-core-xray',
       netTuning: { supported: false, availableCongestions: [] },
       netTuningSelectedProfile: 'bbr',
       netTuningLoading: false,
@@ -1616,9 +1647,33 @@
         const msg = await HttpUtil.get('/panel/core/versions');
         this.binaryLoading = false;
         if (msg && msg.success && msg.obj) {
-          if (msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
-          if (msg.obj.engines) this.protocolEngines = msg.obj.engines;
+          this.applyBinaryMetadata(msg.obj);
         }
+      },
+      applyBinaryMetadata(obj) {
+        if (!obj) return;
+        if (obj.binaries) this.binaryInventory = obj.binaries;
+        if (obj.engines) this.protocolEngines = obj.engines;
+        if (obj.xrayCapabilities) this.xrayCapabilities = obj.xrayCapabilities;
+        if (obj.forkProtocolEngine) this.forkProtocolEngine = obj.forkProtocolEngine;
+        if (obj.speedLimitEngine) this.speedLimitEngine = obj.speedLimitEngine;
+      },
+      binaryModeLabel(mode) {
+        return ({
+          'bundled-patched': 'Bundled Patched (XTLS Source)',
+          'custom-patched': 'Custom Patched Build',
+          'official-xtls-unpatched': 'Official XTLS Release (Unpatched)',
+          'missing': 'Missing',
+        })[mode] || mode || 'Unknown';
+      },
+      async changeForkProtocolEngine(val) {
+        this.forkEngineSaving = true;
+        const msg = await HttpUtil.post('/panel/core/fork-engine', { engine: val || 'auto' });
+        this.forkEngineSaving = false;
+        if (msg && msg.obj) {
+          this.applyBinaryMetadata(msg.obj);
+        }
+        await this.loadStatus(false);
       },
       async loadNetworkTuning() {
         this.netTuningLoading = true;
@@ -1685,15 +1740,19 @@
           l2tp: 'xl2tpd',
         })[coreName] || '';
       },
-      openCoreUpdateByName(target) {
+      async openCoreUpdateByName(target) {
+        if (!this.binaryInventory || !this.binaryInventory.length) {
+          await this.loadBinaries();
+        }
         const bin = (this.binaryInventory || []).find((b) => b.core === target);
         if (bin) {
           this.openCoreUpdateModal(bin);
           return;
         }
+        const statusCard = (this.cores || []).find((c) => this.coreBinaryTarget(c.name) === target);
         this.openCoreUpdateModal({
           core: target,
-          installedVersion: '',
+          installedVersion: statusCard ? (statusCard.version || '') : '',
           upstreamRepo: '',
           upstreamUrl: '',
           updateMode: 'prebuilt',
@@ -1735,14 +1794,20 @@
         const q = refresh ? '?refresh=1' : '';
         const msg = await HttpUtil.get('/panel/core/upstream/' + encodeURIComponent(core) + q);
         this.coreUpdateModal.versionsLoading = false;
-        if (msg && msg.success && msg.obj) {
-          this.coreUpdateModal.releases = msg.obj.releases || [];
+        if (msg && msg.obj) {
+          if (msg.obj.installedVersion || msg.obj.version) {
+            this.coreUpdateModal.installedVersion = msg.obj.installedVersion || msg.obj.version;
+          }
           if (msg.obj.upstreamRepo) this.coreUpdateModal.upstreamRepo = msg.obj.upstreamRepo;
           if (msg.obj.upstreamUrl) this.coreUpdateModal.upstreamUrl = msg.obj.upstreamUrl;
           if (msg.obj.updateMode) this.coreUpdateModal.updateMode = msg.obj.updateMode;
+          if (typeof msg.obj.autoUpdatable === 'boolean') this.coreUpdateModal.autoUpdatable = msg.obj.autoUpdatable;
           if (typeof msg.obj.customPatched === 'boolean' && core === 'xray') this.coreUpdateModal.customPatched = msg.obj.customPatched;
           if (msg.obj.patchSet) this.coreUpdateModal.patchSet = msg.obj.patchSet;
           if (msg.obj.upstreamWarning) this.coreUpdateModal.upstreamWarning = msg.obj.upstreamWarning;
+        }
+        if (msg && msg.success && msg.obj) {
+          this.coreUpdateModal.releases = msg.obj.releases || [];
           if (!this.coreUpdateModal.version) {
             const latest = this.coreUpdateModal.releases.find((r) => r.latest) || this.coreUpdateModal.releases[0];
             if (latest && latest.tag && this.coreUpdateModal.autoUpdatable) {
@@ -1761,8 +1826,7 @@
         const msg = await HttpUtil.post('/panel/core/update/' + encodeURIComponent(core), {});
         this.quickUpdatingCore = '';
         if (msg && msg.obj) {
-          if (msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
-          if (msg.obj.engines) this.protocolEngines = msg.obj.engines;
+          this.applyBinaryMetadata(msg.obj);
         }
         await this.loadStatus(false);
       },
@@ -1776,8 +1840,7 @@
         });
         this.coreUpdateModal.submitting = false;
         if (msg && msg.obj) {
-          if (msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
-          if (msg.obj.engines) this.protocolEngines = msg.obj.engines;
+          this.applyBinaryMetadata(msg.obj);
         }
         if (msg && msg.success) {
           this.coreUpdateModal.visible = false;
@@ -1789,8 +1852,7 @@
         const msg = await HttpUtil.post('/panel/core/update/all', {});
         this.coreUpdateModal.submitting = false;
         if (msg && msg.obj) {
-          if (msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
-          if (msg.obj.engines) this.protocolEngines = msg.obj.engines;
+          this.applyBinaryMetadata(msg.obj);
         }
         await this.loadStatus(false);
       },
@@ -1799,8 +1861,7 @@
         const msg = await HttpUtil.post('/panel/core/rollback/' + encodeURIComponent(core), {});
         this.binaryLoading = false;
         if (msg && msg.obj) {
-          if (msg.obj.binaries) this.binaryInventory = msg.obj.binaries;
-          if (msg.obj.engines) this.protocolEngines = msg.obj.engines;
+          this.applyBinaryMetadata(msg.obj);
         }
         await this.loadStatus(false);
       },

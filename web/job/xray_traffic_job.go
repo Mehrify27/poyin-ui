@@ -15,26 +15,27 @@ import (
 
 // XrayTrafficJob collects and processes traffic statistics from Xray, updating the database and optionally informing external APIs.
 type XrayTrafficJob struct {
-	adminService    service.AdminService
-	settingService  service.SettingService
-	xrayService     service.XrayService
-	inboundService  service.InboundService
-	outboundService service.OutboundService
-	l2tpService     service.L2tpService
-	pptpService     service.PptpService
-	openvpnService  service.OpenVpnService
-	ocservService   service.OcservService
-	sstpService     service.SstpService
-	ikev2Service    service.Ikev2Service
-	wgcService      service.WgcService
-	awgService      service.AwgService
-	greService       service.GreService
-	mtprotoService   service.MtprotoService
-	hysteria2Service service.Hysteria2Service
-	sshService       service.SshService
-	nftService      service.NftService
-	radiusService   *service.RadiusService
-	sweeper         *rbridge.Sweeper
+	adminService       service.AdminService
+	settingService     service.SettingService
+	xrayService        service.XrayService
+	inboundService     service.InboundService
+	outboundService    service.OutboundService
+	l2tpService        service.L2tpService
+	pptpService        service.PptpService
+	openvpnService     service.OpenVpnService
+	ocservService      service.OcservService
+	sstpService        service.SstpService
+	ikev2Service       service.Ikev2Service
+	wgcService         service.WgcService
+	awgService         service.AwgService
+	greService         service.GreService
+	mtprotoService     service.MtprotoService
+	hysteria2Service   service.Hysteria2Service
+	singboxForkService service.SingboxForkService
+	sshService         service.SshService
+	nftService         service.NftService
+	radiusService      *service.RadiusService
+	sweeper            *rbridge.Sweeper
 }
 
 // NewXrayTrafficJob creates a new traffic collection job instance.
@@ -244,6 +245,13 @@ func (j *XrayTrafficJob) Run() {
 	if len(hy2ClientTraffics) > 0 {
 		clientTraffics = append(clientTraffics, hy2ClientTraffics...)
 	}
+	sfInboundTraffics, sfClientTraffics := j.singboxForkService.CollectAllTraffic()
+	if len(sfInboundTraffics) > 0 {
+		traffics = append(traffics, sfInboundTraffics...)
+	}
+	if len(sfClientTraffics) > 0 {
+		clientTraffics = appendUnrecorded(clientTraffics, sfClientTraffics)
+	}
 
 	// Level-triggered enforcement: disconnect any STILL-connected client that is no
 	// longer allowed (quota/expiry hit, or disabled in settings). The edge-triggered
@@ -264,6 +272,7 @@ func (j *XrayTrafficJob) Run() {
 	// there is no separate kill path and no daemon restart.
 	j.mtprotoService.KillDisabledSessions()
 	j.hysteria2Service.KillDisabledSessions()
+	j.singboxForkService.KillDisabledSessions()
 	// SSH: close the live sessions of any disabled account and trim every account to
 	// its User Limit. The server owns every net.Conn, so this is an in-process close.
 	j.sshService.KillDisabledSessions()
@@ -296,6 +305,7 @@ func (j *XrayTrafficJob) Run() {
 	// are unchanged, so a no-op tick costs a read and no reload.
 	j.mtprotoService.KillDisabledSessions()
 	j.hysteria2Service.KillDisabledSessions()
+	j.singboxForkService.KillDisabledSessions()
 	// Enforce limits on L2TP clients (kill sessions, regenerate chap-secrets)
 	if len(l2tpDisabledEmails) > 0 {
 		j.l2tpService.DisableClients(l2tpDisabledEmails)

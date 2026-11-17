@@ -436,9 +436,10 @@ func downloadGeofile(entry geofileEntry, maxTime time.Duration) error {
 		defer stop()
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, entry.URL, nil)
+	dlURL := config.ApplyGHProxy(entry.URL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dlURL, nil)
 	if err != nil {
-		return common.NewErrorf("Failed to create HTTP request for %s: %v", entry.URL, err)
+		return common.NewErrorf("Failed to create HTTP request for %s: %v", dlURL, err)
 	}
 	if localUsable {
 		if info, statErr := os.Stat(destPath); statErr == nil && !info.ModTime().IsZero() {

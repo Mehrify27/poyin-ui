@@ -124,6 +124,12 @@ func getAdminIds() []int64 {
 	return out
 }
 
+func getHostname() string {
+	tgBotMutex.Lock()
+	defer tgBotMutex.Unlock()
+	return hostname
+}
+
 func ensureHashStorage() *global.HashStorage {
 	tgBotMutex.Lock()
 	defer tgBotMutex.Unlock()
@@ -408,6 +414,8 @@ func (t *Tgbot) IsRunning() bool {
 // SetHostname sets the hostname for the bot.
 func (t *Tgbot) SetHostname() {
 	host, err := os.Hostname()
+	tgBotMutex.Lock()
+	defer tgBotMutex.Unlock()
 	if err != nil {
 		logger.Error("get hostname error:", err)
 		hostname = ""
@@ -771,7 +779,7 @@ func (t *Tgbot) answerCommand(message *telego.Message, chatId int64, isAdmin boo
 	case "start":
 		msg += t.I18nBot("tgbot.commands.start", "Firstname=="+html.EscapeString(message.From.FirstName))
 		if isAdmin {
-			msg += t.I18nBot("tgbot.commands.welcome", "Hostname=="+hostname)
+			msg += t.I18nBot("tgbot.commands.welcome", "Hostname=="+getHostname())
 		}
 		msg += "\n\n" + t.I18nBot("tgbot.commands.pleaseChoose")
 	case "status":
@@ -2529,8 +2537,8 @@ func (t *Tgbot) buildSubscriptionURLs(email string) (string, string, error) {
 		// try panel domain, otherwise OS hostname
 		if d, err := t.settingService.GetWebDomain(); err == nil && d != "" {
 			subDomain = d
-		} else if hostname != "" {
-			subDomain = hostname
+		} else if hn := getHostname(); hn != "" {
+			subDomain = hn
 		} else {
 			subDomain = "localhost"
 		}
@@ -2913,7 +2921,7 @@ func (t *Tgbot) prepareServerUsageInfo() string {
 		xrayState = t.lastStatus.Xray.State
 	}
 
-	info += t.I18nBot("tgbot.messages.hostname", "Hostname=="+hostname)
+	info += t.I18nBot("tgbot.messages.hostname", "Hostname=="+getHostname())
 	info += t.I18nBot("tgbot.messages.version", "Version=="+config.GetVersion())
 	info += t.I18nBot("tgbot.messages.xrayVersion", "XrayVersion=="+xrayVersion)
 
@@ -2976,13 +2984,14 @@ func (t *Tgbot) UserLoginNotify(username string, password string, ip string, tim
 	}
 
 	msg := ""
+	hn := getHostname()
 	switch status {
 	case LoginSuccess:
 		msg += t.I18nBot("tgbot.messages.loginSuccess")
-		msg += t.I18nBot("tgbot.messages.hostname", "Hostname=="+hostname)
+		msg += t.I18nBot("tgbot.messages.hostname", "Hostname=="+hn)
 	case LoginFail:
 		msg += t.I18nBot("tgbot.messages.loginFailed")
-		msg += t.I18nBot("tgbot.messages.hostname", "Hostname=="+hostname)
+		msg += t.I18nBot("tgbot.messages.hostname", "Hostname=="+hn)
 		msg += t.I18nBot("tgbot.messages.password", "Password=="+password)
 	}
 	msg += t.I18nBot("tgbot.messages.username", "Username=="+username)

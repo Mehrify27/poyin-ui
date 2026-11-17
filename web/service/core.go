@@ -15,6 +15,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/logger"
+	"github.com/mhsanaei/3x-ui/v2/xray"
 )
 
 // vpnKernelModules are the REQUIRED kernel modules the L2TP/PPTP/OpenVPN backends
@@ -122,19 +123,20 @@ type ProvisionStep struct {
 // Like the other services it is a zero-value-usable value type; its methods are
 // stateless (they read the DB and probe the host), so a fresh copy works.
 type CoreService struct {
-	l2tpService    L2tpService
-	pptpService    PptpService
-	openvpnService OpenVpnService
-	ocservService  OcservService
-	sstpService    SstpService
-	ikev2Service   Ikev2Service
-	wgcService     WgcService
-	awgService     AwgService
-	greService       GreService
-	mtprotoService   MtprotoService
-	hysteria2Service Hysteria2Service
-	sshService       SshService
-	xrayService      XrayService
+	l2tpService        L2tpService
+	pptpService        PptpService
+	openvpnService     OpenVpnService
+	ocservService      OcservService
+	sstpService        SstpService
+	ikev2Service       Ikev2Service
+	wgcService         WgcService
+	awgService         AwgService
+	greService         GreService
+	mtprotoService     MtprotoService
+	hysteria2Service   Hysteria2Service
+	singboxForkService SingboxForkService
+	sshService         SshService
+	xrayService        XrayService
 }
 
 // --------------------------------------------------------------------------- //
@@ -453,11 +455,29 @@ func (s *CoreService) xrayStatus() CoreStatus {
 	// protocols have no separate process to report on, and inventing a core for
 	// each would put a start/stop card on the Core Settings page for something
 	// with nothing to start.
-	cs.Extra = map[string]any{"protocolInbounds": xrayProtocolInbounds()}
+	caps := DetectActiveXrayCapabilities()
+	forkEngine := "xray-patched"
+	if ShouldUseSingboxForkEngineForCaps(caps) {
+		forkEngine = "sing-box"
+	}
+	cs.Extra = map[string]any{
+		"protocolInbounds":   xrayProtocolInbounds(),
+		"binaryMode":         caps.BinaryMode,
+		"customPatched":      caps.SupportsNativeForkProtocols && caps.SupportsSpeedLimit,
+		"supportsSpeedLimit": caps.SupportsSpeedLimit,
+		"speedLimitEngine":   ActiveSpeedLimitEngine(),
+		"forkProtocolEngine": forkEngine,
+	}
 	if s.xrayService.IsXrayRunning() {
 		cs.State = CoreRunning
 		cs.Version = s.xrayService.GetXrayVersion()
 		return cs
+	}
+	if binPath := xray.GetBinaryPath(); binPath != "" {
+		tok, _ := probeDaemonBinaryVersion("xray", binPath)
+		cs.Version = firstNonEmptyString(tok, s.xrayService.GetXrayVersion())
+	} else {
+		cs.Version = s.xrayService.GetXrayVersion()
 	}
 	if err := s.xrayService.GetXrayErr(); err != nil {
 		cs.State = CoreError
@@ -780,18 +800,33 @@ func (s *CoreService) mtprotoStatus() CoreStatus {
 func (s *CoreService) hysteria2Status() CoreStatus {
 	cs := CoreStatus{Name: "hysteria2"}
 	inbounds, _ := s.hysteria2Service.GetHysteria2Inbounds()
-	cs.Inbounds = len(inbounds)
+	var forkInbounds []*model.Inbound
+	if ShouldUseSingboxForkEngine() {
+		forkInbounds, _ = s.singboxForkService.GetManagedInbounds()
+	}
+	cs.Inbounds = len(inbounds) + len(forkInbounds)
 	if !s.hysteria2Service.Available() {
 		cs.State = CoreNotInstalled
 		cs.Detail = "sing-box binary not bundled for this architecture"
 		return cs
 	}
 	cs.Version = daemonVersion("sing-box")
+	hy2Running := procMgr.AnyRunningWithPrefix(hy2ProcPrefix)
+	sfRunning := procMgr.AnyRunningWithPrefix(singboxForkProcPrefix)
+	if len(forkInbounds) > 0 {
+		cs.Extra = map[string]any{
+			"forkInbounds": len(forkInbounds),
+			"forkRunning":  sfRunning,
+		}
+	}
 	switch {
 	case cs.Inbounds == 0:
 		cs.State = CoreIdle
-	case procMgr.AnyRunningWithPrefix(hy2ProcPrefix):
+	case (len(inbounds) == 0 || hy2Running) && (len(forkInbounds) == 0 || sfRunning):
 		cs.State = CoreRunning
+	case hy2Running || sfRunning:
+		cs.State = CoreError
+		cs.Detail = "one or more sing-box protocol listeners are not running — check Logs"
 	default:
 		cs.State = CoreStopped
 	}
@@ -987,7 +1022,14 @@ func (s *CoreService) ProtocolNeedsSetup(protocol string) bool {
 func (s *CoreService) RestartCore(name string) error {
 	switch name {
 	case "xray":
-		return s.xrayService.RestartXray(true)
+		if err := s.xrayService.RestartXray(true); err != nil {
+			return err
+		}
+		if err := s.singboxForkService.EnsureServicesRunning(); err != nil {
+			logger.Warning("sing-box fork reconcile after xray restart failed:", err)
+		}
+		WriteSpeedLimits()
+		return nil
 	case "l2tp":
 		return s.l2tpService.RestartServices()
 	case "pptp":
@@ -1010,9 +1052,13 @@ func (s *CoreService) RestartCore(name string) error {
 		return s.mtprotoService.RestartServices()
 	case "hysteria2":
 		err := s.hysteria2Service.RestartServices()
+		sfErr := s.singboxForkService.RestartServices()
 		outErr := (&Hysteria2OutboundService{}).RestartAll()
 		if err != nil {
 			return err
+		}
+		if sfErr != nil {
+			return sfErr
 		}
 		return outErr
 	case "ssh":
@@ -1074,8 +1120,12 @@ func (s *CoreService) StopCore(name string) error {
 		return s.mtprotoService.StopServices()
 	case "hysteria2":
 		err := s.hysteria2Service.StopServices()
+		sfErr := s.singboxForkService.StopServices()
 		(&Hysteria2OutboundService{}).StopAll()
-		return err
+		if err != nil {
+			return err
+		}
+		return sfErr
 	case "ssh":
 		return s.sshService.StopServices()
 	case "radius":
@@ -1143,7 +1193,15 @@ func (s *CoreService) CoreLogs(name string) string {
 	case "mtproto":
 		return procMgr.LogsByPrefix("mtproto-server-")
 	case "hysteria2":
-		return procMgr.LogsByPrefix(hy2ProcPrefix)
+		hy2 := procMgr.LogsByPrefix(hy2ProcPrefix)
+		sf := procMgr.LogsByPrefix(singboxForkProcPrefix)
+		if sf == "" {
+			return hy2
+		}
+		if hy2 == "" {
+			return sf
+		}
+		return hy2 + "\n" + sf
 	case "ssh":
 		running := "no"
 		if s.sshService.AnyRunning() {
@@ -1594,6 +1652,7 @@ func (s *CoreService) StartProvision(cores []string) bool {
 			cs.greService.InitGre()
 			cs.mtprotoService.InitMtproto()
 			cs.hysteria2Service.InitHysteria2()
+			cs.singboxForkService.InitServices()
 			cs.sshService.InitSsh()
 			if err := cs.xrayService.RestartXray(true); err != nil {
 				logger.Warning("provision: failed to restart xray after setup:", err)

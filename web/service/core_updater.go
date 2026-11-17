@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,11 +26,16 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/backend"
 	"github.com/mhsanaei/3x-ui/v2/config"
 	"github.com/mhsanaei/3x-ui/v2/corebundle"
+	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/util/binutil"
+	"github.com/mhsanaei/3x-ui/v2/xray"
 )
 
-const maxCoreArtifactBytes = 512 << 20 // 512 MiB cap against truncated/malicious archives
+const (
+	maxCoreArtifactBytes  = 512 << 20 // 512 MiB cap against truncated/malicious archives
+	maxValidatedJSONBytes = 32 << 20  // 32 MiB cap (XTLS/Xray-core releases?per_page=100 exceeds 10 MiB)
+)
 
 // githubReleaseAPIBase and gitlabReleaseAPIBase can be overridden in unit tests.
 var (
@@ -87,25 +93,45 @@ type CoreUpdateSpec struct {
 // CoreBinaryInfo reports active/bundled/override paths and metadata for one
 // managed binary.
 type CoreBinaryInfo struct {
-	Core             string   `json:"core"`
-	ServiceCore      string   `json:"serviceCore"`
-	Protocols        string   `json:"protocols,omitempty"`
-	ActivePath       string   `json:"activePath"`
-	BundledPath      string   `json:"bundledPath"`
-	CustomPath       string   `json:"customPath"`
-	CustomDir        string   `json:"customDir"`
-	Source           string   `json:"source"` // custom-override | bundled | host-path | missing
-	Version          string   `json:"version"`
-	InstalledVersion string   `json:"installedVersion,omitempty"`
-	SHA256           string   `json:"sha256,omitempty"`
-	HasBackup        bool     `json:"hasBackup"`
-	UpstreamRepo     string   `json:"upstreamRepo,omitempty"`
-	UpstreamURL      string   `json:"upstreamUrl,omitempty"`
-	UpdateMode       string   `json:"updateMode"`
-	AutoUpdatable    bool     `json:"autoUpdatable"`
-	CustomPatched    bool     `json:"customPatched"`
-	PatchSet         []string `json:"patchSet,omitempty"`
-	UpstreamWarning  string   `json:"upstreamWarning,omitempty"`
+	Core                        string   `json:"core"`
+	ServiceCore                 string   `json:"serviceCore"`
+	Protocols                   string   `json:"protocols,omitempty"`
+	ActivePath                  string   `json:"activePath"`
+	BundledPath                 string   `json:"bundledPath"`
+	CustomPath                  string   `json:"customPath"`
+	CustomDir                   string   `json:"customDir"`
+	Source                      string   `json:"source"` // custom-override | bundled | host-path | missing
+	Version                     string   `json:"version"`
+	InstalledVersion            string   `json:"installedVersion,omitempty"`
+	SHA256                      string   `json:"sha256,omitempty"`
+	HasBackup                   bool     `json:"hasBackup"`
+	UpstreamRepo                string   `json:"upstreamRepo,omitempty"`
+	UpstreamURL                 string   `json:"upstreamUrl,omitempty"`
+	UpdateMode                  string   `json:"updateMode"`
+	AutoUpdatable               bool     `json:"autoUpdatable"`
+	CustomPatched               bool     `json:"customPatched"`
+	BinaryMode                  string   `json:"binaryMode,omitempty"`
+	SupportsSpeedLimit          bool     `json:"supportsSpeedLimit,omitempty"`
+	SupportsNativeForkProtocols bool     `json:"supportsNativeForkProtocols,omitempty"`
+	SpeedLimitEngine            string   `json:"speedLimitEngine,omitempty"`
+	ForkProtocolEngine          string   `json:"forkProtocolEngine,omitempty"`
+	PatchSet                    []string `json:"patchSet,omitempty"`
+	UpstreamWarning             string   `json:"upstreamWarning,omitempty"`
+}
+
+const (
+	BinaryModeBundledPatched        = "bundled-patched"
+	BinaryModeCustomPatched         = "custom-patched"
+	BinaryModeOfficialXTLSUnpatched = "official-xtls-unpatched"
+	BinaryModeMissing               = "missing"
+)
+
+// XrayBinaryCapabilities describes which custom vpn-ui patches an Xray binary
+// actually supports at runtime (inferred from build markers and override metadata).
+type XrayBinaryCapabilities struct {
+	BinaryMode                  string `json:"binaryMode"`
+	SupportsSpeedLimit          bool   `json:"supportsSpeedLimit"`
+	SupportsNativeForkProtocols bool   `json:"supportsNativeForkProtocols"`
 }
 
 // CoreReleaseOption describes one upstream version available from the official repository.
@@ -137,31 +163,32 @@ type CoreUpdateOptions struct {
 
 // CoreUpdateResult reports the outcome of updating or rolling back one target.
 type CoreUpdateResult struct {
-	Target      string `json:"target"`
-	ServiceCore string `json:"serviceCore"`
-	DestPath    string `json:"destPath"`
-	BackupPath  string `json:"backupPath,omitempty"`
-	Source      string `json:"source"`
-	Version     string `json:"version,omitempty"`
-	SHA256      string `json:"sha256,omitempty"`
-	Restarted   bool   `json:"restarted"`
-	RolledBack  bool   `json:"rolledBack"`
-	Status      string `json:"status"` // updated | rolled_back | skipped
-	Message     string `json:"message"`
+	Target          string `json:"target"`
+	ServiceCore     string `json:"serviceCore"`
+	DestPath        string `json:"destPath"`
+	BackupPath      string `json:"backupPath,omitempty"`
+	Source          string `json:"source"`
+	Version         string `json:"version,omitempty"`
+	SHA256          string `json:"sha256,omitempty"`
+	PreflightTested bool   `json:"preflightTested,omitempty"`
+	Restarted       bool   `json:"restarted"`
+	RolledBack      bool   `json:"rolledBack"`
+	Status          string `json:"status"` // updated | rolled_back | skipped
+	Message         string `json:"message"`
 }
 
 var managedCoreUpdateSpecs = []CoreUpdateSpec{
 	{
 		Target:             "xray",
 		ServiceCore:        "xray",
-		Protocols:          "VLESS, VMess, Trojan, Shadowsocks, WireGuard, TUIC, Hysteria, AnyTLS",
+		Protocols:          "VLESS, VMess, Trojan, Shadowsocks, WireGuard, AnyTLS, TUIC, NaiveProxy",
 		UpstreamProvider:   "github",
 		GithubRepo:         "XTLS/Xray-core",
 		UpstreamURL:        "https://github.com/XTLS/Xray-core/releases",
 		UpdateMode:         "prebuilt",
 		CustomPatched:      true,
 		PatchSet:           XrayPatchList,
-		UpstreamWarning:    "Bundled Xray-core carries custom vpn-ui patches (CanSpliceCopy=3 speedlimit disable, AnyTLS, TUIC, NaiveProxy, Shadowsocks cipher fallback, legacy reverse). Installing unpatched upstream XTLS/Xray-core disables those patches.",
+		UpstreamWarning:    "Installing unpatched official XTLS/Xray-core automatically switches AnyTLS, TUIC v5, and NaiveProxy to the bundled sing-box sidecar and VPN speed limits to kernel tc fallback.",
 		VersionArgs:        []string{"-version"},
 		ArchiveBinaryNames: []string{"xray"},
 		CustomFileFunc:     corebundle.XrayBinaryName,
@@ -199,7 +226,7 @@ var managedCoreUpdateSpecs = []CoreUpdateSpec{
 	{
 		Target:             "sing-box",
 		ServiceCore:        "hysteria2",
-		Protocols:          "Hysteria 2",
+		Protocols:          "Hysteria 2, AnyTLS, TUIC v5, NaiveProxy",
 		UpstreamProvider:   "github",
 		GithubRepo:         "SagerNet/sing-box",
 		UpstreamURL:        "https://github.com/SagerNet/sing-box/releases",
@@ -362,24 +389,199 @@ func (s *CoreService) GetCoreBinaryInventory() []CoreBinaryInfo {
 	customDir := binutil.CustomBinDir()
 	out := make([]CoreBinaryInfo, 0, len(managedCoreUpdateSpecs))
 	for _, spec := range managedCoreUpdateSpecs {
-		customPath := filepath.Join(customDir, spec.CustomFileFunc())
-		bundledPath := spec.BundledPathFunc()
-		activePath := spec.ActivePathFunc()
+		out = append(out, buildCoreBinaryInfo(spec, customDir))
+	}
+	return out
+}
 
-		source := "missing"
-		if activePath != "" {
-			cleanActive := filepath.Clean(activePath)
-			cleanCustom := filepath.Clean(customPath)
-			if cleanActive == cleanCustom || strings.HasPrefix(cleanActive, filepath.Clean(customDir)+string(os.PathSeparator)) {
-				source = "custom-override"
-			} else if bundledPath != "" && cleanActive == filepath.Clean(bundledPath) {
-				source = "bundled"
-			} else {
-				source = "host-path"
+// GetCoreBinaryInfo resolves metadata and installed version for a single core target.
+func (s *CoreService) GetCoreBinaryInfo(target string) (CoreBinaryInfo, bool) {
+	spec, ok := findCoreUpdateSpec(target)
+	if !ok {
+		return CoreBinaryInfo{}, false
+	}
+	return buildCoreBinaryInfo(spec, binutil.CustomBinDir()), true
+}
+
+const realXrayBinaryMinBytes = 512 << 10
+
+type cachedXrayCaps struct {
+	size    int64
+	modUnix int64
+	caps    XrayBinaryCapabilities
+}
+
+var (
+	xrayCapCacheMu sync.Mutex
+	xrayCapCache   = map[string]cachedXrayCaps{}
+)
+
+func invalidateXrayCapabilitiesCache() {
+	xrayCapCacheMu.Lock()
+	xrayCapCache = map[string]cachedXrayCaps{}
+	xrayCapCacheMu.Unlock()
+}
+
+// DetectActiveXrayCapabilities inspects the currently active Xray binary on disk
+// and reports whether it carries vpn-ui custom patches (speedlimit sidecar +
+// native fork protocols) or is an unpatched official XTLS/Xray-core build.
+func DetectActiveXrayCapabilities() XrayBinaryCapabilities {
+	binPath := corebundle.ResolveXrayBinaryPath(config.GetBinFolderPath())
+	if binPath == "" {
+		binPath = xray.GetBinaryPath()
+	}
+	return DetectXrayCapabilities(binPath)
+}
+
+// DetectXrayCapabilities probes an Xray binary at binPath via override metadata
+// and embedded binary markers, caching results by path, size, and mtime.
+func DetectXrayCapabilities(binPath string) XrayBinaryCapabilities {
+	cleanPath := filepath.Clean(strings.TrimSpace(binPath))
+	if cleanPath == "" || cleanPath == "." {
+		return XrayBinaryCapabilities{BinaryMode: BinaryModeMissing}
+	}
+	st, err := os.Stat(cleanPath)
+	if err != nil || st.IsDir() {
+		return XrayBinaryCapabilities{BinaryMode: BinaryModeMissing}
+	}
+	modUnix := st.ModTime().UnixNano()
+
+	xrayCapCacheMu.Lock()
+	if entry, ok := xrayCapCache[cleanPath]; ok && entry.size == st.Size() && entry.modUnix == modUnix {
+		xrayCapCacheMu.Unlock()
+		return entry.caps
+	}
+	xrayCapCacheMu.Unlock()
+
+	isBundled := false
+	if bp := filepath.Join(config.GetBinFolderPath(), corebundle.XrayBinaryName()); bp != "" && filepath.Clean(bp) == cleanPath {
+		isBundled = true
+	}
+
+	caps := detectXrayCapabilitiesUncached(cleanPath, st.Size(), isBundled)
+
+	xrayCapCacheMu.Lock()
+	xrayCapCache[cleanPath] = cachedXrayCaps{size: st.Size(), modUnix: modUnix, caps: caps}
+	xrayCapCacheMu.Unlock()
+	return caps
+}
+
+func detectXrayCapabilitiesUncached(cleanPath string, size int64, isBundled bool) XrayBinaryCapabilities {
+	meta, hasMeta := readCoreOverrideMeta(cleanPath)
+	if hasMeta && !meta.CustomPatched {
+		return XrayBinaryCapabilities{
+			BinaryMode:                  BinaryModeOfficialXTLSUnpatched,
+			SupportsSpeedLimit:          false,
+			SupportsNativeForkProtocols: false,
+		}
+	}
+
+	hasSpeedLimit, hasForkProto := scanXrayCapabilityMarkers(cleanPath)
+	if hasSpeedLimit || hasForkProto {
+		mode := BinaryModeCustomPatched
+		if isBundled {
+			mode = BinaryModeBundledPatched
+		}
+		return XrayBinaryCapabilities{
+			BinaryMode:                  mode,
+			SupportsSpeedLimit:          hasSpeedLimit,
+			SupportsNativeForkProtocols: hasForkProto,
+		}
+	}
+
+	if hasMeta && meta.CustomPatched {
+		return XrayBinaryCapabilities{
+			BinaryMode:                  BinaryModeCustomPatched,
+			SupportsSpeedLimit:          true,
+			SupportsNativeForkProtocols: true,
+		}
+	}
+
+	// A real compiled ELF >= 512 KiB with neither vpn-ui marker is an unpatched
+	// upstream XTLS/Xray-core binary (e.g. manually placed on disk). Tiny test
+	// fixtures at the bundled path keep the bundled-patched capability profile.
+	if size >= realXrayBinaryMinBytes || !isBundled {
+		return XrayBinaryCapabilities{
+			BinaryMode:                  BinaryModeOfficialXTLSUnpatched,
+			SupportsSpeedLimit:          false,
+			SupportsNativeForkProtocols: false,
+		}
+	}
+	return XrayBinaryCapabilities{
+		BinaryMode:                  BinaryModeBundledPatched,
+		SupportsSpeedLimit:          true,
+		SupportsNativeForkProtocols: true,
+	}
+}
+
+func scanXrayCapabilityMarkers(binPath string) (hasSpeedLimit, hasForkProtocols bool) {
+	f, err := os.Open(binPath)
+	if err != nil {
+		return false, false
+	}
+	defer f.Close()
+
+	speedMarker := []byte("XRAY_SPEEDLIMIT_FILE")
+	forkMarker := []byte("xray.proxy.naive.Account")
+	anytlsMarker := []byte("xray.proxy.anytls.Account")
+
+	const chunkSize = 64 * 1024
+	const overlap = 64
+	buf := make([]byte, overlap+chunkSize)
+	carry := 0
+
+	for {
+		n, rerr := f.Read(buf[carry:])
+		total := carry + n
+		if total > 0 {
+			window := buf[:total]
+			if !hasSpeedLimit && bytes.Contains(window, speedMarker) {
+				hasSpeedLimit = true
+			}
+			if !hasForkProtocols && (bytes.Contains(window, forkMarker) || bytes.Contains(window, anytlsMarker)) {
+				hasForkProtocols = true
+			}
+			if hasSpeedLimit && hasForkProtocols {
+				return true, true
 			}
 		}
+		if rerr != nil {
+			break
+		}
+		if total >= overlap {
+			copy(buf[:overlap], buf[total-overlap:total])
+			carry = overlap
+		} else {
+			carry = total
+		}
+	}
+	return hasSpeedLimit, hasForkProtocols
+}
 
-		isCustomPatched := spec.CustomPatched
+func buildCoreBinaryInfo(spec CoreUpdateSpec, customDir string) CoreBinaryInfo {
+	customPath := filepath.Join(customDir, spec.CustomFileFunc())
+	bundledPath := spec.BundledPathFunc()
+	activePath := spec.ActivePathFunc()
+
+	source := "missing"
+	if activePath != "" {
+		cleanActive := filepath.Clean(activePath)
+		cleanCustom := filepath.Clean(customPath)
+		if cleanActive == cleanCustom || strings.HasPrefix(cleanActive, filepath.Clean(customDir)+string(os.PathSeparator)) {
+			source = "custom-override"
+		} else if bundledPath != "" && cleanActive == filepath.Clean(bundledPath) {
+			source = "bundled"
+		} else {
+			source = "host-path"
+		}
+	}
+
+	isCustomPatched := spec.CustomPatched
+	var caps XrayBinaryCapabilities
+	if spec.Target == "xray" {
+		caps = DetectXrayCapabilities(activePath)
+		isCustomPatched = caps.SupportsSpeedLimit || caps.SupportsNativeForkProtocols
+	} else {
 		if spec.Target == "telemt" && source == "bundled" {
 			isCustomPatched = true
 		}
@@ -390,40 +592,54 @@ func (s *CoreService) GetCoreBinaryInventory() []CoreBinaryInfo {
 		} else if source == "host-path" && spec.CustomPatched {
 			isCustomPatched = false
 		}
-
-		_, bakErr := os.Stat(customPath + ".bak")
-		info := CoreBinaryInfo{
-			Core:            spec.Target,
-			ServiceCore:     spec.ServiceCore,
-			Protocols:       spec.Protocols,
-			ActivePath:      activePath,
-			BundledPath:     bundledPath,
-			CustomPath:      customPath,
-			CustomDir:       customDir,
-			Source:          source,
-			HasBackup:       bakErr == nil,
-			UpstreamRepo:    spec.GithubRepo,
-			UpstreamURL:     spec.UpstreamURL,
-			UpdateMode:      spec.UpdateMode,
-			AutoUpdatable:   canAutoUpdateSpec(spec),
-			CustomPatched:   isCustomPatched,
-			PatchSet:        append([]string(nil), spec.PatchSet...),
-			UpstreamWarning: spec.UpstreamWarning,
-		}
-		if activePath != "" {
-			tok, banner := probeDaemonBinaryVersion(spec.Target, activePath)
-			info.Version = firstNonEmptyString(banner, probeBinaryVersion(activePath, spec.VersionArgs))
-			info.InstalledVersion = firstNonEmptyString(tok, extractVersionToken(info.Version))
-			if meta, ok := readCoreOverrideMeta(customPath); ok && source == "custom-override" && info.InstalledVersion == "" {
-				info.InstalledVersion = meta.Version
-			}
-			if sum, err := binutil.FileSHA256(activePath); err == nil {
-				info.SHA256 = sum
-			}
-		}
-		out = append(out, info)
 	}
-	return out
+
+	_, bakErr := os.Stat(customPath + ".bak")
+	info := CoreBinaryInfo{
+		Core:            spec.Target,
+		ServiceCore:     spec.ServiceCore,
+		Protocols:       spec.Protocols,
+		ActivePath:      activePath,
+		BundledPath:     bundledPath,
+		CustomPath:      customPath,
+		CustomDir:       customDir,
+		Source:          source,
+		HasBackup:       bakErr == nil,
+		UpstreamRepo:    spec.GithubRepo,
+		UpstreamURL:     spec.UpstreamURL,
+		UpdateMode:      spec.UpdateMode,
+		AutoUpdatable:   canAutoUpdateSpec(spec),
+		CustomPatched:   isCustomPatched,
+		PatchSet:        append([]string(nil), spec.PatchSet...),
+		UpstreamWarning: spec.UpstreamWarning,
+	}
+	if spec.Target == "xray" {
+		info.BinaryMode = caps.BinaryMode
+		info.SupportsSpeedLimit = caps.SupportsSpeedLimit
+		info.SupportsNativeForkProtocols = caps.SupportsNativeForkProtocols
+		if caps.SupportsSpeedLimit {
+			info.SpeedLimitEngine = SpeedLimitEngineInCoreXray
+		} else {
+			info.SpeedLimitEngine = SpeedLimitEngineKernelTC
+		}
+		if ShouldUseSingboxForkEngineForCaps(caps) {
+			info.ForkProtocolEngine = "sing-box"
+		} else {
+			info.ForkProtocolEngine = "xray-patched"
+		}
+	}
+	if activePath != "" {
+		tok, banner := probeDaemonBinaryVersion(spec.Target, activePath)
+		info.Version = firstNonEmptyString(banner, probeBinaryVersion(activePath, spec.VersionArgs))
+		info.InstalledVersion = firstNonEmptyString(tok, extractVersionToken(info.Version))
+		if meta, ok := readCoreOverrideMeta(customPath); ok && source == "custom-override" && info.InstalledVersion == "" {
+			info.InstalledVersion = meta.Version
+		}
+		if sum, err := binutil.FileSHA256(activePath); err == nil {
+			info.SHA256 = sum
+		}
+	}
+	return info
 }
 
 // CanAutoUpdateTarget reports whether target can automatically download (or
@@ -626,6 +842,23 @@ func (s *CoreService) updateSingleCore(
 	if err := binutil.ValidateELFBinary(stagedExec, runtime.GOARCH); err != nil {
 		return res, fmt.Errorf("validate %s binary: %w", spec.Target, err)
 	}
+	if opts.VerifyHealthFunc == nil {
+		if err := RunBinaryVersionCheck(spec, stagedExec); err != nil {
+			return res, fmt.Errorf("staged binary self-check failed: %w", err)
+		}
+		if spec.ServiceCore == "xray" {
+			stagedCfgPath, cerr := s.prepareStagedXrayConfig(stagedExec, tmpDir)
+			if cerr != nil {
+				return res, fmt.Errorf("prepare staged xray preflight config: %w", cerr)
+			}
+			if stagedCfgPath != "" {
+				if err := testXrayBinaryConfig(stagedExec, stagedCfgPath); err != nil {
+					return res, fmt.Errorf("staged xray rejected current config: %w", err)
+				}
+				res.PreflightTested = true
+			}
+		}
+	}
 
 	sum, err := binutil.FileSHA256(stagedExec)
 	if err == nil {
@@ -635,11 +868,30 @@ func (s *CoreService) updateSingleCore(
 		res.Version = ver
 	}
 
+	isPatchedResult := spec.CustomPatched
+	if spec.Target == "xray" {
+		hasSL, hasFork := scanXrayCapabilityMarkers(stagedExec)
+		if hasSL || hasFork {
+			isPatchedResult = true
+		} else if strings.TrimSpace(opts.URL) == "" && strings.TrimSpace(opts.File) == "" {
+			isPatchedResult = false
+		}
+	} else if strings.TrimSpace(opts.URL) == "" && strings.TrimSpace(opts.File) == "" && spec.CustomPatched {
+		isPatchedResult = false
+	}
+
 	bakPath, hadPrev, err := binutil.AtomicInstallBinary(dest, stagedExec)
 	if err != nil {
 		return res, err
 	}
+	writeCoreOverrideMeta(dest, coreOverrideMeta{
+		CustomPatched:  isPatchedResult,
+		Source:         sourceLabel,
+		Version:        res.Version,
+		AllowUnpatched: opts.AllowUnpatched,
+	})
 	invalidateDaemonVersionCache(spec.CustomFileFunc())
+	invalidateXrayCapabilitiesCache()
 	if hadPrev {
 		res.BackupPath = bakPath
 	}
@@ -647,6 +899,7 @@ func (s *CoreService) updateSingleCore(
 	rollbackWithReason := func(cause error) (CoreUpdateResult, error) {
 		rbErr := binutil.RestoreBinary(dest, bakPath, hadPrev)
 		invalidateDaemonVersionCache(spec.CustomFileFunc())
+		invalidateXrayCapabilitiesCache()
 		if rbErr == nil {
 			_ = restartFn(spec.ServiceCore)
 			res.RolledBack = true
@@ -667,17 +920,6 @@ func (s *CoreService) updateSingleCore(
 	if err := verifyFn(spec, dest); err != nil {
 		return rollbackWithReason(err)
 	}
-
-	isPatchedResult := spec.CustomPatched
-	if strings.TrimSpace(opts.URL) == "" && strings.TrimSpace(opts.File) == "" && spec.CustomPatched {
-		isPatchedResult = false
-	}
-	writeCoreOverrideMeta(dest, coreOverrideMeta{
-		CustomPatched:  isPatchedResult,
-		Source:         sourceLabel,
-		Version:        res.Version,
-		AllowUnpatched: opts.AllowUnpatched,
-	})
 
 	res.Status = "updated"
 	res.Message = fmt.Sprintf("%s updated at %s and %s restarted cleanly", spec.Target, dest, spec.ServiceCore)
@@ -709,7 +951,9 @@ func (s *CoreService) RollbackCore(target string, restartFn func(string) error) 
 		if err := binutil.RestoreBinary(dest, bakPath, true); err != nil {
 			return res, fmt.Errorf("restore backup %s: %w", bakPath, err)
 		}
+		_ = os.Remove(coreMetaPath(dest))
 		invalidateDaemonVersionCache(spec.CustomFileFunc())
+		invalidateXrayCapabilitiesCache()
 		res.Source = "backup"
 		res.Message = fmt.Sprintf("restored %s from backup", dest)
 	} else if _, err := os.Stat(dest); err == nil {
@@ -718,6 +962,7 @@ func (s *CoreService) RollbackCore(target string, restartFn func(string) error) 
 		}
 		_ = os.Remove(coreMetaPath(dest))
 		invalidateDaemonVersionCache(spec.CustomFileFunc())
+		invalidateXrayCapabilitiesCache()
 		res.Source = "bundled-fallback"
 		res.Message = fmt.Sprintf("removed custom override %s; reverted to bundled binary", dest)
 	} else {
@@ -754,41 +999,109 @@ func RunBinaryVersionCheck(spec CoreUpdateSpec, destPath string) error {
 	return fmt.Errorf("%s failed binary execution check: %w (%s)", spec.Target, err, strings.TrimSpace(string(out)))
 }
 
+func (s *CoreService) prepareStagedXrayConfig(stagedExec, tmpDir string) (string, error) {
+	if database.GetDB() != nil {
+		stagedCaps := DetectXrayCapabilities(stagedExec)
+		cfg, err := s.xrayService.BuildXrayConfigWithCapabilities(stagedCaps)
+		if err == nil && cfg != nil {
+			rawCfg, merr := json.MarshalIndent(cfg, "", "  ")
+			if merr != nil {
+				return "", merr
+			}
+			stagedCfg := filepath.Join(tmpDir, "staged-config.json")
+			if werr := os.WriteFile(stagedCfg, rawCfg, 0o600); werr != nil {
+				return "", werr
+			}
+			return stagedCfg, nil
+		}
+	}
+	if cfgPath := xray.GetConfigPath(); cfgPath != "" {
+		if st, serr := os.Stat(cfgPath); serr == nil && !st.IsDir() {
+			return cfgPath, nil
+		}
+	}
+	return "", nil
+}
+
+func testXrayBinaryConfig(binPath, configPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binPath, "run", "-test", "-c", configPath)
+	env := os.Environ()
+	if absBinDir, err := filepath.Abs(config.GetBinFolderPath()); err == nil {
+		env = append(env, "XRAY_LOCATION_ASSET="+absBinDir)
+	}
+	if absSL, err := filepath.Abs(xray.GetSpeedLimitPath()); err == nil {
+		env = append(env, "XRAY_SPEEDLIMIT_FILE="+absSL)
+	}
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("%s", msg)
+	}
+	return nil
+}
+
 func (s *CoreService) verifyUpdatedCoreHealth(spec CoreUpdateSpec, destPath string) error {
 	if err := RunBinaryVersionCheck(spec, destPath); err != nil {
 		return err
 	}
 
 	if spec.ServiceCore == "xray" {
-		deadline := time.Now().Add(4 * time.Second)
-		for time.Now().Before(deadline) {
+		startDeadline := time.Now().Add(5 * time.Second)
+		startedRunning := false
+		for time.Now().Before(startDeadline) {
 			if errMsg := s.xrayService.GetXrayErr(); errMsg != nil {
 				return fmt.Errorf("xray startup error: %w", errMsg)
 			}
 			if s.xrayService.IsXrayRunning() {
-				time.Sleep(500 * time.Millisecond)
-				if s.xrayService.IsXrayRunning() {
-					return nil
-				}
+				startedRunning = true
+				break
 			}
 			time.Sleep(250 * time.Millisecond)
 		}
-		if errMsg := s.xrayService.GetXrayErr(); errMsg != nil {
-			return fmt.Errorf("xray startup error: %w", errMsg)
+		if !startedRunning {
+			if errMsg := s.xrayService.GetXrayErr(); errMsg != nil {
+				return fmt.Errorf("xray startup error: %w", errMsg)
+			}
+			if resMsg := strings.TrimSpace(s.xrayService.GetXrayResult()); resMsg != "" {
+				return fmt.Errorf("xray process did not remain running after update: %s", resMsg)
+			}
+			return errors.New("xray process did not remain running after update")
 		}
-		return errors.New("xray process did not remain running after update")
+		// Soak for 2 seconds after startup so rapid initialization exits (e.g.
+		// geoip/geosite read errors or invalid inbound listeners) trigger auto-rollback.
+		for i := 0; i < 8; i++ {
+			time.Sleep(250 * time.Millisecond)
+			if errMsg := s.xrayService.GetXrayErr(); errMsg != nil {
+				return fmt.Errorf("xray exited during stability check: %w", errMsg)
+			}
+			if !s.xrayService.IsXrayRunning() {
+				if resMsg := strings.TrimSpace(s.xrayService.GetXrayResult()); resMsg != "" {
+					return fmt.Errorf("xray exited during stability check: %s", resMsg)
+				}
+				return errors.New("xray exited during post-update stability check")
+			}
+		}
+		return nil
 	}
 
-	// For sidecar daemons (telemt, sing-box, ocserv, awg), confirm the core is
-	// not in a broken state when enabled inbounds exist for it.
+	// For sidecar daemons (telemt, sing-box, ocserv, awg), confirm the core stays
+	// healthy across the post-restart settle window when enabled inbounds exist for it.
 	counts := s.inboundCountsByCore()
 	if counts[spec.ServiceCore] == 0 {
 		return nil
 	}
-	time.Sleep(1500 * time.Millisecond)
-	for _, st := range s.GetCoresStatus() {
-		if st.Name == spec.ServiceCore && (st.State == CoreError || st.State == CoreStopped) {
-			return fmt.Errorf("core %s entered state %s (%s)", spec.ServiceCore, st.State, st.Detail)
+	for i := 0; i < 4; i++ {
+		time.Sleep(500 * time.Millisecond)
+		for _, st := range s.GetCoresStatus() {
+			if st.Name == spec.ServiceCore && (st.State == CoreError || st.State == CoreStopped) {
+				return fmt.Errorf("core %s entered state %s (%s)", spec.ServiceCore, st.State, st.Detail)
+			}
 		}
 	}
 	return nil
@@ -899,21 +1212,31 @@ func fetchValidatedJSON(rawURL string, timeout time.Duration, headers map[string
 	if err != nil {
 		return err
 	}
-	body, rerr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	body, rerr := io.ReadAll(io.LimitReader(resp.Body, maxValidatedJSONBytes+1))
 	_ = resp.Body.Close()
 	if rerr != nil {
 		return fmt.Errorf("read response from %s: %w", rawURL, rerr)
+	}
+	if len(body) > maxValidatedJSONBytes {
+		return fmt.Errorf("upstream %s response exceeded %d MiB size limit", rawURL, maxValidatedJSONBytes>>20)
 	}
 
 	trimmed := trimUTF8BOMAndSpace(body)
 	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
 
 	if resp.StatusCode != http.StatusOK {
+		rateNote := formatRateLimitNote(resp.Header)
 		if msg := extractJSONErrorMessage(trimmed); msg != "" {
+			if rateNote != "" {
+				return fmt.Errorf("HTTP %d from %s: %s (%s)", resp.StatusCode, rawURL, msg, rateNote)
+			}
 			return fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, rawURL, msg)
 		}
 		if looksLikeHTMLPayload(contentType, trimmed) {
 			return fmt.Errorf("HTTP %d from %s returned HTML instead of JSON (mirror/proxy error or rate-limit page)", resp.StatusCode, rawURL)
+		}
+		if rateNote != "" {
+			return fmt.Errorf("HTTP %d from %s (%s)", resp.StatusCode, rawURL, rateNote)
 		}
 		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, rawURL)
 	}
@@ -937,6 +1260,31 @@ func fetchValidatedJSON(rawURL string, timeout time.Duration, headers map[string
 		return fmt.Errorf("decode response from %s: %w", rawURL, err)
 	}
 	return nil
+}
+
+func formatRateLimitNote(h http.Header) string {
+	if h == nil {
+		return ""
+	}
+	rem := strings.TrimSpace(h.Get("X-RateLimit-Remaining"))
+	resetRaw := strings.TrimSpace(h.Get("X-RateLimit-Reset"))
+	retryAfter := strings.TrimSpace(h.Get("Retry-After"))
+	if rem != "0" && retryAfter == "" {
+		return ""
+	}
+	var parts []string
+	if rem == "0" {
+		parts = append(parts, "GitHub API rate limit exhausted")
+	}
+	if resetRaw != "" {
+		if ts, err := strconv.ParseInt(resetRaw, 10, 64); err == nil && ts > 0 {
+			parts = append(parts, "resets at "+time.Unix(ts, 0).UTC().Format(time.RFC3339))
+		}
+	}
+	if retryAfter != "" {
+		parts = append(parts, "retry-after "+retryAfter+"s")
+	}
+	return strings.Join(parts, "; ")
 }
 
 func trimUTF8BOMAndSpace(b []byte) []byte {
@@ -1321,7 +1669,12 @@ func resolveGithubReleaseAsset(spec CoreUpdateSpec, requestedVersion string) (do
 	_ = pickedName
 	if digest == "" && sidecarURL != "" {
 		client := &http.Client{Timeout: 25 * time.Second}
-		if sum, ferr := fetchSHA256FromSidecar(client, config.ApplyGHProxy(sidecarURL)); ferr == nil {
+		sum, ferr := fetchSHA256FromSidecar(client, config.ApplyGHProxy(sidecarURL))
+		if ferr != nil {
+			if spec.GithubRepo == "XTLS/Xray-core" {
+				return "", "", rel.TagName, fmt.Errorf("fetch SHA-256 digest %s for %s: %w", sidecarURL, pickedName, ferr)
+			}
+		} else {
 			digest = sum
 		}
 	}
@@ -1354,7 +1707,14 @@ func scoreReleaseAsset(target, filename, goarch string) int {
 		if strings.Contains(lower, "arm64") || strings.Contains(lower, "aarch64") {
 			return -1
 		}
-		archTokens = []string{"armv7", "arm-v7", "arm32-v7a", "armv6", "arm"}
+		switch strings.TrimSpace(os.Getenv("GOARM")) {
+		case "5":
+			archTokens = []string{"arm32-v5", "armv5", "arm-v5"}
+		case "6":
+			archTokens = []string{"arm32-v6", "armv6", "arm-v6"}
+		default:
+			archTokens = []string{"arm32-v7a", "armv7", "arm-v7", "armv6", "arm"}
+		}
 	case "386":
 		if strings.Contains(lower, "x86_64") || strings.Contains(lower, "amd64") || strings.Contains(lower, "linux-64") {
 			return -1
