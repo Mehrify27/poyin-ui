@@ -207,7 +207,7 @@ func NormalizeNetworkTuningProfile(raw string) (string, error) {
 		return NetProfileDefault, nil
 	case "bbr", "standard", "bbr-standard", "enable", "enabled", "on":
 		return NetProfileBBR, nil
-	case "vpn-performance", "vpn", "performance", "high", "turbo", "low-latency":
+	case "vpn-performance", "vpn", "performance", "perf", "high", "turbo", "low-latency":
 		return NetProfileVPNPerformance, nil
 	default:
 		return "", fmt.Errorf("unknown network tuning profile %q (valid: default, bbr, vpn-performance)", raw)

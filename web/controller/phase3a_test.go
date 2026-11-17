@@ -8,6 +8,8 @@ import (
 	"testing"
 	"testing/fstest"
 
+	"github.com/gin-contrib/sessions"
+	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
 )
 
@@ -98,6 +100,7 @@ func TestJSONAndFormDualParamHelpers(t *testing.T) {
 func TestBootstrapAndPWARoutesRespectBasePathAndAuthBoundary(t *testing.T) {
 	const basePath = "/edge-panel/"
 	r := gin.New()
+	r.Use(sessions.Sessions("vpn-ui", cookie.NewStore([]byte("test-secret"))))
 	r.Use(func(c *gin.Context) {
 		c.Set("base_path", basePath)
 		c.Next()

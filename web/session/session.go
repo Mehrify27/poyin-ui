@@ -47,6 +47,9 @@ func SetLoginUser(c *gin.Context, user *model.User) {
 
 // loginUserId returns the session's user id, or 0 when absent or unreadable.
 func loginUserId(c *gin.Context) int {
+	if _, ok := c.Get(sessions.DefaultKey); !ok {
+		return 0
+	}
 	s := sessions.Default(c)
 	obj := s.Get(loginUserKey)
 	if obj == nil {
